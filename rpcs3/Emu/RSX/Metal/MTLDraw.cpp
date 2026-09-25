@@ -429,6 +429,7 @@ void MTLGSRender::split_render_pass()
 	{
 		close_render_pass();
 		mtl::g_feedback_loop_pass_splits++;
+		mtl::count_feedback_split();
 	}
 }
 
@@ -769,10 +770,14 @@ void MTLGSRender::load_texture_env()
 			depth_compare_mode = mtl::get_compare_function(tex.zfunc(), true);
 		}
 
-		// Anisotropic filtering. On this fork "Automatic" (override 0) means 16x: every Apple GPU supports 16x and it is
-		// cheap on tile-based GPUs. An explicit override (1x-16x) or Strict Rendering Mode keeps the upstream behaviour.
+		// Anisotropic filtering. On this fork "Automatic" (override 0) means 16x for the game's own textures: every Apple
+		// GPU supports 16x and it sharpens surfaces seen at an angle. Render targets and blit results (screen-space
+		// buffers read by post-processing and effects) keep the game's setting: extra taps there cost bandwidth at the
+		// scaled resolution for no visible gain. An explicit override (1x-16x) or Strict Rendering Mode keeps the
+		// upstream behaviour.
 		f32 af_level = mtl::max_aniso(tex.max_aniso());
-		if (!g_cfg.video.strict_rendering_mode && g_cfg.video.anisotropic_level_override == 0u)
+		if (!g_cfg.video.strict_rendering_mode && g_cfg.video.anisotropic_level_override == 0u &&
+			sampler_state->upload_context == rsx::texture_upload_context::shader_read)
 		{
 			af_level = 16.f;
 		}
@@ -1008,21 +1013,111 @@ void MTLGSRender::load_texture_env()
 
 	m_samplers_dirty.store(false);
 
+	bool depth_feedback = false;
 	if (current_fragment_program.ctrl & RSX_SHADER_CONTROL_EMULATE_DEPTH_COMPARE)
 	{
-		// No depth framebuffer fetch on Metal: the depth buffer is sampled as a texture. End the pass so that the
-		// sampling pass is ordered after every previous depth write.
+		// No depth framebuffer fetch on Metal: the depth buffer is sampled as a texture. The pass must end if depth
+		// was written in it, so that the sampling pass is ordered after every previous depth write.
 		auto ds = ensure(m_rtts.m_bound_depth_stencil.second, "Invalid FS export configuration.");
 		ds->texture_barrier(*m_current_command_buffer);
 
-		check_for_cyclic_refs = true;
+		depth_feedback = is_written_in_open_pass(ds);
 	}
 
-	if (check_for_cyclic_refs)
+	// Feedback loop: end the render pass (counted as a pass split) only when a sampled attachment holds writes of the
+	// open pass. Chains of reads of a surface that the pass does not write (soft particles, fog and distortion sampling
+	// the depth or colour buffer) used to split on every draw, storing and reloading every attachment each time.
+	if (is_render_pass_open() && (depth_feedback || (check_for_cyclic_refs && feedback_read_needs_split())))
 	{
-		// Feedback loop: end the render pass (counted as a pass split)
 		invalidate_render_pass();
 	}
+}
+
+void MTLGSRender::mark_attachment_writes(const std::array<bool, 4>& color, bool depth_stencil)
+{
+	if (!is_render_pass_open())
+	{
+		return;
+	}
+
+	const u64 pass = m_current_command_buffer->open_pass_serial();
+
+	for (const auto& index : m_rtts.m_bound_render_target_ids)
+	{
+		if (auto surface = m_rtts.m_bound_render_targets[index].second; surface && color[index])
+		{
+			surface->written_in_pass = pass;
+		}
+	}
+
+	if (auto surface = m_rtts.m_bound_depth_stencil.second; surface && depth_stencil)
+	{
+		surface->written_in_pass = pass;
+	}
+}
+
+bool MTLGSRender::is_written_in_open_pass(const mtl::image* image) const
+{
+	if (!image || !is_render_pass_open())
+	{
+		return false;
+	}
+
+	const u64 pass = m_current_command_buffer->open_pass_serial();
+
+	for (const auto& index : m_rtts.m_bound_render_target_ids)
+	{
+		if (const auto surface = m_rtts.m_bound_render_targets[index].second;
+			surface && static_cast<const mtl::image*>(surface) == image)
+		{
+			return surface->written_in_pass == pass;
+		}
+	}
+
+	if (const auto surface = m_rtts.m_bound_depth_stencil.second;
+		surface && static_cast<const mtl::image*>(surface) == image)
+	{
+		return surface->written_in_pass == pass;
+	}
+
+	// Not an attachment of the open pass: its memory is current
+	return false;
+}
+
+bool MTLGSRender::feedback_read_needs_split() const
+{
+	auto check = [this](const auto& states, u32 mask)
+	{
+		for (u32 i = 0; mask; mask >>= 1, ++i)
+		{
+			if (!(mask & 1) || !states[i])
+			{
+				continue;
+			}
+
+			const auto desc = static_cast<const mtl::texture_cache::sampled_image_descriptor*>(states[i].get());
+			if (!desc->is_cyclic_reference && !desc->external_subresource_desc.do_not_cache)
+			{
+				continue;
+			}
+
+			if (!desc->image_handle)
+			{
+				// Composed or copied from the surface when bound: keep the conservative split
+				return true;
+			}
+
+			if (is_written_in_open_pass(desc->image_handle->image()))
+			{
+				return true;
+			}
+		}
+
+		return false;
+	};
+
+	return check(fs_sampler_state, current_fp_metadata.referenced_textures_mask) ||
+		check(vs_sampler_state, current_vp_metadata.referenced_textures_mask);
 }
 
 bool MTLGSRender::bind_texture_env()
@@ -1571,6 +1666,14 @@ void MTLGSRender::end()
 
 	m_rtts.on_write(m_framebuffer_layout.color_write_enabled, m_framebuffer_layout.zeta_write_enabled);
 
+	// The layout's depth/stencil write flag can miss stencil-only writes (it is re-derived from the depth state when
+	// that changes): mark from the live state, conservatively
+	const auto& regs = rsx::method_registers;
+	const bool depth_stencil_written = m_framebuffer_layout.zeta_write_enabled ||
+		(regs.depth_test_enabled() && regs.depth_write_enabled()) ||
+		(regs.stencil_test_enabled() && regs.stencil_mask() != 0);
+	mark_attachment_writes(m_framebuffer_layout.color_write_enabled, depth_stencil_written);
+
 	rsx::thread::end();
 }
 
@@ -1846,6 +1949,7 @@ void MTLGSRender::clear_surface(u32 mask)
 	{
 		// Ends the current pass and reopens it with loadAction=Clear on the requested attachments
 		begin_render_pass(&load_clear);
+		mark_attachment_writes({ update_color, update_color, update_color, update_color }, update_z);
 	}
 
 	if (!inpass.color_write_mask && !inpass.depth && !inpass.stencil)
@@ -1925,6 +2029,9 @@ void MTLGSRender::clear_surface(u32 mask)
 	}
 
 	encoder->drawPrimitives(MTL::PrimitiveTypeTriangleStrip, NS::UInteger(0), NS::UInteger(4));
+
+	const bool clear_color = inpass.color_write_mask != 0;
+	mark_attachment_writes({ clear_color, clear_color, clear_color, clear_color }, clear_depth || clear_stencil);
 
 	if (query_open)
 	{

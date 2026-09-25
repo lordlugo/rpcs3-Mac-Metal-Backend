@@ -7,8 +7,10 @@
 //    No ShaderWrite: nothing writes surfaces from compute, and it would cost lossless compression.
 //    MSAA targets are TextureType2DMultisample.
 //  - No layouts. Feedback loops (sampling a bound attachment) cannot be solved with a barrier inside a pass on Apple
-//    GPUs: texture_barrier() ends the current render pass (the next encoder waits for all prior work) and counts the
-//    split in mtl::g_feedback_loop_pass_splits. Same-pixel feedback can use framebuffer fetch instead (renderer's call).
+//    GPUs: texture_barrier() ends the current render pass (the next encoder waits for all prior work) when the surface
+//    was written by that pass (written_in_pass, marked by the renderer after draws and clears), and counts the split
+//    in mtl::g_feedback_loop_pass_splits. Writes of passes that already ended are in memory and need no split.
+//    Same-pixel feedback can use framebuffer fetch instead (renderer's call).
 //  - Destructive cloning for spills moves the MTLTexture into a disposable drawable_surface_t (GC-deferred release).
 
 #include "util/types.hpp"
@@ -177,6 +179,7 @@ namespace mtl
 		u64 last_rw_access_tag = 0;     // timestamp when this object was last used
 		u64 spill_request_tag = 0;      // timestamp when spilling was requested
 		bool is_bound = false;          // set when the surface is bound for rendering
+		u64 written_in_pass = 0;        // command_list::open_pass_serial() of the pass whose draws/clears last wrote it
 
 		using drawable_surface_t::drawable_surface_t;
 

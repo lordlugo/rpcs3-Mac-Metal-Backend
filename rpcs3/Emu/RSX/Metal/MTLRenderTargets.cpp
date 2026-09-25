@@ -1088,11 +1088,13 @@ namespace mtl
 		}
 
 		// Apple GPUs cannot wait on attachment writes inside a render pass. Split the pass instead: the next encoder
-		// begins with a barrier on all previously encoded work (see mtl::command_list).
-		if (cmd.is_render_pass_open())
+		// begins with a barrier on all previously encoded work (see mtl::command_list). Writes of passes that already
+		// ended are in memory, so only writes by the open pass (marked by the renderer) need the split.
+		if (cmd.is_render_pass_open() && written_in_pass == cmd.open_pass_serial())
 		{
 			cmd.end_render_pass();
 			g_feedback_loop_pass_splits++;
+			count_feedback_split();
 		}
 
 		m_cyclic_ref_tracker.on_insert_texture_barrier();
@@ -1120,6 +1122,7 @@ namespace mtl
 		{
 			cmd.end_render_pass();
 			g_feedback_loop_pass_splits++;
+			count_feedback_split();
 		}
 
 		m_cyclic_ref_tracker.reset();

@@ -17,6 +17,18 @@ namespace mtl
 		table_count = 3
 	};
 
+	// Telemetry for the renderer's periodic log line: GPU time of committed work (union of the start-end intervals
+	// reported by Metal 4 commit feedback, so overlapping work is not counted twice) and render passes begun.
+	struct gpu_stats_t
+	{
+		u64 busy_ns = 0;
+		u64 render_passes = 0;
+		u64 feedback_splits = 0;
+	};
+
+	gpu_stats_t get_gpu_stats_and_reset();
+	void count_feedback_split();
+
 	struct submit_info_t
 	{
 		// Optional GPU-side waits before this batch executes
@@ -75,6 +87,7 @@ namespace mtl
 		MTL4::CommandBuffer* m_commands = nullptr;
 
 		MTL4::RenderCommandEncoder* m_render_encoder = nullptr;   // Not owned (lifetime of the encoding)
+		u64 m_pass_serial = 0;                                     // Unique id of the open render pass (all lists)
 		MTL4::ComputeCommandEncoder* m_compute_encoder = nullptr; // Not owned
 		u32 m_compute_commands_since_barrier = 0;
 		bool m_pending_full_barrier = true;
@@ -114,6 +127,10 @@ namespace mtl
 		// Begin a render pass. Ends any active encoder first.
 		MTL4::RenderCommandEncoder* begin_render_pass(const MTL4::RenderPassDescriptor* desc, MTL4::RenderEncoderOptions options = 0);
 		bool is_render_pass_open() const { return m_render_encoder != nullptr; }
+
+		// Unique id (across all command lists) of the open render pass, 0 when none is open. Attachments written by a
+		// pass reach memory when it ends: feedback reads compare a surface's last writing pass with this id.
+		u64 open_pass_serial() const { return m_render_encoder ? m_pass_serial : 0; }
 		MTL4::RenderCommandEncoder* render_encoder() const { return m_render_encoder; }
 		void end_render_pass();
 

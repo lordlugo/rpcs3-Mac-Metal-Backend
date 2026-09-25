@@ -24,7 +24,9 @@ namespace mtl
 			UPSCALE_DEFAULT_VIEW = (1 << 0),
 			UPSCALE_LEFT_VIEW    = (1 << 0),
 			UPSCALE_RIGHT_VIEW   = (1 << 1),
-			UPSCALE_AND_COMMIT   = (1 << 2)
+			UPSCALE_AND_COMMIT   = (1 << 2),
+			UPSCALE_CLEAR_TARGET = (1 << 3)  // With UPSCALE_AND_COMMIT: clear the whole present surface (letterbox bars)
+			                                 // as the load action of the final pass instead of in a pass of its own
 		};
 	}
 
@@ -54,7 +56,7 @@ namespace mtl
 	// Scaled draw of src_area of `src` into dst_area of `dst` (render target texture). Replaces vkCmdBlitImage for
 	// the present path. Implemented in MTLBlit.cpp with mtl::blit_pass.
 	void upscale_blit(mtl::command_list& cmd, mtl::viewable_image* src, MTL::Texture* dst,
-		const areai& src_area, const areai& dst_area, bool linear_filter);
+		const areai& src_area, const areai& dst_area, bool linear_filter, bool clear_target = false);
 
 	// Creates the upscaler for the output scaling setting. output_scaling_mode::fsr maps to MetalFX spatial upscaling
 	// followed by optional RCAS sharpening (falls back to bilinear at runtime whenever MetalFX cannot be used).

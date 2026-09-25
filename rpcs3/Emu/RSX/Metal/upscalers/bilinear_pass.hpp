@@ -20,7 +20,7 @@ namespace mtl
 				ensure(present_surface);
 
 				// Sampled draw through mtl::blit_pass (Metal has no vkCmdBlitImage)
-				upscale_blit(cmd, src, present_surface, src_area, dst_area, true);
+				upscale_blit(cmd, src, present_surface, src_area, dst_area, true, !!(mode & UPSCALE_CLEAR_TARGET));
 				return nullptr;
 			}
 

@@ -541,7 +541,15 @@ namespace mtl
 		auto src_image = src;
 		areai output_src_area = src_area;
 
-		if (input_size.width < output_size.width && input_size.height < output_size.height)
+		// MetalFX (+ RCAS) costs three passes at the output size: its scaler, the sharpening pass and the final draw.
+		// Below 1.25x (a high resolution scale on a Retina display, e.g. 225% of 720p shown at 3456x1944) it looks the
+		// same as the bilinear draw that happens anyway, so that is all that runs.
+		constexpr f32 min_metalfx_scale = 1.25f;
+		const bool worth_upscaling =
+			output_size.width >= input_size.width * min_metalfx_scale ||
+			output_size.height >= input_size.height * min_metalfx_scale;
+
+		if (input_size.width < output_size.width && input_size.height < output_size.height && worth_upscaling)
 		{
 			// Cannot upscale both LEFT and RIGHT images at the same time.
 			// Default maps to LEFT for simplicity
@@ -577,7 +585,7 @@ namespace mtl
 		{
 			ensure(present_surface);
 
-			upscale_blit(cmd, src_image, present_surface, output_src_area, dst_area, true);
+			upscale_blit(cmd, src_image, present_surface, output_src_area, dst_area, true, !!(mode & UPSCALE_CLEAR_TARGET));
 			return nullptr;
 		}
 

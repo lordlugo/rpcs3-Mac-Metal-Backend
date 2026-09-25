@@ -19,7 +19,7 @@ namespace mtl
 			{
 				ensure(present_surface);
 
-				upscale_blit(cmd, src, present_surface, src_area, dst_area, false);
+				upscale_blit(cmd, src, present_surface, src_area, dst_area, false, !!(mode & UPSCALE_CLEAR_TARGET));
 				return nullptr;
 			}
 

@@ -286,6 +286,12 @@ private:
 	void invalidate_render_pass();
 	void split_render_pass();
 	bool is_render_pass_open() const;
+
+	// Feedback loops (a draw samples a bound attachment). Tile-based GPUs write attachments to memory when the pass
+	// ends, so a read only needs a pass split when the sampled surface was written by the pass that is still open.
+	void mark_attachment_writes(const std::array<bool, 4>& color, bool depth_stencil);
+	bool is_written_in_open_pass(const mtl::image* image) const;
+	bool feedback_read_needs_split() const;
 	MTL4::RenderCommandEncoder* get_render_encoder() const;
 	void on_render_pass_begin(MTL4::RenderCommandEncoder* encoder);
 

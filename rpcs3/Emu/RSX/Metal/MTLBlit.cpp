@@ -4,6 +4,7 @@
 // mtl::blit_pass (color) or its depth/stencil variants, which write [[depth]] / [[stencil]] from the fragment shader.
 
 #include "MTLOverlays.h"
+#include "MTLRenderPass.h"
 #include "MTLFormats.h"
 #include "MTLHelpers.h"
 #include "MTLResourceManager.h"
@@ -445,13 +446,33 @@ namespace mtl
 	// ---- Scaled copies ----------------------------------------------------------------------------------------------
 
 	void upscale_blit(mtl::command_list& cmd, mtl::viewable_image* src, MTL::Texture* dst,
-		const areai& src_area, const areai& dst_area, bool linear_filter)
+		const areai& src_area, const areai& dst_area, bool linear_filter, bool clear_target)
 	{
 		ensure(src && dst);
 
 		// Raw copy semantics (vkCmdBlitImage ignores the native component layout)
 		std::vector<mtl::image_view*> views = { src->get_identity_view() };
-		get_overlay_pass<blit_pass>()->run(cmd, overlay_target(dst), dst_area, views, src_area, linear_filter);
+
+		// Letterbox bars: black from the load action of this pass (no separate full-size clear pass). The blit draws
+		// nothing (and opens no pass) for an empty or off-target area: clear on its own then.
+		const s32 dst_w = static_cast<s32>(dst->width());
+		const s32 dst_h = static_cast<s32>(dst->height());
+		const bool draws_something =
+			dst_area.x1 != dst_area.x2 && dst_area.y1 != dst_area.y2 && src_area.x1 != src_area.x2 && src_area.y1 != src_area.y2 &&
+			std::max(dst_area.x1, dst_area.x2) > 0 && std::min(dst_area.x1, dst_area.x2) < dst_w &&
+			std::max(dst_area.y1, dst_area.y2) > 0 && std::min(dst_area.y1, dst_area.y2) < dst_h;
+
+		if (clear_target && !draws_something)
+		{
+			clear_color_texture(cmd, dst, dst->width(), dst->height(), MTL::ClearColor::Make(0., 0., 0., 1.));
+			return;
+		}
+
+		overlay_target target(dst);
+		target.clear_color_on_load = clear_target;
+		target.clear_color_value = { 0.f, 0.f, 0.f, 1.f };
+
+		get_overlay_pass<blit_pass>()->run(cmd, target, dst_area, views, src_area, linear_filter);
 	}
 
 	void copy_scaled_image(mtl::command_list& cmd,

@@ -5,6 +5,79 @@
 
 namespace mtl
 {
+	namespace
+	{
+		struct gpu_stats_state
+		{
+			std::mutex mutex;
+			f64 busy_until = 0.;
+			u64 busy_ns = 0;
+			atomic_t<u64> render_passes = 0;
+			atomic_t<u64> feedback_splits = 0;
+			atomic_t<u32> errors_logged = 0;
+		};
+
+		// Never destroyed: commit feedback can still arrive on a Metal thread while the process exits
+		gpu_stats_state& gpu_stats()
+		{
+			static gpu_stats_state* s_state = new gpu_stats_state();
+			return *s_state;
+		}
+
+		atomic_t<u64> g_pass_serial = 0;
+
+		// Called by Metal when committed work finishes (any thread)
+		void on_commit_feedback(MTL4::CommitFeedback* feedback)
+		{
+			if (!feedback)
+			{
+				return;
+			}
+
+			auto& state = gpu_stats();
+
+			if (const NS::Error* error = feedback->error(); error && state.errors_logged++ < 16)
+			{
+				autorelease_scope pool;
+				rsx_log.error("Metal: GPU error in committed work: %s", to_string(error));
+			}
+
+			const f64 start = feedback->GPUStartTime();
+			const f64 end = feedback->GPUEndTime();
+			if (!(end > start))
+			{
+				return;
+			}
+
+			// Union of the intervals (approximate when feedback arrives out of order across queues)
+			std::lock_guard lock(state.mutex);
+			const f64 from = std::max(start, state.busy_until);
+			if (end > from)
+			{
+				state.busy_ns += static_cast<u64>((end - from) * 1'000'000'000.);
+			}
+			state.busy_until = std::max(state.busy_until, end);
+		}
+	}
+
+	gpu_stats_t get_gpu_stats_and_reset()
+	{
+		auto& state = gpu_stats();
+		gpu_stats_t stats{};
+		{
+			std::lock_guard lock(state.mutex);
+			stats.busy_ns = std::exchange(state.busy_ns, 0);
+		}
+		stats.render_passes = state.render_passes.exchange(0);
+		stats.feedback_splits = state.feedback_splits.exchange(0);
+		return stats;
+	}
+
+	void count_feedback_split()
+	{
+		gpu_stats().feedback_splits++;
+	}
+
 	command_list::~command_list()
 	{
 		destroy();
@@ -136,8 +209,12 @@ namespace mtl
 			m_queue->wait(info.wait_event, info.wait_value);
 		}
 
+		// Commit feedback: GPU time (telemetry) and GPU errors (page faults, timeouts), which are silent otherwise
+		auto options = ref(MTL4::CommitOptions::alloc()->init());
+		options->addFeedbackHandler(MTL4::CommitFeedbackHandlerFunction(&on_commit_feedback));
+
 		const MTL4::CommandBuffer* buffers[] = { m_commands };
-		m_queue->commit(buffers, 1);
+		m_queue->commit(buffers, 1, options.get());
 
 		if (info.signal_drawable)
 		{
@@ -168,6 +245,8 @@ namespace mtl
 		m_render_encoder = m_commands->renderCommandEncoder(desc, options);
 		ensure(m_render_encoder, "Metal: failed to begin render pass");
 		m_render_encoder->retain();
+		m_pass_serial = ++g_pass_serial;
+		gpu_stats().render_passes++;
 
 		open_encoder_barrier(m_render_encoder, stages_render);
 		return m_render_encoder;

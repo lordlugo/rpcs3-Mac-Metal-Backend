@@ -372,6 +372,23 @@ void MTLGSRender::present_drawable(mtl::frame_context_t* ctx)
 			(now_us - pacing.stats_time) / 1'000'000, refresh * 1000., counts[0], counts[1], counts[2], counts[3], counts[4], counts[5], dropped,
 			mode, get_guest_frame_interval() * 1000., min_duration * 1000.);
 
+		// GPU load. A rising GPU time per frame in the same scene means the GPU clock dropped (heat); a high pass count
+		// means attachments are stored and reloaded often (feedback splits, clears, copies between draws).
+		u32 frames = dropped;
+		for (const u32 count : counts)
+		{
+			frames += count;
+		}
+
+		const auto gpu = mtl::get_gpu_stats_and_reset();
+		const f64 window_ms = (now_us - pacing.stats_time) / 1000.;
+		if (frames && window_ms > 0.)
+		{
+			const f64 busy_ms = gpu.busy_ns / 1'000'000.;
+			rsx_log.notice("Metal: GPU busy %.2f ms per frame (%.0f%% of the time), %.1f render passes and %.1f feedback splits per frame",
+				busy_ms / frames, 100. * busy_ms / window_ms, static_cast<f64>(gpu.render_passes) / frames, static_cast<f64>(gpu.feedback_splits) / frames);
+		}
+
 		pacing.stats_time = now_us;
 	}
 }
@@ -1054,9 +1071,9 @@ void MTLGSRender::flip(const rsx::display_flip_info_t& info)
 	const bool use_calibration_pass = image_to_flip &&
 		(!use_full_rgb_range_output || !rsx::fcmp(avconfig.gamma, 1.f) || avconfig.stereo_enabled);
 
-	if (needs_letterbox_clear && !use_calibration_pass)
+	if (needs_letterbox_clear && !image_to_flip)
 	{
-		// The calibration pass clears on load instead (see below)
+		// Nothing to draw: clear on its own. Otherwise the final pass (calibration pass or upscaler draw) clears on load.
 		mtl::clear_color_texture(*m_current_command_buffer, target_texture, target_size.width, target_size.height, MTL::ClearColor::Make(0., 0., 0., 1.));
 	}
 
@@ -1095,7 +1112,8 @@ void MTLGSRender::flip(const rsx::display_flip_info_t& info)
 		else
 		{
 			// Scaled draw into the present image (Metal has no image blit). MetalFX (+ RCAS) upscales first when active.
-			m_upscaler->scale_output(*m_current_command_buffer, image_to_flip, target_texture, src_area, aspect_ratio, UPSCALE_AND_COMMIT | UPSCALE_DEFAULT_VIEW);
+			m_upscaler->scale_output(*m_current_command_buffer, image_to_flip, target_texture, src_area, aspect_ratio,
+				UPSCALE_AND_COMMIT | UPSCALE_DEFAULT_VIEW | (needs_letterbox_clear ? UPSCALE_CLEAR_TARGET : 0));
 		}
 	}
 
