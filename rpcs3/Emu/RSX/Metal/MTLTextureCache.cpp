@@ -2,6 +2,7 @@
 #include "MTLTextureCache.h"
 #include "MTLCompute.h"
 #include "MTLGSRender.h"
+#include "MTLCommandStream.h"
 
 #include "mtlutils/data_heap.h"
 #include "Emu/Memory/vm.h"
@@ -171,11 +172,14 @@ namespace mtl
 			const auto task_length = transfer_pitch * src_area.height();
 			auto working_buffer_length = calculate_working_buffer_size(task_length, src->aspect());
 
+			// Metal: the tiled output block (and the kernel binding at its start) is kept 256-byte aligned
+			const u32 tiled_output_offset = utils::align<u32>(task_length, 256);
+
 #if !DEBUG_DMA_TILING
 			if (require_tiling)
 			{
-				// Safety padding
-				working_buffer_length += tiled_region.tile->size;
+				// Safety padding (+ alignment of the tiled output block)
+				working_buffer_length += tiled_region.tile->size + 256;
 
 				// Calculate actual working section for the memory op
 				dma_sync_region = tiled_region.tile_align(dma_sync_region);
@@ -243,9 +247,9 @@ namespace mtl
 					dma_sync(true);
 					ensure(dma_mapping.second);
 
-					// Upload memory to the working buffer
-					const auto dst_offset = task_length; // Append to the end of the input
-					cmd.compute()->copyFromBuffer(dma_mapping.second->value(), dma_mapping.first, working_buffer->value(), dst_offset, dma_sync_region.length());
+					// Upload memory to the working buffer. The guest address has arbitrary alignment.
+					const auto dst_offset = tiled_output_offset; // Append to the end of the input
+					mtl::copy_buffer_to_buffer_aligned(cmd, dma_mapping.second, dma_mapping.first, working_buffer, dst_offset, dma_sync_region.length());
 				}
 
 				// Prepare payload
@@ -259,7 +263,7 @@ namespace mtl
 					.bank = tiled_region.tile->bank,
 
 					.dst = working_buffer,
-					.dst_offset = task_length,
+					.dst_offset = tiled_output_offset,
 					.src = working_buffer,
 					.src_offset = 0,
 
@@ -275,7 +279,7 @@ namespace mtl
 				job->run(cmd, config);
 
 				// Update internal variables
-				result_offset = task_length;
+				result_offset = tiled_output_offset;
 				real_pitch = tiled_region.tile->pitch; // We're always copying the full image. In case of partials we're "filling in" blocks, not doing partial 2D copies.
 #endif
 			}
@@ -284,23 +288,15 @@ namespace mtl
 			{
 				dma_sync(false);
 
-				cmd.compute()->copyFromBuffer(working_buffer->value(), result_offset, dma_mapping.second->value(), dma_mapping.first, dma_sync_region.length());
+				// Guest destination: any alignment (blit when 4-byte aligned, compute byte copy otherwise)
+				mtl::copy_buffer_to_buffer_aligned(cmd, working_buffer, result_offset, dma_mapping.second, dma_mapping.first, dma_sync_region.length());
 			}
 			else
 			{
 				dma_sync(true);
 
-				u32 dst_offset = dma_mapping.first;
-				u32 src_offset = result_offset;
-
-				for (unsigned row = 0; row < transfer_height; ++row)
-				{
-					// Rows are independent of each other; only the first one needs to wait for the previous work
-					auto encoder = row ? cmd.compute_unordered() : cmd.compute();
-					encoder->copyFromBuffer(working_buffer->value(), src_offset, dma_mapping.second->value(), dst_offset, transfer_pitch);
-					src_offset += real_pitch;
-					dst_offset += rsx_pitch;
-				}
+				// One strided copy: transfer_height rows of transfer_pitch bytes, the guest bytes between rows are preserved
+				mtl::copy_buffer_rows(cmd, working_buffer, result_offset, real_pitch, dma_mapping.second, dma_mapping.first, rsx_pitch, transfer_pitch, transfer_height);
 			}
 		}
 		else
@@ -316,6 +312,8 @@ namespace mtl
 			region.image_offset = MTL::Origin::Make(static_cast<NS::UInteger>(src_area.x1), static_cast<NS::UInteger>(src_area.y1), 0);
 			region.image_extent = MTL::Size::Make(transfer_width, transfer_height, 1);
 
+			// A misaligned guest destination is staged through an aligned buffer by the copy helper (Metal requires
+			// 16-byte aligned buffer offsets for texture -> buffer copies)
 			region.buffer_offset = dma_mapping.first;
 			mtl::copy_image_to_buffer_raw(cmd, src, dma_mapping.second, region);
 		}
@@ -1311,8 +1309,9 @@ namespace mtl
 		if (cmd.access_hint != mtl::command_list::access_type_hint::all)
 		{
 			// Primary access command queue, must restart it after.
-			// (No async compute scheduler to flush on Metal.)
-			cmd.submit();
+			// (No async compute scheduler to flush on Metal.) Commit through the renderer's submit path so ordering and
+			// the global submit lock match every other submission.
+			mtl::queue_submit_now(cmd);
 			if (!cmd.wait(GENERAL_WAIT_TIMEOUT))
 			{
 				rsx_log.error("[Metal] Timed out waiting for the DMA flush submission");
@@ -1325,7 +1324,7 @@ namespace mtl
 		else
 		{
 			// Auxilliary command queue with auto-restart capability
-			cmd.submit();
+			mtl::queue_submit_now(cmd);
 			cmd.clear_flags();
 		}
 

@@ -192,20 +192,17 @@ namespace mtl
 		return state;
 	}
 
-	// Metal can only filter depth formats linearly through comparison samplers (Depth16Unorm excepted)
-	static bool is_depth_format_filterable(MTL::PixelFormat format, bool compare_enabled)
+	// Linear filtering of depth formats: always legal through comparison samplers (sample_compare).
+	// Plain sampling of 32-bit float depth can only be filtered on Apple9+ (M3 and later); Depth16Unorm is always filterable.
+	static bool is_depth_format_filterable(MTL::PixelFormat format, bool shader_compare, bool apple9)
 	{
-		if (compare_enabled)
-		{
-			return true;
-		}
-
 		switch (format)
 		{
 		case MTL::PixelFormatDepth16Unorm:
 			return true;
 		case MTL::PixelFormatDepth32Float:
 		case MTL::PixelFormatDepth32Float_Stencil8:
+			return shader_compare || apple9;
 		case MTL::PixelFormatX32_Stencil8:
 		case MTL::PixelFormatStencil8:
 			return false;
@@ -479,26 +476,31 @@ MTL::DepthStencilState* MTLGSRender::get_depth_stencil_state(u64 key)
 
 mtl::image_view* MTLGSRender::get_null_texture_view(rsx::texture_dimension_extended type, bool is_depth)
 {
-	if (is_depth && type <= rsx::texture_dimension_extended::texture_dimension_2d)
+	// Shadow samplers are declared as depth2d<> (1D/2D) or depthcube<> which cannot take colour views.
+	// NOTE: There is no 3D depth texture type in MSL; 3D shadow samplers cannot be declared and fall back to colour.
+	if (is_depth && type != rsx::texture_dimension_extended::texture_dimension_3d)
 	{
-		// depth2d<> arguments cannot take a colour texture
-		if (!m_null_depth_texture)
+		const bool is_cube = (type == rsx::texture_dimension_extended::texture_dimension_cubemap);
+		auto& null_texture = m_null_depth_textures[is_cube ? 1 : 0];
+
+		if (!null_texture)
 		{
 			mtl::image_create_info info{};
-			info.type = MTL::TextureType2D;
+			info.type = is_cube ? MTL::TextureTypeCube : MTL::TextureType2D;
 			info.format = MTL::PixelFormatDepth32Float;
 			info.usage = MTL::TextureUsageShaderRead | MTL::TextureUsageRenderTarget;
 			info.format_class = RSX_FORMAT_CLASS_DEPTH24_FLOAT_X8_PACK32;
+			info.layers = is_cube ? 6 : 1;
 
-			m_null_depth_texture = std::make_unique<mtl::viewable_image>(*m_device, info);
-			m_null_depth_texture->set_debug_name("null depth texture");
+			null_texture = std::make_unique<mtl::viewable_image>(*m_device, info);
+			null_texture->set_debug_name(is_cube ? "null depth cube texture" : "null depth texture");
 
 			mtl::image_clear_value value{};
 			value.depth = 1.f;
-			mtl::clear_image(*m_current_command_buffer, m_null_depth_texture.get(), value);
+			mtl::clear_image(*m_current_command_buffer, null_texture.get(), value);
 		}
 
-		return m_null_depth_texture->get_identity_view(mtl::aspect_depth);
+		return null_texture->get_identity_view(mtl::aspect_depth);
 	}
 
 	return mtl::null_image_view(*m_current_command_buffer, mtl::get_view_type(type));
@@ -668,12 +670,14 @@ void MTLGSRender::load_texture_env()
 		if (!tex.enabled())
 		{
 			*sampler_state = {};
+			m_fs_lod_bias[i] = 0.f;
 			continue;
 		}
 
 		*sampler_state = m_texture_cache.upload_texture(*m_current_command_buffer, tex, m_rtts);
 		if (!sampler_state->validate())
 		{
+			m_fs_lod_bias[i] = 0.f;
 			continue;
 		}
 
@@ -741,7 +745,13 @@ void MTLGSRender::load_texture_env()
 		bool compare_enabled = false;
 		MTL::CompareFunction depth_compare_mode = MTL::CompareFunctionNever;
 
-		if (texture_format >= CELL_GCM_TEXTURE_DEPTH24_D8 && texture_format <= CELL_GCM_TEXTURE_DEPTH16_FLOAT)
+		// Mirror RSXThread's shadow_textures decision (the decompiler emits sample_compare only for those units).
+		// A compare sampler must only be attached when the shader actually compares.
+		if (texture_format >= CELL_GCM_TEXTURE_DEPTH24_D8 && texture_format <= CELL_GCM_TEXTURE_DEPTH16_FLOAT &&
+			sampler_state->format_class != RSX_FORMAT_CLASS_COLOR &&
+			!tex.alpha_kill_enabled() &&
+			tex.zfunc() > rsx::comparison_function::never &&
+			tex.zfunc() < rsx::comparison_function::always)
 		{
 			compare_enabled = true;
 			depth_compare_mode = mtl::get_compare_function(tex.zfunc(), true);
@@ -794,11 +804,11 @@ void MTLGSRender::load_texture_env()
 		}
 		else
 		{
-			// Apple GPUs cannot filter 32-bit float depth outside of comparison sampling
+			// Pre-Apple9 GPUs cannot filter 32-bit float depth outside of comparison sampling
 			const auto mtl_format = sampler_state->image_handle ? sampler_state->image_handle->image()->format() :
 				mtl::get_compatible_sampler_format(sampler_state->external_subresource_desc.gcm_format);
 
-			can_sample_linear = mtl::is_depth_format_filterable(mtl_format, compare_enabled);
+			can_sample_linear = mtl::is_depth_format_filterable(mtl_format, compare_enabled, m_device->caps().apple9);
 		}
 
 		const auto mipmap_count = tex.get_exact_mipmap_count();
@@ -861,6 +871,9 @@ void MTLGSRender::load_texture_env()
 		info.unnormalized_coordinates = false;
 		info.mip_lod_bias = lod_bias;
 		info.max_anisotropy = af_level;
+
+		// Pre-Apple10 samplers ignore mip_lod_bias; programs built with requires_lod_bias add it in the shader
+		m_fs_lod_bias[i] = lod_bias;
 		info.min_lod = min_lod;
 		info.max_lod = max_lod;
 		info.min_filter = min_filter.filter;
@@ -1340,14 +1353,35 @@ void MTLGSRender::emit_geometry(u32 sub_index)
 		}
 		else
 		{
+			// Metal requires 4-byte aligned index buffer addresses. 16-bit sub-ranges following an odd index count start on
+			// a 2-byte boundary: those are copied to a fresh (aligned) ring allocation.
+			// NOTE: Read the source through the mapping taken before any allocation; a ring grow swaps the backing store
+			// (the old buffer stays alive through the GC until this submission completes, so index_base remains valid).
+			const u8* index_data = m_index_buffer_ring_info.map<u8>(offset, 0);
+
 			u32 vertex_offset = 0;
 			const auto subranges = draw_call.get_subranges();
 			for (const auto &range : subranges)
 			{
 				const auto count = get_index_count(draw_call.primitive, range.count);
-				encoder->drawIndexedPrimitives(upload_info.primitive, count, index_type,
-					index_base + (vertex_offset * index_size), count * index_size);
+				const u64 range_offset = vertex_offset * index_size;
+				const u64 range_length = count * index_size;
 				vertex_offset += count;
+
+				if (!count)
+				{
+					continue;
+				}
+
+				MTL::GPUAddress range_address = index_base + range_offset;
+				if (range_address & 3)
+				{
+					const usz aligned_offset = m_index_buffer_ring_info.alloc<64>(range_length);
+					std::memcpy(m_index_buffer_ring_info.map<u8>(aligned_offset, range_length), index_data + range_offset, range_length);
+					range_address = m_index_buffer_ring_info.gpu_address(aligned_offset);
+				}
+
+				encoder->drawIndexedPrimitives(upload_info.primitive, count, index_type, range_address, range_length);
 			}
 		}
 	}
@@ -1851,9 +1885,28 @@ void MTLGSRender::clear_surface(u32 mask)
 	encoder->setViewport(viewport);
 	encoder->setScissorRect(MTL::ScissorRect{ scissor_x, scissor_y, scissor_w, scissor_h });
 
+	if (m_device->caps().depth_bounds)
+	{
+		// The depth bounds test would discard the clear against the stored depth
+		encoder->setDepthTestBounds(0.f, 1.f);
+	}
+
+	// Clears are never counted by occlusion queries (VK: vkCmdClearAttachments). Suspend the open query, if any.
+	const bool query_open = (m_current_command_buffer->flags & mtl::command_list::cb_has_open_query) && m_active_query_info;
+	if (query_open)
+	{
+		encoder->setVisibilityResultMode(MTL::VisibilityResultModeDisabled, 0);
+	}
+
 	encoder->drawPrimitives(MTL::PrimitiveTypeTriangleStrip, NS::UInteger(0), NS::UInteger(4));
 
-	// The next draw must restore the full encoder state
+	if (query_open)
+	{
+		const auto open_query = m_occlusion_map[m_active_query_info->driver_handle].indices.back();
+		m_occlusion_query_manager->resume_query(encoder, open_query);
+	}
+
+	// The next draw must restore the full encoder state (viewport, scissor, depth bias, depth bounds, ...)
 	m_encoder_state.pipeline = nullptr;
 	m_encoder_state.depth_stencil = ds_state;
 	m_current_command_buffer->flags |= mtl::command_list::cb_reload_dynamic_state;

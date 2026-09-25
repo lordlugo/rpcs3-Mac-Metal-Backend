@@ -53,6 +53,9 @@ private:
 
 private:
 	const MTLFragmentProgram* m_fragment_prog = nullptr;
+
+	// Per fragment texture unit mip LOD bias, pushed to programs with requires_lod_bias (pre-Apple10 GPUs)
+	std::array<f32, 16> m_fs_lod_bias{};
 	const MTLVertexProgram* m_vertex_prog = nullptr;
 	mtl::glsl::program* m_program = nullptr;
 	mtl::glsl::program* m_prev_program = nullptr;
@@ -70,8 +73,9 @@ private:
 	std::unique_ptr<mtl::buffer> null_buffer;
 	std::unique_ptr<mtl::buffer_view> null_buffer_view;
 
-	// Placeholder depth texture for shadow samplers of disabled texture units (depth2d<> cannot take a colour view)
-	std::unique_ptr<mtl::viewable_image> m_null_depth_texture;
+	// Placeholder depth textures for shadow samplers without a bound image (depth2d<>/depthcube<> cannot take colour views)
+	// [0] = 2D (also 1D, declared as 2D), [1] = Cube
+	std::array<std::unique_ptr<mtl::viewable_image>, 2> m_null_depth_textures;
 
 	std::unique_ptr<mtl::upscaler> m_upscaler;
 	output_scaling_mode m_output_scaling{output_scaling_mode::bilinear};
@@ -101,7 +105,7 @@ private:
 	std::unique_ptr<mtl::render_device> m_device;
 	mtl::timeline m_timeline;
 	void* m_view = nullptr;                      // NSView of the game window
-	CA::MetalLayer* m_metal_layer = nullptr;     // Backing layer of m_view (not owned)
+	CA::MetalLayer* m_metal_layer = nullptr;     // Backing layer of m_view (retained, released on teardown)
 	bool m_layer_framebuffer_only = true;
 
 	// Occlusion queries (visibility result buffers)

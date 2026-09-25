@@ -89,8 +89,240 @@ namespace mtl
 		return { bytes_per_row, bytes_per_image };
 	}
 
+	// ---------------------------------------------------------------------------------------------------------------
+	// Alignment-safe transfers
+	// ---------------------------------------------------------------------------------------------------------------
+	// Apple GPU / macOS blit rules:
+	//  - buffer <-> texture copies: the buffer offset must be a multiple of 16 bytes (covers every texel and block size
+	//    used here) and bytesPerRow a multiple of the texel (block) size.
+	//  - buffer -> buffer copies: source offset, destination offset and size must be multiples of 4.
+	// Guest memory (DMA blocks, zero-copy uploads) has arbitrary alignment. Misaligned transfers go through an aligned
+	// staging buffer and/or a byte-granular compute copy, so correctness never depends on guest alignment.
+	static constexpr u64 s_texture_copy_buffer_alignment = 16;
+	static constexpr u64 s_buffer_copy_alignment = 4;
+
+	// Byte-granular strided buffer copy: `rows` rows of `row_length` bytes, source/destination row pitches independent.
+	// Each invocation owns one destination word; bytes of that word outside the copied rows (edges, gaps between rows)
+	// are preserved with a read-modify-write, exactly like a blit that only touches the copied bytes.
+	struct cs_byte_copy_task : compute_task
+	{
+		const mtl::buffer* m_src_buffer = nullptr;
+		const mtl::buffer* m_dst_buffer = nullptr;
+		u64 m_src_base = 0;
+		u64 m_src_range = 0;
+		u64 m_dst_base = 0;
+		u64 m_dst_range = 0;
+		std::array<u32, 8> m_params{};
+
+		cs_byte_copy_task()
+		{
+			ssbo_count = 2;
+			use_push_constants = true;
+			push_constants_size = 32;
+
+			create();
+
+			const std::pair<std::string_view, std::string> syntax_replace[] =
+			{
+				{ "%ws", std::to_string(optimal_group_size) },
+			};
+
+			m_src = fmt::replace_all(std::string(
+				"#version 430\n"
+				"layout(local_size_x=%ws, local_size_y=1, local_size_z=1) in;\n"
+				"layout(set=0, binding=0, std430) readonly buffer ssbo0{ uint src_data[]; };\n"
+				"layout(set=0, binding=1, std430) buffer ssbo1{ uint dst_data[]; };\n"
+				"layout(push_constant) uniform ubo{ uvec4 params[2]; };\n"
+				"\n"
+				"// params[0] = { src byte offset, dst byte offset (both relative to the bound word), row length, rows }\n"
+				"// params[1] = { src pitch, dst pitch, destination words to process, unused }\n"
+				"\n"
+				"uint linear_invocation_id()\n"
+				"{\n"
+				"	uint size_in_x = (gl_NumWorkGroups.x * gl_WorkGroupSize.x);\n"
+				"	return (gl_GlobalInvocationID.y * size_in_x) + gl_GlobalInvocationID.x;\n"
+				"}\n"
+				"\n"
+				"void main()\n"
+				"{\n"
+				"	uint word = linear_invocation_id();\n"
+				"	if (word >= params[1].z)\n"
+				"		return;\n"
+				"\n"
+				"	uint src_rel = params[0].x;\n"
+				"	uint dst_rel = params[0].y;\n"
+				"	uint row_length = params[0].z;\n"
+				"	uint rows = params[0].w;\n"
+				"	uint src_pitch = params[1].x;\n"
+				"	uint dst_pitch = params[1].y;\n"
+				"\n"
+				"	uint value = 0u;\n"
+				"	uint mask = 0u;\n"
+				"\n"
+				"	for (uint i = 0u; i < 4u; ++i)\n"
+				"	{\n"
+				"		uint dst_byte = (word << 2) + i;\n"
+				"		if (dst_byte < dst_rel)\n"
+				"			continue;\n"
+				"\n"
+				"		uint rel = dst_byte - dst_rel;\n"
+				"		uint row = rel / dst_pitch;\n"
+				"		uint col = rel - (row * dst_pitch);\n"
+				"		if (row >= rows || col >= row_length)\n"
+				"			continue;\n"
+				"\n"
+				"		uint src_byte = src_rel + (row * src_pitch) + col;\n"
+				"		uint data = (src_data[src_byte >> 2] >> ((src_byte & 3u) << 3)) & 0xFFu;\n"
+				"		value |= data << (i << 3);\n"
+				"		mask |= 0xFFu << (i << 3);\n"
+				"	}\n"
+				"\n"
+				"	if (mask == 0u)\n"
+				"		return;\n"
+				"\n"
+				"	if (mask != 0xFFFFFFFFu)\n"
+				"	{\n"
+				"		value |= dst_data[word] & ~mask;\n"
+				"	}\n"
+				"\n"
+				"	dst_data[word] = value;\n"
+				"}\n"), syntax_replace);
+		}
+
+		void bind_resources(mtl::command_list& /*cmd*/) override
+		{
+			push_constants(0, ::size32(m_params) * 4, m_params.data());
+			m_program->bind_uniform({ m_src_buffer, m_src_base, m_src_range }, glsl::binding_set_index_compute, 0);
+			m_program->bind_uniform({ m_dst_buffer, m_dst_base, m_dst_range }, glsl::binding_set_index_compute, 1);
+		}
+
+		void run(mtl::command_list& cmd,
+			const mtl::buffer* src, u64 src_offset, u64 src_pitch,
+			const mtl::buffer* dst, u64 dst_offset, u64 dst_pitch,
+			u64 row_length, u32 rows)
+		{
+			ensure(row_length && rows && src_pitch >= row_length && dst_pitch >= row_length);
+
+			const u64 src_span = u64{ rows - 1 } * src_pitch + row_length;
+			const u64 dst_span = u64{ rows - 1 } * dst_pitch + row_length;
+			ensure((src_offset + src_span) <= src->size() && (dst_offset + dst_span) <= dst->size());
+
+			// Bind 4-byte aligned windows; the kernel addresses bytes relative to them
+			m_src_buffer = src;
+			m_dst_buffer = dst;
+			m_src_base = src_offset & ~(s_buffer_copy_alignment - 1);
+			m_dst_base = dst_offset & ~(s_buffer_copy_alignment - 1);
+
+			const u64 src_rel = src_offset - m_src_base;
+			const u64 dst_rel = dst_offset - m_dst_base;
+			const u64 dst_words = utils::align<u64>(dst_rel + dst_span, 4) / 4;
+
+			// The kernel touches whole words; the partial edge words must still lie inside the buffers
+			// (always true for our MB/64K granular allocations)
+			m_src_range = utils::align<u64>(src_rel + src_span, 4);
+			m_dst_range = dst_words * 4;
+			ensure((m_src_base + m_src_range) <= src->size() && (m_dst_base + m_dst_range) <= dst->size());
+
+			ensure(dst_words <= u32{ umax } && src_pitch <= u32{ umax } && dst_pitch <= u32{ umax } && (src_rel + src_span) <= u32{ umax });
+			m_params =
+			{
+				static_cast<u32>(src_rel), static_cast<u32>(dst_rel), static_cast<u32>(row_length), rows,
+				static_cast<u32>(src_pitch), static_cast<u32>(dst_pitch), static_cast<u32>(dst_words), 0
+			};
+
+			compute_task::run(cmd, utils::aligned_div(static_cast<u32>(dst_words), optimal_group_size));
+		}
+	};
+
+	// Private aligned staging area for misaligned buffer <-> texture transfers. Separate from the double-buffered
+	// scratch pool so it can never alias a scratch buffer the caller is currently using.
+	static std::unique_ptr<mtl::buffer> g_transfer_staging_buffer;
+
+	static mtl::buffer* get_transfer_staging_buffer(u64 min_required_size)
+	{
+		if (g_transfer_staging_buffer && g_transfer_staging_buffer->size() < min_required_size)
+		{
+			// In-flight commands may still reference it
+			mtl::get_resource_manager()->dispose(g_transfer_staging_buffer);
+		}
+
+		if (!g_transfer_staging_buffer)
+		{
+			g_transfer_staging_buffer = std::make_unique<mtl::buffer>(*g_render_device, utils::align<u64>(min_required_size, 0x100000),
+				memory_location::device_local, "transfer staging buffer");
+		}
+
+		return g_transfer_staging_buffer.get();
+	}
+
+	// Strided buffer -> buffer copy with any alignment. Rows of one call are independent of each other.
+	static void copy_buffer_rows_impl(mtl::command_list& cmd,
+		const mtl::buffer* src, u64 src_offset, u64 src_pitch,
+		const mtl::buffer* dst, u64 dst_offset, u64 dst_pitch,
+		u64 row_length, u32 rows, bool ordered)
+	{
+		if (!row_length || !rows)
+		{
+			return;
+		}
+
+		if (rows == 1 || (src_pitch == row_length && dst_pitch == row_length))
+		{
+			// Contiguous: collapse into a single row
+			row_length *= rows;
+			rows = 1;
+			src_pitch = dst_pitch = row_length;
+		}
+
+		const u64 alignment_bits = src_offset | dst_offset | row_length | (rows > 1 ? (src_pitch | dst_pitch) : 0);
+		if ((alignment_bits & (s_buffer_copy_alignment - 1)) == 0)
+		{
+			for (u32 row = 0; row < rows; ++row)
+			{
+				auto encoder = (ordered && row == 0) ? cmd.compute() : cmd.compute_unordered();
+				encoder->copyFromBuffer(src->value(), src_offset + row * src_pitch, dst->value(), dst_offset + row * dst_pitch, row_length);
+			}
+			return;
+		}
+
+		// Always ordered (program::bind records a barrier), so edge-word read-modify-writes never race
+		mtl::get_compute_task<cs_byte_copy_task>()->run(cmd, src, src_offset, src_pitch, dst, dst_offset, dst_pitch, row_length, rows);
+	}
+
+	void copy_buffer_rows(mtl::command_list& cmd,
+		const mtl::buffer* src, u64 src_offset, u64 src_pitch,
+		const mtl::buffer* dst, u64 dst_offset, u64 dst_pitch,
+		u64 row_length, u32 rows)
+	{
+		copy_buffer_rows_impl(cmd, src, src_offset, src_pitch, dst, dst_offset, dst_pitch, row_length, rows, true);
+	}
+
+	void copy_buffer_to_buffer_aligned(mtl::command_list& cmd, const mtl::buffer* src, u64 src_offset, const mtl::buffer* dst, u64 dst_offset, u64 length)
+	{
+		copy_buffer_rows_impl(cmd, src, src_offset, length, dst, dst_offset, length, length, 1, true);
+	}
+
+	// Bytes of texel data per row, block rows and slices touched by a buffer <-> texture copy of `region`
+	struct region_rows_t
+	{
+		u64 row_bytes;
+		u32 rows;
+		u32 slices;
+	};
+
+	static region_rows_t get_region_rows(const mtl::image* img, const buffer_image_copy& region, u32 aspect)
+	{
+		const auto block = get_format_block_info(img->format(), aspect);
+		return
+		{
+			u64{ utils::aligned_div(static_cast<u32>(region.image_extent.width), u32{ block.block_width }) } * block.bytes_per_block,
+			utils::aligned_div(static_cast<u32>(region.image_extent.height), u32{ block.block_height }),
+			static_cast<u32>(region.image_extent.depth)
+		};
+	}
+
 	// vkCmdCopyBufferToImage equivalent (one region, any number of layers)
-	static void copy_buffer_to_image_impl(mtl::command_list& cmd, const MTL::Buffer* src, const mtl::image* dst, const buffer_image_copy& region, bool ordered = true)
+	static void copy_buffer_to_image_impl(mtl::command_list& cmd, const mtl::buffer* src, const mtl::image* dst, const buffer_image_copy& region, bool ordered = true)
 	{
 		const u32 aspect = get_transfer_aspect(dst, region);
 		const auto options = get_blit_option(dst, aspect);
@@ -103,14 +335,30 @@ namespace mtl
 
 		for (u32 layer = 0; layer < region.layer_count; ++layer)
 		{
-			auto encoder = (ordered && layer == 0) ? cmd.compute() : cmd.compute_unordered();
-			encoder->copyFromBuffer(src, region.buffer_offset + layer * layer_stride, bytes_per_row, bytes_per_image_arg,
-				region.image_extent, dst->value, is_3d ? 0 : (region.base_layer + layer), region.mip_level, region.image_offset, options);
+			const u64 offset = region.buffer_offset + layer * layer_stride;
+			const u32 slice = is_3d ? 0 : (region.base_layer + layer);
+
+			if ((offset % s_texture_copy_buffer_alignment) == 0) [[likely]]
+			{
+				auto encoder = (ordered && layer == 0) ? cmd.compute() : cmd.compute_unordered();
+				encoder->copyFromBuffer(src->value(), offset, bytes_per_row, bytes_per_image_arg,
+					region.image_extent, dst->value, slice, region.mip_level, region.image_offset, options);
+				continue;
+			}
+
+			// Misaligned source (e.g. zero-copy guest memory): move the data into the aligned staging area first
+			const auto extent = get_region_rows(dst, region, aspect);
+			const u64 span = u64{ extent.slices - 1 } * bytes_per_image + u64{ extent.rows - 1 } * bytes_per_row + extent.row_bytes;
+			const auto staging = get_transfer_staging_buffer(span);
+
+			copy_buffer_rows_impl(cmd, src, offset, span, staging, 0, span, span, 1, true);
+			cmd.compute()->copyFromBuffer(staging->value(), 0, bytes_per_row, bytes_per_image_arg,
+				region.image_extent, dst->value, slice, region.mip_level, region.image_offset, options);
 		}
 	}
 
 	// vkCmdCopyImageToBuffer equivalent (one region, any number of layers)
-	static void copy_image_to_buffer_impl(mtl::command_list& cmd, const mtl::image* src, const MTL::Buffer* dst, const buffer_image_copy& region, bool ordered = true)
+	static void copy_image_to_buffer_impl(mtl::command_list& cmd, const mtl::image* src, const mtl::buffer* dst, const buffer_image_copy& region, bool ordered = true)
 	{
 		ensure(src->samples() == 1, "Metal cannot copy multisampled textures to buffers");
 
@@ -124,24 +372,63 @@ namespace mtl
 
 		for (u32 layer = 0; layer < region.layer_count; ++layer)
 		{
-			auto encoder = (ordered && layer == 0) ? cmd.compute() : cmd.compute_unordered();
-			encoder->copyFromTexture(src->value, is_3d ? 0 : (region.base_layer + layer), region.mip_level, region.image_offset, region.image_extent,
-				dst, region.buffer_offset + layer * layer_stride, bytes_per_row, bytes_per_image_arg, options);
-		}
-	}
+			const u64 offset = region.buffer_offset + layer * layer_stride;
+			const u32 slice = is_3d ? 0 : (region.base_layer + layer);
 
-	// vkCmdCopyBuffer equivalent. Regions of one call are independent of each other.
-	static void copy_buffer_regions(mtl::command_list& cmd, const MTL::Buffer* src, const MTL::Buffer* dst, const buffer_copy_t* regions, usz count)
-	{
-		for (usz i = 0; i < count; ++i)
-		{
-			if (!regions[i].size)
+			if ((offset % s_texture_copy_buffer_alignment) == 0) [[likely]]
 			{
+				auto encoder = (ordered && layer == 0) ? cmd.compute() : cmd.compute_unordered();
+				encoder->copyFromTexture(src->value, slice, region.mip_level, region.image_offset, region.image_extent,
+					dst->value(), offset, bytes_per_row, bytes_per_image_arg, options);
 				continue;
 			}
 
-			auto encoder = (i == 0) ? cmd.compute() : cmd.compute_unordered();
-			encoder->copyFromBuffer(src, regions[i].src_offset, dst, regions[i].dst_offset, regions[i].size);
+			// Misaligned destination (e.g. a DMA block at an arbitrary guest address): copy into the aligned staging area,
+			// then move only the texel rows so the bytes between rows (pitch padding) stay untouched, like a direct copy.
+			const auto extent = get_region_rows(src, region, aspect);
+			const u64 span = u64{ extent.slices - 1 } * bytes_per_image + u64{ extent.rows - 1 } * bytes_per_row + extent.row_bytes;
+			const auto staging = get_transfer_staging_buffer(span);
+
+			cmd.compute()->copyFromTexture(src->value, slice, region.mip_level, region.image_offset, region.image_extent,
+				staging->value(), 0, bytes_per_row, bytes_per_image_arg, options);
+
+			for (u32 z = 0; z < extent.slices; ++z)
+			{
+				copy_buffer_rows_impl(cmd, staging, z * bytes_per_image, bytes_per_row,
+					dst, offset + z * bytes_per_image, bytes_per_row, extent.row_bytes, extent.rows, true);
+			}
+		}
+	}
+
+	// vkCmdCopyBuffer equivalent. Regions of one call are independent of each other (disjoint destinations).
+	// Runs of equally sized regions with constant strides (row-by-row copies) are merged into one strided copy.
+	static void copy_buffer_regions(mtl::command_list& cmd, const mtl::buffer* src, const mtl::buffer* dst, const buffer_copy_t* regions, usz count)
+	{
+		usz i = 0;
+		while (i < count)
+		{
+			const auto& first = regions[i];
+			const u64 size = first.size;
+			usz j = i + 1;
+			u64 src_pitch = size;
+			u64 dst_pitch = size;
+
+			if (size && j < count && regions[j].size == size &&
+				regions[j].src_offset >= first.src_offset + size && regions[j].dst_offset >= first.dst_offset + size)
+			{
+				src_pitch = regions[j].src_offset - first.src_offset;
+				dst_pitch = regions[j].dst_offset - first.dst_offset;
+
+				while (j < count && regions[j].size == size &&
+					regions[j].src_offset == regions[j - 1].src_offset + src_pitch &&
+					regions[j].dst_offset == regions[j - 1].dst_offset + dst_pitch)
+				{
+					++j;
+				}
+			}
+
+			copy_buffer_rows_impl(cmd, src, first.src_offset, src_pitch, dst, first.dst_offset, dst_pitch, size, static_cast<u32>(j - i), i == 0);
+			i = j;
 		}
 	}
 
@@ -224,12 +511,12 @@ namespace mtl
 
 	void copy_image_to_buffer_raw(mtl::command_list& cmd, const mtl::image* src, const mtl::buffer* dst, const buffer_image_copy& region)
 	{
-		copy_image_to_buffer_impl(cmd, src, dst->value(), region);
+		copy_image_to_buffer_impl(cmd, src, dst, region);
 	}
 
 	void copy_buffer_to_image_raw(mtl::command_list& cmd, const mtl::buffer* src, const mtl::image* dst, const buffer_image_copy& region)
 	{
-		copy_buffer_to_image_impl(cmd, src->value(), dst, region);
+		copy_buffer_to_image_impl(cmd, src, dst, region);
 	}
 
 	u64 calculate_working_buffer_size(u64 base_size, u32 aspect)
@@ -269,7 +556,7 @@ namespace mtl
 		default:
 		{
 			ensure(!options.swap_bytes); // "Implicit byteswap option not supported for speficied format"
-			copy_image_to_buffer_impl(cmd, src, dst->value(), region);
+			copy_image_to_buffer_impl(cmd, src, dst, region);
 			break;
 		}
 		case MTL::PixelFormatDepth32Float:
@@ -291,7 +578,7 @@ namespace mtl
 			// 1. Copy the depth to buffer
 			buffer_image_copy region2 = region;
 			region2.buffer_offset = z32_offset;
-			copy_image_to_buffer_impl(cmd, src, dst->value(), region2);
+			copy_image_to_buffer_impl(cmd, src, dst, region2);
 
 			// 2. Do conversion with byteswap [D32->D16F]
 			if (!options.swap_bytes) [[likely]]
@@ -331,8 +618,8 @@ namespace mtl
 			sub_regions[0].aspect = aspect_depth;
 			sub_regions[1].buffer_offset = s_offset;
 			sub_regions[1].aspect = aspect_stencil;
-			copy_image_to_buffer_impl(cmd, src, dst->value(), sub_regions[0]);
-			copy_image_to_buffer_impl(cmd, src, dst->value(), sub_regions[1], false);
+			copy_image_to_buffer_impl(cmd, src, dst, sub_regions[0]);
+			copy_image_to_buffer_impl(cmd, src, dst, sub_regions[1], false);
 
 			// 2. Interleave the separated data blocks with a compute job
 			mtl::cs_interleave_task *job;
@@ -384,7 +671,7 @@ namespace mtl
 		{
 		default:
 		{
-			copy_buffer_to_image_impl(cmd, src->value(), dst, region);
+			copy_buffer_to_image_impl(cmd, src, dst, region);
 			break;
 		}
 		case MTL::PixelFormatDepth32Float:
@@ -410,7 +697,7 @@ namespace mtl
 			// 2. Copy the depth data to image
 			buffer_image_copy region2 = region;
 			region2.buffer_offset = z32_offset;
-			copy_buffer_to_image_impl(cmd, src->value(), dst, region2);
+			copy_buffer_to_image_impl(cmd, src, dst, region2);
 			break;
 		}
 		case MTL::PixelFormatDepth24Unorm_Stencil8:
@@ -456,8 +743,8 @@ namespace mtl
 			sub_regions[0].aspect = aspect_depth;
 			sub_regions[1].buffer_offset = s_offset;
 			sub_regions[1].aspect = aspect_stencil;
-			copy_buffer_to_image_impl(cmd, src->value(), dst, sub_regions[0]);
-			copy_buffer_to_image_impl(cmd, src->value(), dst, sub_regions[1], false);
+			copy_buffer_to_image_impl(cmd, src, dst, sub_regions[0]);
+			copy_buffer_to_image_impl(cmd, src, dst, sub_regions[1], false);
 			break;
 		}
 		}
@@ -509,8 +796,8 @@ namespace mtl
 				scratch_buf = get_scratch_buffer(cmd, length);
 			}
 
-			copy_image_to_buffer_impl(cmd, src, scratch_buf->value(), src_copy);
-			copy_buffer_to_image_impl(cmd, scratch_buf->value(), dst, dst_copy);
+			copy_image_to_buffer_impl(cmd, src, scratch_buf, src_copy);
+			copy_buffer_to_image_impl(cmd, scratch_buf, dst, dst_copy);
 
 			if (remaining_levels > 1)
 			{
@@ -1036,13 +1323,17 @@ namespace mtl
 					auto& copy = buffer_copies.back();
 					copy.src_offset = offset_in_upload_buffer;
 					copy.dst_offset = scratch_offset;
-					copy.size = image_linear_size;
+					// Round up to a word so the (4-byte aligned) copy stays a blit: the heap allocation has 8 bytes of
+					// padding and the next scratch subresource starts 16-byte aligned.
+					copy.size = utils::align<u64>(image_linear_size, 4);
 				}
 
 				// Point data source to scratch mem
 				copy_info.buffer_offset = scratch_offset;
 
-				scratch_offset += image_linear_size;
+				// Metal: keep every subresource 16-byte aligned (buffer -> texture copy offsets, compute bindings).
+				// The 128 bytes per level reserved above cover the padding.
+				scratch_offset = utils::align(scratch_offset + image_linear_size, static_cast<u32>(s_texture_copy_buffer_alignment));
 				ensure((scratch_offset + image_linear_size) <= scratch_buf->size()); // "Out of scratch memory"
 			}
 
@@ -1072,14 +1363,14 @@ namespace mtl
 				auto range_ptr = buffer_copies.data();
 				for (const auto& op : upload_commands)
 				{
-					copy_buffer_regions(cmd2, op.first->value(), scratch_buf->value(), range_ptr, op.second);
+					copy_buffer_regions(cmd2, op.first, scratch_buf, range_ptr, op.second);
 					range_ptr += op.second;
 				}
 			}
 			else
 			{
 				ensure(!buffer_copies.empty());
-				copy_buffer_regions(cmd2, upload_buffer->value(), scratch_buf->value(), buffer_copies.data(), buffer_copies.size());
+				copy_buffer_regions(cmd2, upload_buffer, scratch_buf, buffer_copies.data(), buffer_copies.size());
 			}
 		}
 
@@ -1108,7 +1399,7 @@ namespace mtl
 
 			for (usz i = 0; i < copy_regions.size(); ++i)
 			{
-				copy_buffer_to_image_impl(cmd2, scratch_buf->value(), dst_image, copy_regions[i], i == 0);
+				copy_buffer_to_image_impl(cmd2, scratch_buf, dst_image, copy_regions[i], i == 0);
 			}
 		}
 		else if (upload_commands.size() > 1)
@@ -1118,7 +1409,7 @@ namespace mtl
 			{
 				for (u32 i = 0; i < op.second; ++i)
 				{
-					copy_buffer_to_image_impl(cmd2, op.first->value(), dst_image, region_ptr[i], i == 0);
+					copy_buffer_to_image_impl(cmd2, op.first, dst_image, region_ptr[i], i == 0);
 				}
 				region_ptr += op.second;
 			}
@@ -1127,7 +1418,7 @@ namespace mtl
 		{
 			for (usz i = 0; i < copy_regions.size(); ++i)
 			{
-				copy_buffer_to_image_impl(cmd2, upload_buffer->value(), dst_image, copy_regions[i], i == 0);
+				copy_buffer_to_image_impl(cmd2, upload_buffer, dst_image, copy_regions[i], i == 0);
 			}
 		}
 
@@ -1150,9 +1441,9 @@ namespace mtl
 		mtl::load_dma(range.start, section_length);
 
 		// Allocate scratch and prepare for the GPU job
-		const auto scratch_buf = mtl::get_scratch_buffer(cmd, section_length * 3);       // 0 = linear data, 1 = padding (deswz), 2 = tiled data
-
-		const auto tiled_data_scratch_offset = section_length * 2;
+		// 0 = linear data, 1 = padding (deswz), 2 = tiled data. Metal: the tiled block is 256-byte aligned for the kernel binding.
+		const auto tiled_data_scratch_offset = utils::align<u32>(section_length * 2, 256);
+		const auto scratch_buf = mtl::get_scratch_buffer(cmd, tiled_data_scratch_offset + section_length);
 		const auto linear_data_scratch_offset = 0u;
 
 		// Schedule the job
@@ -1168,7 +1459,7 @@ namespace mtl
 			.dst = scratch_buf,
 			.dst_offset = linear_data_scratch_offset,
 			.src = scratch_buf,
-			.src_offset = section_length * 2,
+			.src_offset = tiled_data_scratch_offset,
 
 			.image_width = width,
 			.image_height = height,
@@ -1183,7 +1474,7 @@ namespace mtl
 			.dst_offset = tiled_data_scratch_offset,
 			.size = section_length
 		};
-		copy_buffer_regions(cmd, dma_mapping.second->value(), scratch_buf->value(), &copy_rgn, 1);
+		copy_buffer_regions(cmd, dma_mapping.second, scratch_buf, &copy_rgn, 1);
 
 		// Detile
 		mtl::get_compute_task<mtl::cs_tile_memcpy<RSX_detiler_op::decode>>()->run(cmd, config);
@@ -1623,6 +1914,7 @@ namespace mtl
 		g_scratch_buffers_pool.current_index = 0;
 
 		g_typeless_textures.clear();
+		g_transfer_staging_buffer.reset();
 		g_null_sampler.reset();
 	}
 

@@ -41,13 +41,82 @@ namespace mtl
 	// ---- Global scratch heap ----------------------------------------------------------------------------------------
 	// The RSX thread (and the UI thread while the renderer is being created/destroyed) uses the main ring, which is
 	// registered with the frame heap snapshots. Other threads (access violation handlers flushing through the secondary
-	// command list chain, etc.) get a private growable ring each: data_heap is not thread-safe. Private rings live until
-	// the renderer is destroyed (they are never recycled by frame snapshots, so they only grow through the GC).
+	// command list chain, etc.) get a private ring each: data_heap is not thread-safe. Private rings are recycled by
+	// their owning thread after each synchronous secondary submission (recycle_thread_scratch_heap).
 	static mtl::data_heap g_scratch_heap;
+
+	// Push constants, overlay UBOs/VAOs: a few KiB per pass. Sized so that grow() is not reached in normal use.
+	static constexpr usz s_thread_scratch_heap_size = 4 * 0x100000;
+	static constexpr usz s_thread_scratch_heap_limit = 64 * 0x100000;
+
+	class thread_scratch_ring final : public mtl::data_heap
+	{
+		// Backing stores replaced by grow(). The owning thread's in-flight work may still read them; they are released
+		// on the next successful recycle (after that work has been waited for). Never goes through the frame GC, whose
+		// event ids track RSX thread submissions only.
+		std::vector<std::unique_ptr<mtl::buffer>> m_retired_buffers;
+
+		// Secondary list left recording by a previous operation of this thread. It may contain commands referencing this
+		// ring, so the ring cannot be recycled before that list has been submitted and has completed.
+		mtl::command_buffer_chunk* m_pending_cmd = nullptr;
+
+	protected:
+		// NOTE: Unlike mtl::data_heap::grow, never syncs the DMA offloader (this runs on PPU/SPU threads).
+		bool grow(usz size) override
+		{
+			usz new_size = std::max<usz>(m_size * 2, m_size + size);
+			new_size = std::min<usz>(new_size, s_thread_scratch_heap_limit);
+			new_size = utils::align<usz>(std::max<usz>(new_size, size + 0x100000), 0x100000);
+
+			rsx_log.warning("[%s] Thread scratch ring exhausted, growing from 0x%llx to 0x%llx bytes", m_name, u64{ m_size }, u64{ new_size });
+
+			const char* name = m_name;
+			const usz guard = m_min_guard_size;
+
+			m_retired_buffers.push_back(std::move(heap));
+			create(new_size, name, guard);
+			return true;
+		}
+
+	public:
+		void recycle(mtl::command_buffer_chunk& cmd)
+		{
+			if (m_pending_cmd)
+			{
+				if (m_pending_cmd->is_recording())
+				{
+					// Still not submitted; try again next time
+					return;
+				}
+
+				m_pending_cmd->wait();
+				m_pending_cmd = nullptr;
+			}
+
+			if (cmd.is_recording())
+			{
+				m_pending_cmd = &cmd;
+				return;
+			}
+
+			// All work recorded by this thread has completed
+			cmd.wait();
+
+			m_retired_buffers.clear();
+			reset_allocation_stats();
+		}
+
+		void release()
+		{
+			m_pending_cmd = nullptr;
+			m_retired_buffers.clear();
+			destroy();
+		}
+	};
 
 	struct thread_scratch_heap
 	{
-		mtl::data_heap heap;
+		thread_scratch_ring ring;
 	};
 
 	static shared_mutex g_thread_scratch_heaps_lock;
@@ -67,7 +136,7 @@ namespace mtl
 			reader_lock lock(g_thread_scratch_heaps_lock);
 			if (const auto found = g_thread_scratch_heaps.find(thread_id); found != g_thread_scratch_heaps.end())
 			{
-				return found->second->heap;
+				return found->second->ring;
 			}
 		}
 
@@ -76,10 +145,36 @@ namespace mtl
 		if (!entry)
 		{
 			entry = std::make_unique<thread_scratch_heap>();
-			entry->heap.create(0x100000, "thread scratch buffer", 0x1000);
+			entry->ring.create(s_thread_scratch_heap_size, "thread scratch buffer", 0x1000);
 		}
 
-		return entry->heap;
+		return entry->ring;
+	}
+
+	// Called by a non-RSX thread after its synchronous work on the secondary chain (cmd) has been recorded/submitted.
+	// Waits for that work and recycles the calling thread's private scratch ring. No-op on the RSX thread.
+	static void recycle_thread_scratch_heap(mtl::command_buffer_chunk& cmd)
+	{
+		const auto renderer = rsx::get_current_renderer();
+		if (!renderer || renderer->is_current_thread())
+		{
+			return;
+		}
+
+		thread_scratch_heap* entry = nullptr;
+		{
+			reader_lock lock(g_thread_scratch_heaps_lock);
+			if (const auto found = g_thread_scratch_heaps.find(std::this_thread::get_id()); found != g_thread_scratch_heaps.end())
+			{
+				entry = found->second.get();
+			}
+		}
+
+		if (entry)
+		{
+			// Only the owning thread touches its ring (entries are removed at renderer teardown only)
+			entry->ring.recycle(cmd);
+		}
 	}
 
 	static void destroy_thread_scratch_heaps()
@@ -87,7 +182,7 @@ namespace mtl
 		std::lock_guard lock(g_thread_scratch_heaps_lock);
 		for (auto& [id, entry] : g_thread_scratch_heaps)
 		{
-			entry->heap.destroy();
+			entry->ring.release();
 		}
 
 		g_thread_scratch_heaps.clear();
@@ -283,8 +378,16 @@ namespace mtl
 
 		if (backend_config.supports_hw_a2c || num_rasterization_samples > 1)
 		{
+			// Mirrors VK set_multisample_state. msaa_enabled is ignored there as well.
+			// NOTE: msaa_sample_mask is not applied: Metal pipelines have no fixed-function sample mask (it would need a
+			// [[sample_mask]] fragment output emitted by the decompiler).
 			const bool alpha_to_one_enable = REGS(ctx)->msaa_alpha_to_one_enabled() && backend_config.supports_hw_a2one;
-			state.alpha_to_coverage = REGS(ctx)->msaa_alpha_to_coverage_enabled() ? 1 : 0;
+
+			// Hardware A2C only on multisampled pipelines; single-sample A2C is emulated in the fragment shader
+			// (backend_config.supports_hw_a2c_1spp = false -> RSX_SHADER_CONTROL_ALPHA_TO_COVERAGE).
+			const bool alpha_to_coverage_enable = REGS(ctx)->msaa_alpha_to_coverage_enabled() && num_rasterization_samples > 1;
+
+			state.alpha_to_coverage = alpha_to_coverage_enable ? 1 : 0;
 			state.alpha_to_one = alpha_to_one_enable ? 1 : 0;
 		}
 
@@ -325,6 +428,11 @@ MTLGSRender::MTLGSRender(utils::serial* ar) noexcept : GSRender(ar)
 	if (m_view)
 	{
 		m_metal_layer = mtl::get_metal_layer_from_view(m_view);
+		if (m_metal_layer)
+		{
+			// The view owns the layer; keep our own reference in case the window drops it before the renderer is gone
+			m_metal_layer->retain();
+		}
 	}
 
 	if (m_metal_layer)
@@ -463,7 +571,7 @@ MTLGSRender::MTLGSRender(utils::serial* ar) noexcept : GSRender(ar)
 	{
 		backend_config.supports_hw_msaa = true;
 		backend_config.supports_hw_a2c = true;
-		backend_config.supports_hw_a2c_1spp = true;
+		backend_config.supports_hw_a2c_1spp = false;          // Metal A2C is only used on multisampled pipelines (see decode_rsx_state)
 		backend_config.supports_hw_a2one = true;
 	}
 
@@ -559,7 +667,10 @@ MTLGSRender::~MTLGSRender()
 
 	m_overlay_recording_img.reset();
 	m_stencil_mirror_sampler.reset();
-	m_null_depth_texture.reset();
+	for (auto& null_texture : m_null_depth_textures)
+	{
+		null_texture.reset();
+	}
 	fs_sampler_handles.fill(nullptr);
 	vs_sampler_handles.fill(nullptr);
 
@@ -591,11 +702,18 @@ MTLGSRender::~MTLGSRender()
 
 	// Device handles/contexts
 	m_timeline.destroy();
-	m_metal_layer = nullptr;
+
+	// The queue references the layer's residency set; drop our layer reference only once the device is gone
+	const auto metal_layer = std::exchange(m_metal_layer, nullptr);
 
 	mtl::g_render_device = nullptr;
 	m_device->destroy();
 	m_device.reset();
+
+	if (metal_layer)
+	{
+		metal_layer->release();
+	}
 }
 
 bool MTLGSRender::on_access_violation(u32 address, bool is_writing)
@@ -680,10 +798,11 @@ bool MTLGSRender::on_access_violation(u32 address, bool is_writing)
 			};
 		}
 
+		auto secondary_cmd = m_secondary_cb_list.next();
 		{
 			// Metal objects created by the flush are autoreleased on this (foreign) thread
 			mtl::autorelease_scope pool;
-			m_texture_cache.flush_all(*m_secondary_cb_list.next(), result, data_transfer_completed_callback);
+			m_texture_cache.flush_all(*secondary_cmd, result, data_transfer_completed_callback);
 		}
 
 		if (has_queue_ref)
@@ -691,6 +810,9 @@ bool MTLGSRender::on_access_violation(u32 address, bool is_writing)
 			// Release RSX thread if it's still locked
 			m_flush_requests.remove_one();
 		}
+
+		// The flush is synchronous; recycle this thread's private scratch ring (no-op on the RSX thread)
+		mtl::recycle_thread_scratch_heap(*secondary_cmd);
 	}
 
 	return true;
@@ -701,7 +823,8 @@ void MTLGSRender::on_invalidate_memory_range(const utils::address_range32 &range
 	mtl::autorelease_scope pool;
 	std::lock_guard lock(m_secondary_cb_guard);
 
-	auto data = m_texture_cache.invalidate_range(*m_secondary_cb_list.next(), range, cause);
+	auto secondary_cmd = m_secondary_cb_list.next();
+	auto data = m_texture_cache.invalidate_range(*secondary_cmd, range, cause);
 	AUDIT(data.empty());
 
 	if (cause == rsx::invalidation_cause::unmap)
@@ -717,6 +840,9 @@ void MTLGSRender::on_invalidate_memory_range(const utils::address_range32 &range
 
 		mtl::unmap_dma(range.start, range.length());
 	}
+
+	// Recycle this thread's private scratch ring (no-op on the RSX thread)
+	mtl::recycle_thread_scratch_heap(*secondary_cmd);
 }
 
 void MTLGSRender::on_semaphore_acquire_wait()
@@ -1599,6 +1725,13 @@ void MTLGSRender::update_vertex_env(u32 id, const mtl::vertex_upload_info& verte
 		blend_config[6] = std::bit_cast<u32>(blend_colors[3]);
 
 		m_program->push_constants(mtl::glsl::binding_set_index_fragment, 4, 28, blend_config);
+	}
+
+	if (m_fragment_prog && m_fragment_prog->requires_lod_bias)
+	{
+		// Shader-side sampler LOD bias (samplers can't apply it before Apple10), see MTLFragmentProgram::requires_lod_bias
+		m_program->push_constants(mtl::glsl::binding_set_index_fragment,
+			MTLFragmentProgram::lod_bias_push_offset, MTLFragmentProgram::lod_bias_push_size, m_fs_lod_bias.data());
 	}
 
 	// Now actually fill in the data

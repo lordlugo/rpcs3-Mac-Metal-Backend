@@ -9,8 +9,10 @@
 #include "Emu/RSX/Program/SPIRVCommon.h"
 #include "Emu/system_config.h"
 #include "Utilities/File.h"
+#include "Utilities/StrUtil.h"
 #include "util/fnv_hash.hpp"
 
+#include <algorithm>
 #include <exception>
 #include <unordered_set>
 
@@ -92,6 +94,65 @@ namespace mtl::glsl
 			sampler          // Separate sampler -> [[sampler(m)]]
 		};
 
+		const char* to_string(metal_resource_class cls)
+		{
+			switch (cls)
+			{
+			case metal_resource_class::buffer: return "buffer";
+			case metal_resource_class::texture: return "image";
+			case metal_resource_class::sampled_texture: return "sampled image";
+			case metal_resource_class::sampler: return "sampler";
+			}
+			return "resource";
+		}
+
+		// Constant sampler for sampled images left without a sampler slot. Identical to the renderer's stencil-mirror
+		// sampler (nearest, clamp to opaque-black border, LOD 0), the only realistic users besides texelFetch-only
+		// inputs, whose sampler is never used.
+		const spirv_cross::MSLConstexprSampler& get_fallback_sampler()
+		{
+			static const spirv_cross::MSLConstexprSampler s_sampler = []()
+			{
+				spirv_cross::MSLConstexprSampler sampler{};
+				sampler.coord = spirv_cross::MSL_SAMPLER_COORD_NORMALIZED;
+				sampler.min_filter = spirv_cross::MSL_SAMPLER_FILTER_NEAREST;
+				sampler.mag_filter = spirv_cross::MSL_SAMPLER_FILTER_NEAREST;
+				sampler.mip_filter = spirv_cross::MSL_SAMPLER_MIP_FILTER_NEAREST;
+				sampler.s_address = spirv_cross::MSL_SAMPLER_ADDRESS_CLAMP_TO_BORDER;
+				sampler.t_address = spirv_cross::MSL_SAMPLER_ADDRESS_CLAMP_TO_BORDER;
+				sampler.r_address = spirv_cross::MSL_SAMPLER_ADDRESS_CLAMP_TO_BORDER;
+				sampler.border_color = spirv_cross::MSL_SAMPLER_BORDER_COLOR_OPAQUE_BLACK;
+				sampler.lod_clamp_enable = true;
+				sampler.lod_clamp_min = 0.f;
+				sampler.lod_clamp_max = 0.f;
+				return sampler;
+			}();
+			return s_sampler;
+		}
+
+		// Vertex fetch format of a vertex shader input (GLSL `layout(location = N) in <type>`)
+		MTL::VertexFormat get_vertex_format(const spirv_cross::SPIRType& type)
+		{
+			if (type.columns != 1 || !type.array.empty() || type.vecsize < 1 || type.vecsize > 4)
+			{
+				return MTL::VertexFormatInvalid;
+			}
+
+			static constexpr MTL::VertexFormat float_formats[] = { MTL::VertexFormatFloat, MTL::VertexFormatFloat2, MTL::VertexFormatFloat3, MTL::VertexFormatFloat4 };
+			static constexpr MTL::VertexFormat half_formats[] = { MTL::VertexFormatHalf, MTL::VertexFormatHalf2, MTL::VertexFormatHalf3, MTL::VertexFormatHalf4 };
+			static constexpr MTL::VertexFormat int_formats[] = { MTL::VertexFormatInt, MTL::VertexFormatInt2, MTL::VertexFormatInt3, MTL::VertexFormatInt4 };
+			static constexpr MTL::VertexFormat uint_formats[] = { MTL::VertexFormatUInt, MTL::VertexFormatUInt2, MTL::VertexFormatUInt3, MTL::VertexFormatUInt4 };
+
+			switch (type.basetype)
+			{
+			case spirv_cross::SPIRType::Float: return float_formats[type.vecsize - 1];
+			case spirv_cross::SPIRType::Half: return half_formats[type.vecsize - 1];
+			case spirv_cross::SPIRType::Int: return int_formats[type.vecsize - 1];
+			case spirv_cross::SPIRType::UInt: return uint_formats[type.vecsize - 1];
+			default: return MTL::VertexFormatInvalid;
+			}
+		}
+
 		void log_failure(::glsl::program_domain domain, std::string_view reason, const std::string& glsl_source, const std::string& msl)
 		{
 			rsx_log.error("[MSL] Failed to translate %s shader: %s", to_string(domain), reason);
@@ -112,6 +173,9 @@ namespace mtl::glsl
 
 			// Sets used per binding location, to catch two sets aliasing one location (layout keys are per stage)
 			std::unordered_map<u32, u32> binding_sets;
+
+			// Sampled images that got a constexpr sampler because the stage ran out of sampler slots
+			std::vector<std::string> constexpr_samplers;
 
 			auto bind = [&](const spirv_cross::Resource& res, metal_resource_class cls) -> std::string
 			{
@@ -154,35 +218,76 @@ namespace mtl::glsl
 				msl_binding.binding = binding;
 				msl_binding.count = count;
 
+				auto type_matches = [&]()
+				{
+					switch (cls)
+					{
+					case metal_resource_class::buffer:
+						return slot.type == input_type_uniform_buffer || slot.type == input_type_storage_buffer;
+					case metal_resource_class::sampled_texture:
+					case metal_resource_class::sampler:
+						return slot.type == input_type_texture;
+					case metal_resource_class::texture:
+						return slot.type == input_type_texture || slot.type == input_type_texel_buffer || slot.type == input_type_storage_texture;
+					}
+					return false;
+				};
+
+				if (!type_matches())
+				{
+					return fmt::format("'%s' (set=%u, binding=%u) is a %s in the shader but a %s in the program inputs",
+						res.name, set, binding, to_string(cls), to_string(slot.type));
+				}
+
 				switch (cls)
 				{
 				case metal_resource_class::buffer:
 					if (slot.buffer_index == umax)
 					{
-						return fmt::format("'%s' (set=%u, binding=%u) is a buffer in the shader but a %s in the program inputs", res.name, set, binding, to_string(slot.type));
+						return fmt::format("'%s' (set=%u, binding=%u): no Metal buffer slot left in this stage", res.name, set, binding);
 					}
 					msl_binding.basetype = spirv_cross::SPIRType::Struct;
 					msl_binding.msl_buffer = slot.buffer_index;
 					break;
 				case metal_resource_class::sampled_texture:
-					if (slot.sampler_index == umax)
-					{
-						return fmt::format("'%s' (set=%u, binding=%u) is a sampled image in the shader but a %s in the program inputs", res.name, set, binding, to_string(slot.type));
-					}
-					msl_binding.msl_sampler = slot.sampler_index;
-					[[fallthrough]];
 				case metal_resource_class::texture:
 					if (slot.texture_index == umax)
 					{
-						return fmt::format("'%s' (set=%u, binding=%u) is an image in the shader but a %s in the program inputs", res.name, set, binding, to_string(slot.type));
+						return fmt::format("'%s' (set=%u, binding=%u): no Metal texture slot left in this stage", res.name, set, binding);
 					}
 					msl_binding.basetype = spirv_cross::SPIRType::SampledImage;
 					msl_binding.msl_texture = slot.texture_index;
+
+					if (cls == metal_resource_class::sampled_texture)
+					{
+						if (slot.sampler_index != umax)
+						{
+							msl_binding.msl_sampler = slot.sampler_index;
+						}
+						else if (count == 1)
+						{
+							// Sampler slots exhausted (layout order puts stencil mirrors and texelFetch-only inputs last):
+							// sample with a constant sampler equal to the stencil-mirror sampler instead.
+							compiler.remap_constexpr_sampler(res.id, get_fallback_sampler());
+							constexpr_samplers.push_back(res.name);
+						}
+						else
+						{
+							return fmt::format("'%s' (set=%u, binding=%u): no sampler slots left for a sampler array", res.name, set, binding);
+						}
+					}
 					break;
 				case metal_resource_class::sampler:
 					if (slot.sampler_index == umax)
 					{
-						return fmt::format("'%s' (set=%u, binding=%u) is a sampler in the shader but a %s in the program inputs", res.name, set, binding, to_string(slot.type));
+						if (count != 1)
+						{
+							return fmt::format("'%s' (set=%u, binding=%u): no sampler slots left for a sampler array", res.name, set, binding);
+						}
+
+						compiler.remap_constexpr_sampler(res.id, get_fallback_sampler());
+						constexpr_samplers.push_back(res.name);
+						return {};
 					}
 					msl_binding.basetype = spirv_cross::SPIRType::Sampler;
 					msl_binding.msl_sampler = slot.sampler_index;
@@ -233,13 +338,21 @@ namespace mtl::glsl
 				return "unsupported resource class (acceleration structure / atomic counter / shader record)";
 			}
 
+			if (!constexpr_samplers.empty())
+			{
+				rsx_log.notice("[MSL] %u sampled image(s) use a constant nearest/clamp-to-border sampler (stage sampler slots exhausted): %s",
+					::size32(constexpr_samplers), fmt::merge(constexpr_samplers, ", "));
+			}
+
 			// Subpass inputs need no binding: input_attachment_index N reads the pixel's [[color(N)]] (framebuffer fetch)
 
 			if (!resources.push_constant_buffers.empty())
 			{
 				if (layout.push_constant_buffer_index == umax)
 				{
-					return fmt::format("push constant block '%s' is used but no push constant input was declared", resources.push_constant_buffers.front().name);
+					return layout.push_constant_size
+						? fmt::format("push constant block '%s': no Metal buffer slot left in this stage", resources.push_constant_buffers.front().name)
+						: fmt::format("push constant block '%s' is used but no push constant input was declared", resources.push_constant_buffers.front().name);
 				}
 
 				spirv_cross::MSLResourceBinding msl_binding{};
@@ -342,7 +455,32 @@ namespace mtl::glsl
 					}
 				}
 
-				if (compiler.needs_swizzle_buffer() || compiler.needs_view_mask_buffer() || compiler.needs_dispatch_base_buffer() ||
+				if (domain == ::glsl::glsl_vertex_program)
+				{
+					// Reflect [[stage_in]] attributes once here; pipelines build their vertex descriptor from this list
+					const auto active = compiler.get_active_interface_variables();
+					for (const auto& input : compiler.get_shader_resources(active).stage_inputs)
+					{
+						const u32 location = compiler.get_decoration(input.id, spv::DecorationLocation);
+						const MTL::VertexFormat format = get_vertex_format(compiler.get_type(input.type_id));
+
+						if (format == MTL::VertexFormatInvalid)
+						{
+							error = fmt::format("vertex input '%s' (location %u) cannot be fetched as a vertex attribute", input.name, location);
+							break;
+						}
+
+						result.vertex_attributes.emplace_back(location, format);
+					}
+
+					std::sort(result.vertex_attributes.begin(), result.vertex_attributes.end(), FN(x.first < y.first));
+				}
+
+				if (!error.empty())
+				{
+					// Reported below
+				}
+				else if (compiler.needs_swizzle_buffer() || compiler.needs_view_mask_buffer() || compiler.needs_dispatch_base_buffer() ||
 					compiler.needs_output_buffer() || compiler.needs_patch_output_buffer() || compiler.needs_input_threadgroup_mem())
 				{
 					error = "the generated MSL requires an auxiliary buffer the Metal backend does not provide";
@@ -431,6 +569,7 @@ namespace mtl::glsl
 		m_entry_point = std::string(get_entry_point_name(domain));
 		m_compile_failed = false;
 		m_needs_buffer_sizes = false;
+		m_vertex_attributes.clear();
 	}
 
 	bool shader::compile(const binding_layout& layout, bool fast_math)
@@ -482,6 +621,7 @@ namespace mtl::glsl
 		m_msl = std::move(translated.msl);
 		m_entry_point = std::move(translated.entry_point);
 		m_needs_buffer_sizes = translated.needs_buffer_size_buffer;
+		m_vertex_attributes = std::move(translated.vertex_attributes);
 		return true;
 	}
 
@@ -499,5 +639,6 @@ namespace mtl::glsl
 		m_msl.clear();
 		m_compile_failed = false;
 		m_needs_buffer_sizes = false;
+		m_vertex_attributes.clear();
 	}
 }

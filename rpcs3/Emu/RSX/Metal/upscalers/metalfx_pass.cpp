@@ -180,8 +180,26 @@ namespace mtl
 		const auto offset = heap.alloc<16>(16);
 
 		auto encoder = cmd.compute();
-		encoder->fillBuffer(heap.value(), NS::Range::Make(offset, 4), 0);
+		encoder->fillBuffer(heap.value(), NS::Range::Make(offset, 4), 0); // 16-byte aligned offset, 4-byte length
 		encoder->updateFence(m_fence, MTL::StageBlit | MTL::StageDispatch);
+
+		cmd.end_encoder();
+	}
+
+	void metalfx_upscale_pass::wait_fence(mtl::command_list& cmd)
+	{
+		// The scaler updates m_fence once its output is written. Open a fresh encoder, wait on the fence before a
+		// (therefore blocked) dummy blit command and close it. Every later encoder starts with a queue barrier on all
+		// prior work, i.e. after this command, so every consumer of the output (the commit blit below,
+		// video_out_calibration_pass, the renderer's own passes) is ordered after the scaler even if the queue barrier
+		// itself did not cover the passes MetalFX encoded.
+		auto& heap = get_scratch_heap();
+		const auto offset = heap.alloc<16>(16);
+
+		ensure(cmd.active_encoder() == mtl::command_list::encoder_type::none);
+		auto encoder = cmd.compute();
+		encoder->waitForFence(m_fence, MTL::StageBlit | MTL::StageDispatch);
+		encoder->fillBuffer(heap.value(), NS::Range::Make(offset, 4), 0);
 
 		cmd.end_encoder();
 	}
@@ -225,18 +243,23 @@ namespace mtl
 				}
 				else
 				{
-					// MetalFX creates autoreleased objects while encoding
-					autorelease_scope pool;
-
-					m_scaler->setInputContentWidth(input_size.width);
-					m_scaler->setInputContentHeight(input_size.height);
-					m_scaler->setColorTexture(src->value);
-					m_scaler->setOutputTexture(output->value);
-
+					// 1. Everything recorded so far (the producer of src) -> fence the scaler waits on
 					signal_fence(cmd);
 
-					m_scaler->setFence(m_fence);
-					m_scaler->encodeToCommandBuffer(cmd.handle());
+					// 2. Scaler passes. Self-contained: MetalFX may create autoreleased objects while encoding
+					{
+						autorelease_scope pool;
+
+						m_scaler->setInputContentWidth(input_size.width);
+						m_scaler->setInputContentHeight(input_size.height);
+						m_scaler->setColorTexture(src->value);
+						m_scaler->setOutputTexture(output->value);
+						m_scaler->setFence(m_fence);
+						m_scaler->encodeToCommandBuffer(cmd.handle());
+					}
+
+					// 3. Scaler output -> everything recorded afterwards
+					wait_fence(cmd);
 
 					// Swap input for the MetalFX target
 					src_image = output.get();

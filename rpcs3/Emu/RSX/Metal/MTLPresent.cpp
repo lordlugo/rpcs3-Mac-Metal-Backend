@@ -44,8 +44,9 @@ void MTLGSRender::configure_metal_layer()
 		return;
 	}
 
-	// MetalFX (output_scaling_mode::fsr) may write the upscaled image straight into the drawable
-	const bool framebuffer_only = (g_cfg.video.output_scaling != output_scaling_mode::fsr);
+	// Drawables are only ever render pass attachments (clears, calibration/blit/overlay passes). MetalFX writes into an
+	// internal image which is then drawn into the drawable (upscale_blit), so every mode can use framebuffer-only drawables.
+	const bool framebuffer_only = true;
 	if (framebuffer_only != m_layer_framebuffer_only || framebuffer_only != m_metal_layer->framebufferOnly())
 	{
 		m_metal_layer->setFramebufferOnly(framebuffer_only);
@@ -612,6 +613,10 @@ void MTLGSRender::flip(const rsx::display_flip_info_t& info)
 	ensure(!m_current_frame->drawable);
 	ensure(m_current_frame->swap_command_buffer == nullptr);
 
+	// The swap submission makes the queue wait for the drawable. Submit the frame's work now so that only the
+	// presentation passes recorded below are held back by that wait.
+	flush_command_queue();
+
 	auto drawable = m_metal_layer->nextDrawable();
 	if (!drawable)
 	{
@@ -623,9 +628,7 @@ void MTLGSRender::flip(const rsx::display_flip_info_t& info)
 	drawable->retain();
 	m_current_frame->drawable = drawable;
 
-	// Drawables acquired while the layer is framebuffer-only can only be render targets
-	const bool drawable_is_framebuffer_only = m_layer_framebuffer_only;
-
+	// NOTE: The layer is framebuffer-only: the drawable texture may only be used as a render pass attachment
 	MTL::Texture* target_texture = drawable->texture();
 	const sizeu target_size = { static_cast<u32>(target_texture->width()), static_cast<u32>(target_texture->height()) };
 	const mtl::overlay_target target(target_texture);
@@ -642,10 +645,17 @@ void MTLGSRender::flip(const rsx::display_flip_info_t& info)
 		aspect_ratio = { 0, 0, s32(target_size.width), s32(target_size.height) };
 	}
 
-	if (!image_to_flip || aspect_ratio.x1 || aspect_ratio.y1 ||
-		static_cast<u32>(aspect_ratio.x2) < target_size.width || static_cast<u32>(aspect_ratio.y2) < target_size.height)
+	// The window background must be cleared to black (drawable contents are undefined)
+	const bool needs_letterbox_clear = !image_to_flip || aspect_ratio.x1 || aspect_ratio.y1 ||
+		static_cast<u32>(aspect_ratio.x2) < target_size.width || static_cast<u32>(aspect_ratio.y2) < target_size.height;
+
+	const bool use_full_rgb_range_output = g_cfg.video.full_rgb_range_output.get();
+	const bool use_calibration_pass = image_to_flip &&
+		(!use_full_rgb_range_output || !rsx::fcmp(avconfig.gamma, 1.f) || avconfig.stereo_enabled);
+
+	if (needs_letterbox_clear && !use_calibration_pass)
 	{
-		// Clear the window background to black (drawable contents are undefined)
+		// The calibration pass clears on load instead (see below)
 		mtl::clear_color_texture(*m_current_command_buffer, target_texture, target_size.width, target_size.height, MTL::ClearColor::Make(0., 0., 0., 1.));
 	}
 
@@ -655,18 +665,13 @@ void MTLGSRender::flip(const rsx::display_flip_info_t& info)
 	{
 		m_output_scaling = output_scaling;
 		m_upscaler = mtl::create_upscaler(m_output_scaling);
-
-		// MetalFX writes into the drawable; the layer must not be framebuffer-only for the next drawables
-		configure_metal_layer();
 	}
 
 	if (image_to_flip)
 	{
-		const bool use_full_rgb_range_output = g_cfg.video.full_rgb_range_output.get();
 		const areai src_area = { 0, 0, s32(buffer_width), s32(buffer_height) };
 
-		if (!use_full_rgb_range_output || !rsx::fcmp(avconfig.gamma, 1.f) || avconfig.stereo_enabled ||
-			(m_output_scaling == output_scaling_mode::fsr && drawable_is_framebuffer_only)) [[unlikely]]
+		if (use_calibration_pass) [[unlikely]]
 		{
 			rsx::simple_array<mtl::viewable_image*> calibration_src;
 			if (image_to_flip) calibration_src.push_back(image_to_flip);
@@ -685,8 +690,13 @@ void MTLGSRender::flip(const rsx::display_flip_info_t& info)
 				}
 			}
 
+			// Letterbox clear folded into the pass (loadAction Clear) instead of a separate clear pass
+			mtl::overlay_target calibration_target = target;
+			calibration_target.clear_color_on_load = needs_letterbox_clear;
+			calibration_target.clear_color_value = { 0.f, 0.f, 0.f, 1.f };
+
 			mtl::get_overlay_pass<mtl::video_out_calibration_pass>()->run(
-				*m_current_command_buffer, areau(aspect_ratio), target, calibration_src,
+				*m_current_command_buffer, areau(aspect_ratio), calibration_target, calibration_src,
 				avconfig.gamma, !use_full_rgb_range_output, avconfig.stereo_enabled);
 		}
 		else

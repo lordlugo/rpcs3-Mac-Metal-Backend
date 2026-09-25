@@ -108,6 +108,21 @@ namespace mtl
 				return it->second;
 			};
 
+			// Slot exhaustion is data dependent (e.g. 16 RSX textures + stencil mirrors), so it never throws: the slot
+			// keeps umax and the translation of a shader that really uses the resource fails (the draw is skipped).
+			auto take_slots = [](u32& next, u32 count, u32 limit) -> u32
+			{
+				if (next + count > limit)
+				{
+					next = limit;
+					return umax;
+				}
+
+				const u32 first = next;
+				next += count;
+				return first;
+			};
+
 			// Pass 1: buffers, in input order
 			for (const auto& in : inputs)
 			{
@@ -117,11 +132,12 @@ namespace mtl
 				}
 
 				auto& slot = claim(in);
-				slot.buffer_index = next_buffer;
-				next_buffer += slot.array_size;
+				slot.buffer_index = take_slots(next_buffer, slot.array_size, max_buffer_slots);
 			}
 
-			// Pass 2: sampled textures first so that sampler index == texture index
+			// Pass 2: sampled textures first so that sampler index == texture index for the first 16 sampler slots.
+			// Textures past that get no sampler: the translator gives them a constexpr nearest/clamp-to-border sampler
+			// (see MTLShaderCompiler.cpp), which is exactly what stencil mirrors and texelFetch-only inputs use anyway.
 			for (const auto& in : inputs)
 			{
 				if (in.type != input_type_texture)
@@ -130,15 +146,13 @@ namespace mtl
 				}
 
 				auto& slot = claim(in);
-				slot.texture_index = next_texture;
-				slot.sampler_index = next_texture;
-				next_texture += slot.array_size;
-				next_sampler = next_texture;
+				slot.texture_index = take_slots(next_texture, slot.array_size, max_texture_slots);
 
-				if (next_sampler > max_sampler_slots)
+				if (slot.texture_index != umax && slot.texture_index == next_sampler &&
+					next_sampler + slot.array_size <= max_sampler_slots)
 				{
-					fmt::throw_exception("Too many sampled textures in one %s stage: '%s' needs samplers up to %u (Metal limit is %u)",
-						to_string(in.domain), in.name, next_sampler, max_sampler_slots);
+					slot.sampler_index = slot.texture_index;
+					next_sampler += slot.array_size;
 				}
 			}
 
@@ -151,8 +165,7 @@ namespace mtl
 				}
 
 				auto& slot = claim(in);
-				slot.texture_index = next_texture;
-				next_texture += slot.array_size;
+				slot.texture_index = take_slots(next_texture, slot.array_size, max_texture_slots);
 			}
 
 			// Push constants: one block per stage, emulating Vulkan's shared push-constant space (absolute offsets)
@@ -179,18 +192,9 @@ namespace mtl
 
 			if (push_constant_end)
 			{
-				layout.push_constant_buffer_index = next_buffer++;
+				// umax if all buffer slots are taken; the translation then reports it
+				layout.push_constant_buffer_index = take_slots(next_buffer, 1, max_buffer_slots);
 				layout.push_constant_size = utils::align(push_constant_end, 16u);
-			}
-
-			if (next_buffer > max_buffer_slots)
-			{
-				fmt::throw_exception("Too many buffers in one stage: %u (Metal limit is %u)", next_buffer, max_buffer_slots);
-			}
-
-			if (next_texture > max_texture_slots)
-			{
-				fmt::throw_exception("Too many textures in one stage: %u (argument table limit is %u)", next_texture, max_texture_slots);
 			}
 
 			layout.buffer_count = next_buffer;

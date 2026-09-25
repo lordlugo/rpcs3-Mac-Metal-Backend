@@ -3,8 +3,9 @@
 // Port of VK/VKRenderTargets.h: render targets (surface cache entries) and the rsx::surface_store traits.
 //
 // Metal specifics:
-//  - Render targets are Private textures with usage RenderTarget | ShaderRead (| ShaderWrite for single-sampled color
-//    formats that support it) | PixelFormatView (added by mtl::image). MSAA targets are TextureType2DMultisample.
+//  - Render targets are Private textures with usage RenderTarget | ShaderRead | PixelFormatView (added by mtl::image).
+//    No ShaderWrite: nothing writes surfaces from compute, and it would cost lossless compression.
+//    MSAA targets are TextureType2DMultisample.
 //  - No layouts. Feedback loops (sampling a bound attachment) cannot be solved with a barrier inside a pass on Apple
 //    GPUs: texture_barrier() ends the current render pass (the next encoder waits for all prior work) and counts the
 //    split in mtl::g_feedback_loop_pass_splits. Same-pixel feedback can use framebuffer fetch instead (renderer's call).
@@ -446,14 +447,13 @@ namespace mtl
 				required_bo_size += (bo ? ::size32(*bo) : BlockSize);
 			}
 
-			// Create dst
-			auto dst = new mtl::buffer(cmd.device(), required_bo_size, memory_location::device_local, "merged surface buffer");
+			// Create dst (word multiple, required by the alignment-safe copy path)
+			auto dst = new mtl::buffer(cmd.device(), utils::align(required_bo_size, 4u), memory_location::device_local, "merged surface buffer");
 
 			// TODO: Initialize the buffer with system RAM contents
 
 			// Copy all the data over from the sub-blocks
 			u32 offset = 0;
-			bool first = true;
 			for (auto& bo : list)
 			{
 				if (!bo)
@@ -463,10 +463,8 @@ namespace mtl
 				}
 
 				const u32 length = ::size32(*bo);
-				auto encoder = first ? cmd.compute() : cmd.compute_unordered();
-				encoder->copyFromBuffer(bo->value(), 0, dst->value(), offset, length);
+				mtl::copy_buffer_to_buffer_aligned(cmd, bo, 0, dst, offset, length);
 				offset += length;
-				first = false;
 
 				// Cleanup
 				mtl::surface_cache_utils::dispose(bo);

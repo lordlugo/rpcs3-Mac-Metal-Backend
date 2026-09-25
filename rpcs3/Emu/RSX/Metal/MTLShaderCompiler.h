@@ -12,6 +12,8 @@
 #include <array>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace mtl::glsl
 {
@@ -21,6 +23,7 @@ namespace mtl::glsl
 		std::string entry_point;                 // Entry point function name inside `msl`
 		bool needs_buffer_size_buffer = false;   // MSL reads spvBufferSizeConstants at layout.buffer_count
 		std::array<u32, 3> workgroup_size{ 1, 1, 1 }; // Compute only: GLSL local_size (dispatch must use it)
+		std::vector<std::pair<u32, MTL::VertexFormat>> vertex_attributes; // Vertex only: [[stage_in]] (location, format)
 	};
 
 	// Unique (per stage) MSL entry point names given to every translated shader.

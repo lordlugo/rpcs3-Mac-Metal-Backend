@@ -154,7 +154,7 @@ namespace mtl
 	void command_list::open_encoder_barrier(MTL4::CommandEncoder* encoder, MTL::Stages before_stages)
 	{
 		// Conservative: wait for every stage of all prior work on this queue, make results device-visible.
-		encoder->barrierAfterQueueStages(stages_all_work, before_stages, MTL4::VisibilityOptionDevice);
+		encoder->barrierAfterQueueStages(stages_all_producers, before_stages, MTL4::VisibilityOptionDevice);
 		m_pending_full_barrier = false;
 	}
 
@@ -175,6 +175,7 @@ namespace mtl
 		if (m_render_encoder)
 		{
 			m_render_encoder->endEncoding();
+			m_render_encoder->release();
 			m_render_encoder = nullptr;
 		}
 	}
@@ -217,6 +218,7 @@ namespace mtl
 		if (m_compute_encoder)
 		{
 			m_compute_encoder->endEncoding();
+			m_compute_encoder->release();
 			m_compute_encoder = nullptr;
 			m_compute_commands_since_barrier = 0;
 		}

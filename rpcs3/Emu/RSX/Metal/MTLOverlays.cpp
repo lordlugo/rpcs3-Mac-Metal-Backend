@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "MTLOverlays.h"
+#include "MTLFormats.h"
 #include "MTLResourceManager.h"
 
 #include "mtlutils/device.h"
@@ -462,7 +463,9 @@ namespace mtl
 		auto program = glsl::create_graphics_program(vs_src, get_vertex_inputs(), fs_src, get_fragment_inputs(), state);
 		if (!program)
 		{
-			fmt::throw_exception("Metal: failed to build overlay pipeline.\nVS:\n%s\nFS:\n%s", vs_src, fs_src);
+			// Cache the failure (nullptr) so it is reported once; callers skip the draw instead of aborting
+			rsx_log.error("Metal: failed to build overlay pipeline (color fmt=%u, depth fmt=%u, samples=%u).\nVS:\n%s\nFS:\n%s",
+				state.color[0].pixel_format, state.depth_stencil_format, state.sample_count, vs_src, fs_src);
 		}
 
 		auto result = program.get();
@@ -532,6 +535,11 @@ namespace mtl
 			program = build_pipeline(key, state);
 		}
 
+		if (!program)
+		{
+			return nullptr;
+		}
+
 		update_uniforms(cmd, program);
 
 		if (m_num_uniform_buffers > 0)
@@ -587,12 +595,18 @@ namespace mtl
 		// Vertex and uniform data live in the shared scratch heap which is recycled by the renderer
 	}
 
-	void overlay_pass::begin_pass(mtl::command_list& cmd, const overlay_target& target, const areau& viewport)
+	bool overlay_pass::begin_pass(mtl::command_list& cmd, const overlay_target& target, const areau& viewport)
 	{
 		ensure(target.primary(), "Overlay pass has no render target");
 
-		autorelease_scope pool;
+		if (target.color && !format_is_renderable(target.color->pixelFormat()))
+		{
+			rsx_log.error("Metal: overlay pass target format %d is not renderable; pass skipped", static_cast<int>(target.color->pixelFormat()));
+			return false;
+		}
 
+		// NOTE: no autorelease pool here. The encoder created by begin_render_pass (and anything the descriptor hands
+		// out) must outlive this function; the caller's per-draw/flip pool owns those autoreleased objects.
 		const bool covers_target =
 			viewport.x1 == 0 && viewport.y1 == 0 &&
 			viewport.x2 >= target.width() && viewport.y2 >= target.height();
@@ -645,6 +659,7 @@ namespace mtl
 
 		// This call clobbers dynamic state
 		cmd.set_flag(mtl::command_list::cb_reload_dynamic_state);
+		return true;
 	}
 
 	void overlay_pass::end_pass(mtl::command_list& cmd)
@@ -663,6 +678,11 @@ namespace mtl
 		}
 
 		auto program = load_program(cmd, target, src);
+		if (!program)
+		{
+			return;
+		}
+
 		set_up_viewport(cmd, target, viewport.x1, viewport.y1, viewport.width(), viewport.height());
 
 		auto encoder = cmd.render_encoder();
@@ -705,7 +725,11 @@ namespace mtl
 
 	void overlay_pass::run(mtl::command_list& cmd, const areau& viewport, const overlay_target& target, const std::vector<mtl::image_view*>& src)
 	{
-		begin_pass(cmd, target, viewport);
+		if (!begin_pass(cmd, target, viewport))
+		{
+			return;
+		}
+
 		draw(cmd, viewport, target, src);
 		end_pass(cmd);
 	}
@@ -1156,7 +1180,11 @@ namespace mtl
 		const auto null_view_2d_array = get_null_image_view(MTL::TextureType2DArray);
 
 		// 2. Draw everything in one render pass
-		begin_pass(cmd, target, viewport);
+		if (!begin_pass(cmd, target, viewport))
+		{
+			ui.update(get_system_time());
+			return;
+		}
 
 		for (usz i = 0; i < draw_commands.size(); ++i)
 		{
@@ -1385,7 +1413,10 @@ namespace mtl
 		const bool full_mask = colormask.r > 0.f && colormask.g > 0.f && colormask.b > 0.f && colormask.a > 0.f;
 		const bool full_region = region.x == 0 && region.y == 0 && region.width >= full_area.x2 && region.height >= full_area.y2;
 
-		begin_pass(cmd, color_target, full_area);
+		if (!begin_pass(cmd, color_target, full_area))
+		{
+			return;
+		}
 
 		if (!(full_mask && full_region))
 		{

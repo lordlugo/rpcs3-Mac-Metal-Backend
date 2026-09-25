@@ -142,4 +142,7 @@ namespace mtl
 	constexpr MTL::Stages stages_render = MTL::StageVertex | MTL::StageFragment | MTL::StageTile;
 	constexpr MTL::Stages stages_compute = MTL::StageDispatch | MTL::StageBlit;
 	constexpr MTL::Stages stages_all_work = stages_render | stages_compute;
+	// "After" scope for queue barriers: everything that may have been encoded before, including work encoded by
+	// frameworks (MetalFX may use machine-learning / resource-state stages).
+	constexpr MTL::Stages stages_all_producers = stages_all_work | MTL::StageMachineLearning | MTL::StageResourceState;
 }

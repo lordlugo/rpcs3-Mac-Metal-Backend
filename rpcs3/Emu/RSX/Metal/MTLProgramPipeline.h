@@ -121,9 +121,12 @@ namespace mtl
 		// Assigns Metal indices for ONE stage (all inputs of the list, whatever their set):
 		//  - buffers (UBO, SSBO) 0.. in input order, push-constant block last (index 30 max);
 		//  - sampled textures (input_type_texture) first 0.., then texel buffers and storage textures (63 max);
-		//  - sampler index == texture index for sampled textures (must stay < 16);
+		//  - sampler index == texture index for the first 16 sampled texture slots, in input order. Later sampled
+		//    textures get sampler_index = umax and the MSL gives them a constant nearest / clamp-to-border(black) /
+		//    LOD 0 sampler (exactly the stencil-mirror sampler), so list textures that need real samplers first;
 		//  - input_type_attachment gets no slot (framebuffer fetch [[color(n)]]).
-		// Keys are GLSL binding locations; a location may only be declared once per stage. Fails loudly otherwise.
+		// Keys are GLSL binding locations; a location may only be declared once per stage (fatal: programming error).
+		// Running out of buffer/texture slots is not fatal: the slot stays umax and the shader translation fails.
 		// If a stage reads SSBO lengths, its buffer-size table lives at index buffer_count (see shader/program).
 		binding_layout build_binding_layout(const std::vector<program_input>& inputs);
 
@@ -164,6 +167,7 @@ namespace mtl
 			std::mutex m_compile_lock;          // compile() may race between pipe-compiler workers sharing a shader
 			bool m_compile_failed = false;      // Do not retry (and re-log) a translation that already failed
 			bool m_needs_buffer_sizes = false;  // MSL reads spvBufferSizeConstants (GLSL SSBO .length())
+			std::vector<std::pair<u32, MTL::VertexFormat>> m_vertex_attributes; // Vertex stage inputs (location, format)
 
 		public:
 			shader() = default;
@@ -190,6 +194,10 @@ namespace mtl
 			// True if the MSL expects a buffer-size table (uint per Metal buffer index) at binding_layout::buffer_count.
 			// Only set for shaders using GLSL SSBO .length(); pipeline builders forward it to program.
 			bool needs_buffer_size_buffer() const { return m_needs_buffer_sizes; }
+
+			// Vertex shaders only: `layout(location = N) in` attributes (reflected at translation time, sorted by
+			// location). Empty for RSX vertex programs, which pull their inputs from texel buffers.
+			const std::vector<std::pair<u32, MTL::VertexFormat>>& vertex_attributes() const { return m_vertex_attributes; }
 		};
 
 		// Fixed-function state baked into a Metal 4 render pipeline. POD; hashed and serialized raw (shader cache).

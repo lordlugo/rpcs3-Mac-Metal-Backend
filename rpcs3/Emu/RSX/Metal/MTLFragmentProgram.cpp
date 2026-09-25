@@ -2,6 +2,7 @@
 #include "MTLFragmentProgram.h"
 #include "MTLCommonDecompiler.h"
 #include "Emu/system_config.h"
+#include "mtlutils/device.h"
 #include "../Program/GLSLCommon.h"
 
 std::string MTLFragmentDecompilerThread::getFloatTypeName(usz elementCount)
@@ -349,22 +350,41 @@ void MTLFragmentDecompilerThread::insertConstants(std::stringstream & OS)
 	OS << "	uvec4 stipple_pattern[];\n";
 	OS << "};\n\n";
 
-	if (m_prog.ctrl & RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING)
+	// Push constants (Vulkan-style shared space; the fragment stage owns offsets 4..96):
+	//   4..32  programmable blending parameters
+	//   32..96 per-unit texture LOD bias, only when samplers cannot apply mipLodBias (pre-Apple10 GPUs)
+	const bool use_programmable_blending = !!(m_prog.ctrl & RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING);
+	const bool use_lod_bias = metal_props.emulate_sampler_lod_bias && properties.has_tex_op;
+	mtl_prog->requires_lod_bias = use_lod_bias;
+
+	if (use_programmable_blending || use_lod_bias)
 	{
-		OS <<
-			"layout(push_constant) uniform push_constants_block\n"
-			"{\n"
-			"	layout(offset = 4) uint blend_eqn;\n"
-			"	uint blend_sfactors;\n"
-			"	uint blend_dfactors;\n"
-			"	vec4 blend_constants;\n"
-			"};\n\n";
+		OS << "layout(push_constant) uniform push_constants_block\n{\n";
+
+		if (use_programmable_blending)
+		{
+			OS <<
+				"	layout(offset = 4) uint blend_eqn;\n"
+				"	uint blend_sfactors;\n"
+				"	uint blend_dfactors;\n"
+				"	vec4 blend_constants;\n";
+		}
+
+		if (use_lod_bias)
+		{
+			OS << "	layout(offset = " << MTLFragmentProgram::lod_bias_push_offset << ") vec4 texture_lod_bias[4];\n";
+		}
+
+		OS << "};\n\n";
+
+		const u32 push_begin = use_programmable_blending ? 4u : MTLFragmentProgram::lod_bias_push_offset;
+		const u32 push_end = use_lod_bias ? (MTLFragmentProgram::lod_bias_push_offset + MTLFragmentProgram::lod_bias_push_size) : 32u;
 
 		mtl::glsl::program_input push_constants
 		{
 			.domain = glsl::glsl_fragment_program,
 			.type = mtl::glsl::input_type_push_constant,
-			.push_constant = mtl::glsl::push_constant_ref{ .offset = 4, .size = 28 },
+			.push_constant = mtl::glsl::push_constant_ref{ .offset = push_begin, .size = push_end - push_begin },
 			.set = mtl::glsl::binding_set_index_fragment,
 			.location = umax,
 			.name = "push_constants_block"
@@ -486,6 +506,52 @@ void MTLFragmentDecompilerThread::insertGlobalFunctions(std::stringstream &OS)
 			OS <<
 				"#undef TEX1D_Z24X8_RGBA8\n"
 				"#define TEX1D_Z24X8_RGBA8(index, coord1) _process_texel(convert_z24x8_to_rgba8(ZS_READ(index, _TEX1D_COORD(index, coord1)), TEX_PARAM(index).remap, TEX_FLAGS(index)), TEX_FLAGS(index))\n";
+		}
+
+		OS << "\n";
+	}
+
+	if (mtl_prog->requires_lod_bias)
+	{
+		// Metal: sampler LOD bias is only supported by Apple10 GPUs. Everywhere else the renderer pushes the per-unit
+		// bias (texture_lod_bias) and the implicit/explicit-LOD sampling macros add it, matching Vulkan where the
+		// sampler's mipLodBias applies to every LOD computation. Gradient sampling cannot take a bias (not biased).
+		OS <<
+			"// Metal: shader-side sampler LOD bias\n"
+			"#define _TEX_LOD_BIAS(index) texture_lod_bias[(index) / 4][(index) % 4]\n"
+			"#undef TEX2D\n"
+			"#undef TEX2D_BIAS\n"
+			"#undef TEX2D_LOD\n"
+			"#undef TEX2D_PROJ\n"
+			"#define TEX2D(index, coord2) _process_texel(texture(TEX_NAME(index), COORD_SCALE2(index, coord2), _TEX_LOD_BIAS(index)), TEX_FLAGS(index))\n"
+			"#define TEX2D_BIAS(index, coord2, bias) _process_texel(texture(TEX_NAME(index), COORD_SCALE2(index, coord2), (bias) + _TEX_LOD_BIAS(index)), TEX_FLAGS(index))\n"
+			"#define TEX2D_LOD(index, coord2, lod) _process_texel(textureLod(TEX_NAME(index), COORD_SCALE2(index, coord2), (lod) + _TEX_LOD_BIAS(index)), TEX_FLAGS(index))\n"
+			"#define TEX2D_PROJ(index, coord4) _process_texel(texture(TEX_NAME(index), COORD_PROJ2(index, coord4.xyw), _TEX_LOD_BIAS(index)), TEX_FLAGS(index))\n";
+
+		if (m_shader_props.require_tex3D_ops)
+		{
+			OS <<
+				"#undef TEX3D\n"
+				"#undef TEX3D_BIAS\n"
+				"#undef TEX3D_LOD\n"
+				"#undef TEX3D_PROJ\n"
+				"#define TEX3D(index, coord3) _process_texel(texture(TEX_NAME(index), COORD_SCALE3(index, coord3), _TEX_LOD_BIAS(index)), TEX_FLAGS(index))\n"
+				"#define TEX3D_BIAS(index, coord3, bias) _process_texel(texture(TEX_NAME(index), COORD_SCALE3(index, coord3), (bias) + _TEX_LOD_BIAS(index)), TEX_FLAGS(index))\n"
+				"#define TEX3D_LOD(index, coord3, lod) _process_texel(textureLod(TEX_NAME(index), COORD_SCALE3(index, coord3), (lod) + _TEX_LOD_BIAS(index)), TEX_FLAGS(index))\n"
+				"#define TEX3D_PROJ(index, coord4) _process_texel(texture(TEX_NAME(index), COORD_PROJ3(index, coord4).xyz, _TEX_LOD_BIAS(index)), TEX_FLAGS(index))\n";
+		}
+
+		if (m_shader_props.require_tex1D_ops)
+		{
+			OS <<
+				"#undef TEX1D\n"
+				"#undef TEX1D_BIAS\n"
+				"#undef TEX1D_LOD\n"
+				"#undef TEX1D_PROJ\n"
+				"#define TEX1D(index, coord1) _process_texel(texture(TEX_NAME(index), _TEX1D_COORD(index, coord1), _TEX_LOD_BIAS(index)), TEX_FLAGS(index))\n"
+				"#define TEX1D_BIAS(index, coord1, bias) _process_texel(texture(TEX_NAME(index), _TEX1D_COORD(index, coord1), (bias) + _TEX_LOD_BIAS(index)), TEX_FLAGS(index))\n"
+				"#define TEX1D_LOD(index, coord1, lod) _process_texel(textureLod(TEX_NAME(index), _TEX1D_COORD(index, coord1), (lod) + _TEX_LOD_BIAS(index)), TEX_FLAGS(index))\n"
+				"#define TEX1D_PROJ(index, coord4) _process_texel(texture(TEX_NAME(index), vec2(COORD_PROJ1(index, coord4.xw), 0.5), _TEX_LOD_BIAS(index)), TEX_FLAGS(index))\n";
 		}
 
 		OS << "\n";
@@ -675,6 +741,10 @@ void MTLFragmentProgram::Decompile(const RSXFragmentProgram& prog)
 	// the same whenever d24_unorm_s8 is unsupported).
 	decompiler.device_props.emulate_depth_compare = true;
 	decompiler.device_props.has_low_precision_rounding = false;
+
+	// Pre-Apple10 GPUs cannot apply mipLodBias in the sampler: the shader adds the bias (see requires_lod_bias)
+	decompiler.metal_props.emulate_sampler_lod_bias = mtl::g_render_device && !mtl::g_render_device->caps().apple10;
+	requires_lod_bias = false;
 	decompiler.Task();
 
 	constant_offsets = std::move(decompiler.properties.constant_offsets);

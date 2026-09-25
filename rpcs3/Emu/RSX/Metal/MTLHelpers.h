@@ -99,6 +99,15 @@ namespace mtl
 	void copy_image_to_buffer_raw(mtl::command_list& cmd, const mtl::image* src, const mtl::buffer* dst, const buffer_image_copy& region);
 	void copy_buffer_to_image_raw(mtl::command_list& cmd, const mtl::buffer* src, const mtl::image* dst, const buffer_image_copy& region);
 
+	// Buffer -> buffer copies of any alignment (Metal addition). macOS blits require 4-byte aligned offsets and sizes;
+	// otherwise a byte-granular compute copy is recorded. Destination bytes outside the copied range(s) are preserved.
+	// copy_buffer_rows copies `rows` rows of `row_length` bytes with independent source/destination pitches.
+	void copy_buffer_to_buffer_aligned(mtl::command_list& cmd, const mtl::buffer* src, u64 src_offset, const mtl::buffer* dst, u64 dst_offset, u64 length);
+	void copy_buffer_rows(mtl::command_list& cmd,
+		const mtl::buffer* src, u64 src_offset, u64 src_pitch,
+		const mtl::buffer* dst, u64 dst_offset, u64 dst_pitch,
+		u64 row_length, u32 rows);
+
 	u64 calculate_working_buffer_size(u64 base_size, u32 aspect);
 
 	void copy_image_typeless(mtl::command_list& cmd, mtl::image* src, mtl::image* dst,

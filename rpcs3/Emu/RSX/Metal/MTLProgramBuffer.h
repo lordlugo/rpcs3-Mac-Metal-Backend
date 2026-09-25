@@ -71,9 +71,34 @@ namespace mtl
 
 	struct program_cache : public program_state_cache<MTLTraits>
 	{
+		using base_type = program_state_cache<MTLTraits>;
+
 		program_cache(decompiler_callback_t callback)
 		{
 			notify_pipeline_compiled = callback;
+		}
+
+		// MTL4 render pipelines do not bake depth/stencil formats, so graphics_pipeline_state::depth_stencil_format is
+		// removed from the effective cache key: it is zeroed while the pipeline is looked up / built / stored in the
+		// shader cache (the field stays in the POD for shader-cache layout compatibility) and restored afterwards so
+		// the caller's own state comparisons are unaffected. Hides program_state_cache::get_graphics_pipeline.
+		template <typename... Args>
+		auto get_graphics_pipeline(
+			rsx::program_cache_hint_t* cache_hint,
+			const RSXVertexProgram& vertex_shader,
+			const RSXFragmentProgram& fragment_shader,
+			mtl::pipeline_props& pipeline_properties,
+			bool compile_async,
+			bool allow_notification,
+			Args&& ...args)
+		{
+			const u32 depth_stencil_format = std::exchange(pipeline_properties.state.depth_stencil_format, 0u);
+
+			auto result = base_type::get_graphics_pipeline(cache_hint, vertex_shader, fragment_shader, pipeline_properties,
+				compile_async, allow_notification, std::forward<Args>(args)...);
+
+			pipeline_properties.state.depth_stencil_format = depth_stencil_format;
+			return result;
 		}
 
 		u64 get_hash(const mtl::pipeline_props& props)

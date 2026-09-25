@@ -4,6 +4,7 @@
 // mtl::blit_pass (color) or its depth/stencil variants, which write [[depth]] / [[stencil]] from the fragment shader.
 
 #include "MTLOverlays.h"
+#include "MTLFormats.h"
 #include "MTLHelpers.h"
 #include "MTLResourceManager.h"
 #include "upscalers/upscaling.h"
@@ -59,6 +60,39 @@ namespace mtl
 			"	gl_FragDepth = textureLod(fs0, tc0, 0.).x;\n"
 			"}\n";
 
+		// Integer and stencil sources are fetched (nearest texel of the mapped coordinate) instead of sampled
+		#define BLIT_NEAREST_TEXEL(tex) \
+			"	ivec2 size_" #tex " = textureSize(" #tex ", 0);\n" \
+			"	ivec2 coord_" #tex " = clamp(ivec2(floor(tc0 * vec2(size_" #tex "))), ivec2(0), size_" #tex " - ivec2(1));\n"
+
+		const char* s_blit_uint_fs =
+			"#version 450\n"
+			"#extension GL_ARB_separate_shader_objects : enable\n"
+			"\n"
+			"layout(set=1, binding=0) uniform usampler2D fs0;\n"
+			"layout(location=0) in vec2 tc0;\n"
+			"layout(location=0) out uvec4 ocol;\n"
+			"\n"
+			"void main()\n"
+			"{\n"
+			BLIT_NEAREST_TEXEL(fs0)
+			"	ocol = texelFetch(fs0, coord_fs0, 0);\n"
+			"}\n";
+
+		const char* s_blit_sint_fs =
+			"#version 450\n"
+			"#extension GL_ARB_separate_shader_objects : enable\n"
+			"\n"
+			"layout(set=1, binding=0) uniform isampler2D fs0;\n"
+			"layout(location=0) in vec2 tc0;\n"
+			"layout(location=0) out ivec4 ocol;\n"
+			"\n"
+			"void main()\n"
+			"{\n"
+			BLIT_NEAREST_TEXEL(fs0)
+			"	ocol = texelFetch(fs0, coord_fs0, 0);\n"
+			"}\n";
+
 		const char* s_blit_stencil_fs =
 			"#version 450\n"
 			"#extension GL_ARB_separate_shader_objects : enable\n"
@@ -69,7 +103,8 @@ namespace mtl
 			"\n"
 			"void main()\n"
 			"{\n"
-			"	gl_FragStencilRefARB = int(textureLod(fs0, tc0, 0.).x & 0xFF);\n"
+			BLIT_NEAREST_TEXEL(fs0)
+			"	gl_FragStencilRefARB = int(texelFetch(fs0, coord_fs0, 0).x & 0xFF);\n"
 			"}\n";
 
 		const char* s_blit_depth_stencil_fs =
@@ -83,9 +118,12 @@ namespace mtl
 			"\n"
 			"void main()\n"
 			"{\n"
+			BLIT_NEAREST_TEXEL(fs1)
 			"	gl_FragDepth = textureLod(fs0, tc0, 0.).x;\n"
-			"	gl_FragStencilRefARB = int(textureLod(fs1, tc0, 0.).x & 0xFF);\n"
+			"	gl_FragStencilRefARB = int(texelFetch(fs1, coord_fs1, 0).x & 0xFF);\n"
 			"}\n";
+
+		#undef BLIT_NEAREST_TEXEL
 
 		// Clip a destination span to [0, limit) and adjust the (floating point) source span proportionally
 		void clip_span(s32& d1, s32& d2, f32& s1, f32& s2, s32 limit)
@@ -107,7 +145,8 @@ namespace mtl
 		}
 
 		// Scratch images used when the source and destination subresource are the same, or when the destination
-		// cannot be rendered to. Slot 0 = source copy, slot 1 = render target stand-in.
+		// image lacks RenderTarget usage. Slot 0 = source copy (sampled only, any format), slot 1 = render target
+		// stand-in (only requested for renderable formats, see copy_scaled_image).
 		struct blit_scratch_key
 		{
 			u32 slot;
@@ -126,18 +165,23 @@ namespace mtl
 
 		std::unordered_map<blit_scratch_key, std::unique_ptr<mtl::image>, blit_scratch_key_hash> g_blit_scratch;
 
-		mtl::image* get_blit_scratch(u32 slot, const mtl::image* like, u32 width, u32 height)
+		// `exact`: the scratch must have exactly width x height (whole-subresource copies)
+		mtl::image* get_blit_scratch(u32 slot, const mtl::image* like, u32 width, u32 height, bool exact = false)
 		{
 			const blit_scratch_key key{ slot, like->format() };
+			const bool render_target = (slot == 1);
+			ensure(!render_target || format_is_renderable(like->format()));
 			auto& entry = g_blit_scratch[key];
 
-			if (entry && entry->width() >= width && entry->height() >= height)
+			if (entry && (exact
+				? (entry->width() == width && entry->height() == height)
+				: (entry->width() >= width && entry->height() >= height)))
 			{
 				return entry.get();
 			}
 
-			const u32 new_w = entry ? std::max(entry->width(), width) : width;
-			const u32 new_h = entry ? std::max(entry->height(), height) : height;
+			const u32 new_w = (entry && !exact) ? std::max(entry->width(), width) : width;
+			const u32 new_h = (entry && !exact) ? std::max(entry->height(), height) : height;
 
 			if (entry)
 			{
@@ -150,7 +194,7 @@ namespace mtl
 			info.format = like->format();
 			info.width = new_w;
 			info.height = new_h;
-			info.usage = MTL::TextureUsageShaderRead | MTL::TextureUsageRenderTarget;
+			info.usage = render_target ? (MTL::TextureUsageShaderRead | MTL::TextureUsageRenderTarget) : MTL::TextureUsageShaderRead;
 			info.storage = memory_location::device_local;
 			info.format_class = like->format_class();
 
@@ -189,7 +233,7 @@ namespace mtl
 			return { rect.x, rect.y, rect.x + rect.width, rect.y + rect.height };
 		}
 
-		blit_pass* get_blit_pass_for(u32 dst_aspect, u32 src_aspect)
+		blit_pass* get_blit_pass_for(u32 dst_aspect, u32 src_aspect, MTL::PixelFormat dst_format)
 		{
 			if (dst_aspect & aspect_depth)
 			{
@@ -206,14 +250,56 @@ namespace mtl
 				return get_overlay_pass<stencil_blit_pass>();
 			}
 
-			return get_overlay_pass<blit_pass>();
+			switch (get_blit_output_type(dst_format))
+			{
+			case blit_output_type::uint_:
+				return get_overlay_pass<uint_blit_pass>();
+			case blit_output_type::sint_:
+				return get_overlay_pass<sint_blit_pass>();
+			default:
+				return get_overlay_pass<blit_pass>();
+			}
 		}
 	}
 
 	// ---- blit_pass --------------------------------------------------------------------------------------------------
 
-	blit_pass::blit_pass(u32 dst_aspect)
+	blit_output_type get_blit_output_type(MTL::PixelFormat format)
+	{
+		switch (format)
+		{
+		case MTL::PixelFormatR8Uint:
+		case MTL::PixelFormatR16Uint:
+		case MTL::PixelFormatR32Uint:
+		case MTL::PixelFormatRG8Uint:
+		case MTL::PixelFormatRG16Uint:
+		case MTL::PixelFormatRG32Uint:
+		case MTL::PixelFormatRGBA8Uint:
+		case MTL::PixelFormatRGB10A2Uint:
+		case MTL::PixelFormatRGBA16Uint:
+		case MTL::PixelFormatRGBA32Uint:
+		case MTL::PixelFormatStencil8:
+		case MTL::PixelFormatX32_Stencil8:
+		case MTL::PixelFormatX24_Stencil8:
+			return blit_output_type::uint_;
+		case MTL::PixelFormatR8Sint:
+		case MTL::PixelFormatR16Sint:
+		case MTL::PixelFormatR32Sint:
+		case MTL::PixelFormatRG8Sint:
+		case MTL::PixelFormatRG16Sint:
+		case MTL::PixelFormatRG32Sint:
+		case MTL::PixelFormatRGBA8Sint:
+		case MTL::PixelFormatRGBA16Sint:
+		case MTL::PixelFormatRGBA32Sint:
+			return blit_output_type::sint_;
+		default:
+			return blit_output_type::float_;
+		}
+	}
+
+	blit_pass::blit_pass(u32 dst_aspect, blit_output_type output_type)
 		: m_dst_aspect(dst_aspect)
+		, m_output_type(output_type)
 	{
 		vs_src = s_blit_vertex_shader;
 
@@ -223,7 +309,20 @@ namespace mtl
 		switch (dst_aspect)
 		{
 		case aspect_color:
-			fs_src = s_blit_color_fs;
+			switch (output_type)
+			{
+			case blit_output_type::uint_:
+				fs_src = s_blit_uint_fs;
+				m_sampler_filter = MTL::SamplerMinMagFilterNearest;
+				break;
+			case blit_output_type::sint_:
+				fs_src = s_blit_sint_fs;
+				m_sampler_filter = MTL::SamplerMinMagFilterNearest;
+				break;
+			default:
+				fs_src = s_blit_color_fs;
+				break;
+			}
 			renderpass_config.set_color_mask(0, true, true, true, true);
 			renderpass_config.set_depth_mask(false);
 			m_overwrites_color = true;
@@ -329,8 +428,8 @@ namespace mtl
 		m_src_rect[2] = (sx2 - sx1) / src_w;
 		m_src_rect[3] = (sy2 - sy1) / src_h;
 
-		// Depth and stencil are never filtered
-		m_sampler_filter = (linear_filter && m_dst_aspect == aspect_color)
+		// Depth, stencil and integer formats are never filtered
+		m_sampler_filter = (linear_filter && m_dst_aspect == aspect_color && m_output_type == blit_output_type::float_)
 			? MTL::SamplerMinMagFilterLinear
 			: MTL::SamplerMinMagFilterNearest;
 
@@ -390,9 +489,33 @@ namespace mtl
 			return;
 		}
 
+		if (!format_is_renderable(dst->format()))
+		{
+			// Block-compressed (or otherwise non-renderable) destinations cannot be drawn into, and a stand-in of another
+			// format would change the data encoding. vkCmdBlitImage does not support them either.
+			rsx_log.error("Metal: scaled copy into non-renderable format %d is not supported (src fmt=%d)",
+				static_cast<int>(dst->format()), static_cast<int>(src->format()));
+			return;
+		}
+
 		const u32 src_aspect = src->aspect();
 		const u32 dst_aspect = dst->aspect();
-		auto pass = get_blit_pass_for(dst_aspect, src_aspect);
+
+		if (dst_aspect == aspect_color)
+		{
+			// Integer and non-integer color formats cannot be blitted into each other (same rule as vkCmdBlitImage)
+			const auto dst_type = get_blit_output_type(dst->format());
+			const auto src_type = (src_aspect == aspect_color) ? get_blit_output_type(src->format()) : blit_output_type::float_;
+
+			if (dst_type != src_type)
+			{
+				rsx_log.error("Metal: scaled copy between integer and non-integer formats is not supported (src fmt=%d, dst fmt=%d)",
+					static_cast<int>(src->format()), static_cast<int>(dst->format()));
+				return;
+			}
+		}
+
+		auto pass = get_blit_pass_for(dst_aspect, src_aspect, dst->format());
 
 		// Aspects sampled from the source for this pass
 		const bool needs_stencil_view = (pass->m_dst_aspect & aspect_stencil) != 0;
@@ -434,17 +557,39 @@ namespace mtl
 					const s32 y = std::min(src_area.y1, src_area.y2);
 					const u32 w = static_cast<u32>(std::abs(src_area.x2 - src_area.x1));
 					const u32 h = static_cast<u32>(std::abs(src_area.y2 - src_area.y1));
+					const u32 level_w = std::max(src->width() >> src_level, 1u);
+					const u32 level_h = std::max(src->height() >> src_level, 1u);
 
-					auto scratch = get_blit_scratch(0, src, w, h);
-					cmd.compute()->copyFromTexture(src->value, src_layer, src_level, MTL::Origin(x, y, 0), MTL::Size(w, h, 1),
-						scratch->value, 0, 0, MTL::Origin(0, 0, 0));
+					if (src_aspect & aspect_depth_stencil)
+					{
+						// Depth/stencil: whole-subresource copy (partial blit copies of depth/stencil textures are not
+						// allowed on every Metal GPU). Sampling coordinates stay the same.
+						auto scratch = get_blit_scratch(0, src, level_w, level_h, true);
+						cmd.compute()->copyFromTexture(src->value, src_layer, src_level, scratch->value, 0, 0, 1, 1);
 
-					sample_image = scratch;
-					sample_level = 0;
-					sample_layer = 0;
-					sample_area = { 0, 0, static_cast<s32>(w), static_cast<s32>(h) };
-					if (src_area.x1 > src_area.x2) std::swap(sample_area.x1, sample_area.x2);
-					if (src_area.y1 > src_area.y2) std::swap(sample_area.y1, sample_area.y2);
+						sample_image = scratch;
+						sample_level = 0;
+						sample_layer = 0;
+					}
+					else
+					{
+						if (x < 0 || y < 0 || (static_cast<u32>(x) + w) > level_w || (static_cast<u32>(y) + h) > level_h)
+						{
+							rsx_log.error("Metal: scaled self-copy source region (%d,%d %ux%u) is outside the image (%ux%u)", x, y, w, h, level_w, level_h);
+							continue;
+						}
+
+						auto scratch = get_blit_scratch(0, src, w, h);
+						cmd.compute()->copyFromTexture(src->value, src_layer, src_level, MTL::Origin(x, y, 0), MTL::Size(w, h, 1),
+							scratch->value, 0, 0, MTL::Origin(0, 0, 0));
+
+						sample_image = scratch;
+						sample_level = 0;
+						sample_layer = 0;
+						sample_area = { 0, 0, static_cast<s32>(w), static_cast<s32>(h) };
+						if (src_area.x1 > src_area.x2) std::swap(sample_area.x1, sample_area.x2);
+						if (src_area.y1 > src_area.y2) std::swap(sample_area.y1, sample_area.y2);
+					}
 				}
 
 				// Source views (single level, single slice, 2D)
@@ -487,22 +632,42 @@ namespace mtl
 				}
 				else
 				{
-					// Render into a stand-in with RenderTarget usage, then copy into the destination
+					// Render into a stand-in with RenderTarget usage (same, renderable format), then copy into the destination
 					const s32 x = std::min(dst_area.x1, dst_area.x2);
 					const s32 y = std::min(dst_area.y1, dst_area.y2);
 					const u32 w = static_cast<u32>(std::abs(dst_area.x2 - dst_area.x1));
 					const u32 h = static_cast<u32>(std::abs(dst_area.y2 - dst_area.y1));
+					const u32 level_w = std::max(dst->width() >> dst_level, 1u);
+					const u32 level_h = std::max(dst->height() >> dst_level, 1u);
 
-					auto scratch = get_blit_scratch(1, dst, w, h);
+					if (dst_aspect & aspect_depth_stencil)
+					{
+						// Depth/stencil: only whole-subresource blit copies. Round-trip the full level through the
+						// stand-in so the pixels outside dst_area are preserved.
+						auto scratch = get_blit_scratch(1, dst, level_w, level_h, true);
+						cmd.compute()->copyFromTexture(dst->value, dst_layer, dst_level, scratch->value, 0, 0, 1, 1);
 
-					areai scratch_area = { 0, 0, static_cast<s32>(w), static_cast<s32>(h) };
-					if (dst_area.x1 > dst_area.x2) std::swap(scratch_area.x1, scratch_area.x2);
-					if (dst_area.y1 > dst_area.y2) std::swap(scratch_area.y1, scratch_area.y2);
+						pass->run(cmd, overlay_target(scratch), dst_area, views, sample_area, linear_filter);
 
-					pass->run(cmd, overlay_target(scratch), scratch_area, views, sample_area, linear_filter);
+						cmd.compute()->copyFromTexture(scratch->value, 0, 0, dst->value, dst_layer, dst_level, 1, 1);
+					}
+					else if (x < 0 || y < 0 || (static_cast<u32>(x) + w) > level_w || (static_cast<u32>(y) + h) > level_h)
+					{
+						rsx_log.error("Metal: scaled copy destination region (%d,%d %ux%u) is outside the image (%ux%u)", x, y, w, h, level_w, level_h);
+					}
+					else
+					{
+						auto scratch = get_blit_scratch(1, dst, w, h);
 
-					cmd.compute()->copyFromTexture(scratch->value, 0, 0, MTL::Origin(0, 0, 0), MTL::Size(w, h, 1),
-						dst->value, dst_layer, dst_level, MTL::Origin(x, y, 0));
+						areai scratch_area = { 0, 0, static_cast<s32>(w), static_cast<s32>(h) };
+						if (dst_area.x1 > dst_area.x2) std::swap(scratch_area.x1, scratch_area.x2);
+						if (dst_area.y1 > dst_area.y2) std::swap(scratch_area.y1, scratch_area.y2);
+
+						pass->run(cmd, overlay_target(scratch), scratch_area, views, sample_area, linear_filter);
+
+						cmd.compute()->copyFromTexture(scratch->value, 0, 0, MTL::Origin(0, 0, 0), MTL::Size(w, h, 1),
+							dst->value, dst_layer, dst_level, MTL::Origin(x, y, 0));
+					}
 				}
 
 				// The views are referenced by the recorded pass

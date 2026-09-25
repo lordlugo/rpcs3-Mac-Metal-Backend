@@ -9,6 +9,10 @@
 //  - No GL_EXT_fragment_shader_barycentric: the renderer must report supports_normalized_barycentrics = true
 //    (Apple GPUs interpolate correctly), RSX_SHADER_CONTROL_ATTRIBUTE_INTERPOLATION is ignored if ever set.
 //  - Programmable blending subpassInput frag_src_N reads [[color(N)]] via framebuffer fetch (no binding needed).
+//  - Program inputs list the 16 texture units first, then stencil mirrors, then frag_depth, so that if a stage runs
+//    out of the 16 Metal sampler slots only those (nearest-sampled / texelFetch-only) lose their sampler slot.
+//  - Without hardware sampler LOD bias (pre-Apple10), the per-unit LOD bias is applied in the shader (see
+//    MTLFragmentProgram::requires_lod_bias); shadow compares and depth->RGBA reads are not biased.
 //  - Logic ops are not emulated: the shared ROP code exposes no logic-op control bits (see report / DESIGN.md).
 
 class MTLFragmentDecompilerThread : public FragmentProgramDecompiler
@@ -32,6 +36,14 @@ public:
 
 	void Task();
 	const std::vector<mtl::glsl::program_input>& get_inputs() { return inputs; }
+
+	struct
+	{
+		// Samplers cannot apply mipLodBias on this GPU (sampler.cpp only sets it on Apple10): add the per-unit bias
+		// in the shader instead (see MTLFragmentProgram::lod_bias_push_offset).
+		bool emulate_sampler_lod_bias = false;
+	}
+	metal_props;
 
 protected:
 	std::string getFloatTypeName(usz elementCount) override;
@@ -66,6 +78,15 @@ public:
 
 	std::array<u32, 4> output_color_masks{ {} };
 	std::vector<mtl::glsl::program_input> uniforms;
+
+	// Shader-side sampler LOD bias (GPUs without sampler LOD bias support, i.e. !caps().apple10).
+	// When set, the renderer must push one float per fragment texture unit before binding the program:
+	//   push_constants(glsl::binding_set_index_fragment, lod_bias_push_offset, lod_bias_push_size, float[16])
+	// where element i = the mip LOD bias of texture unit i (0 for unused units / units without mipmaps).
+	// GLSL: push_constants_block { ...; layout(offset = 32) vec4 texture_lod_bias[4]; } (unit i = [i / 4][i % 4]).
+	bool requires_lod_bias = false;
+	static constexpr u32 lod_bias_push_offset = 32;
+	static constexpr u32 lod_bias_push_size = 16 * sizeof(f32);
 
 	struct
 	{

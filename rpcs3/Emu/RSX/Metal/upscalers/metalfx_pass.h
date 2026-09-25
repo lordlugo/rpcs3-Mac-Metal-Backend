@@ -25,7 +25,7 @@ namespace mtl
 		std::unique_ptr<mtl::viewable_image> m_output_right;
 
 		MTL4FX::SpatialScaler* m_scaler = nullptr;   // Owned (+1)
-		MTL::Fence* m_fence = nullptr;               // Owned (+1). Orders the scaler against the work before it
+		MTL::Fence* m_fence = nullptr;               // Owned (+1). Orders the scaler against the work before and after it
 
 		struct scaler_config
 		{
@@ -51,6 +51,8 @@ namespace mtl
 
 		// Makes the scaler (encoded as its own passes) wait for all previously recorded work
 		void signal_fence(mtl::command_list& cmd);
+		// Makes all subsequently recorded work wait for the scaler's output
+		void wait_fence(mtl::command_list& cmd);
 
 	public:
 		metalfx_upscale_pass() = default;

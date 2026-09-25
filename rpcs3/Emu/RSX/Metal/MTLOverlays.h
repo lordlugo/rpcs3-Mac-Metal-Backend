@@ -183,6 +183,7 @@ namespace mtl
 		void upload_vertex_data_raw(const void* data, usz size);
 		void upload_uniform_data(const void* data, usz size);
 
+		// Returns nullptr (logged once, cached) if the pipeline cannot be built; the draw is then skipped
 		glsl::program* build_pipeline(u64 storage_key, const glsl::graphics_pipeline_state& state);
 		glsl::program* load_program(mtl::command_list& cmd, const overlay_target& target, const std::vector<mtl::image_view*>& src);
 
@@ -194,7 +195,9 @@ namespace mtl
 		mtl::sampler* get_sampler(bool linear);
 
 		// Render pass management. begin_pass/end_pass bracket one or more draw() calls on the same target.
-		void begin_pass(mtl::command_list& cmd, const overlay_target& target, const areau& viewport);
+		// begin_pass returns false (logged, no pass opened) if the target cannot be rendered to (e.g. a
+		// block-compressed format); the caller must then skip draw()/end_pass().
+		bool begin_pass(mtl::command_list& cmd, const overlay_target& target, const areau& viewport);
 		void end_pass(mtl::command_list& cmd);
 		void draw(mtl::command_list& cmd, const areau& viewport, const overlay_target& target, const std::vector<mtl::image_view*>& src);
 
@@ -347,14 +350,25 @@ namespace mtl
 
 	// Scaled copy of a texture region into a render target region (Metal has no vkCmdBlitImage).
 	// The base class writes color; the derived classes write depth ([[depth]]), stencil ([[stencil]]) or both.
+	enum class blit_output_type : u8
+	{
+		float_,   // unorm/snorm/float color (filterable)
+		uint_,    // unsigned integer color (nearest only)
+		sint_,    // signed integer color (nearest only)
+	};
+
+	// Color output type of a pixel format as seen by a fragment shader
+	blit_output_type get_blit_output_type(MTL::PixelFormat format);
+
 	struct blit_pass : public overlay_pass
 	{
 		u32 m_dst_aspect = aspect_color;
+		blit_output_type m_output_type = blit_output_type::float_;
 		f32 m_src_rect[4] = { 0.f, 0.f, 1.f, 1.f }; // Normalized source origin (xy) and extent (zw), negative extent mirrors
 
 		static constexpr u32 vertex_push_constants_size = 16;
 
-		explicit blit_pass(u32 dst_aspect = aspect_color);
+		explicit blit_pass(u32 dst_aspect = aspect_color, blit_output_type output_type = blit_output_type::float_);
 
 		std::vector<glsl::program_input> get_vertex_inputs() override;
 
@@ -365,6 +379,17 @@ namespace mtl
 		// views for depth_stencil_blit_pass. Views must be single-sampled 2D views.
 		void run(mtl::command_list& cmd, const overlay_target& target, const areai& dst_area,
 			const std::vector<mtl::image_view*>& src, const areai& src_area, bool linear_filter);
+	};
+
+	// Integer color destinations (e.g. R16Uint / R32Uint typeless helpers). Source must have the same integer-ness.
+	struct uint_blit_pass : public blit_pass
+	{
+		uint_blit_pass() : blit_pass(aspect_color, blit_output_type::uint_) {}
+	};
+
+	struct sint_blit_pass : public blit_pass
+	{
+		sint_blit_pass() : blit_pass(aspect_color, blit_output_type::sint_) {}
 	};
 
 	struct depth_blit_pass : public blit_pass

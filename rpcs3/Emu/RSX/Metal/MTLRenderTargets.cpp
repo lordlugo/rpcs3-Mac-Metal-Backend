@@ -118,17 +118,11 @@ namespace mtl
 		}
 	}
 
-	MTL::TextureUsage surface_cache_traits::get_attachment_usage(MTL::PixelFormat format, u8 samples, bool depth)
+	MTL::TextureUsage surface_cache_traits::get_attachment_usage(MTL::PixelFormat /*format*/, u8 /*samples*/, bool /*depth*/)
 	{
-		MTL::TextureUsage usage = MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead;
-
-		if (!depth && samples == 1 && format_supports_shader_write(format))
-		{
-			// Compute access to single-sampled color surfaces (resolve/unresolve, upscalers)
-			usage |= MTL::TextureUsageShaderWrite;
-		}
-
-		return usage;
+		// No pass writes surfaces from compute (resolve/unresolve are fragment passes, transfers are blits), so
+		// ShaderWrite is not requested: it would only disable lossless framebuffer compression.
+		return MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead;
 	}
 
 	std::unique_ptr<mtl::render_target> surface_cache_traits::create_new_surface(
@@ -369,7 +363,8 @@ namespace mtl
 
 		if (dest != bo)
 		{
-			cmd.compute()->copyFromBuffer(dest->value(), src_offset_in_buffer, bo->value(), dst_offset_in_buffer, max_copy_length);
+			// Offsets come from guest addresses: any alignment
+			mtl::copy_buffer_to_buffer_aligned(cmd, dest, src_offset_in_buffer, bo, dst_offset_in_buffer, max_copy_length);
 		}
 	}
 
@@ -707,12 +702,8 @@ namespace mtl
 			create_info.width = resolve_w;
 			create_info.height = resolve_h;
 			create_info.samples = 1;
+			// Resolve/unresolve are fragment passes (MTLResolveHelper): no ShaderWrite needed
 			create_info.usage = MTL::TextureUsageShaderRead | MTL::TextureUsageRenderTarget;
-			if (!is_depth_surface() && format_supports_shader_write(format()))
-			{
-				// Compute resolve/unresolve writes into / reads from the linear surface
-				create_info.usage |= MTL::TextureUsageShaderWrite;
-			}
 			create_info.storage = memory_location::device_local;
 			create_info.format_class = format_class();
 
@@ -781,7 +772,8 @@ namespace mtl
 			result.push_back(rgn);
 			result.front().aspect = aspect_depth;
 			result.back().aspect = aspect_stencil;
-			result.back().buffer_offset = u64{ target->width() } * target->height() * 4;
+			// Metal: texture <-> buffer copy offsets must be 16-byte aligned
+			result.back().buffer_offset = utils::align<u64>(u64{ target->width() } * target->height() * 4, 16);
 		}
 
 		return result;
@@ -874,7 +866,7 @@ namespace mtl
 		}
 
 		const auto pdev = mtl::get_current_renderer();
-		const auto alloc_size = element_size * src->width() * src->height();
+		const auto alloc_size = element_size * src->width() * src->height() + 16; // + alignment padding of the stencil plane
 
 		m_spilled_mem = std::make_unique<mtl::buffer>(*pdev, alloc_size, memory_location::host_visible, "spilled surface");
 

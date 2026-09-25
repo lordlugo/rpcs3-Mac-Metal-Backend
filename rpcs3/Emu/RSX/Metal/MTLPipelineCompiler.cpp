@@ -23,47 +23,32 @@ namespace mtl
 			return !g_cfg.video.disable_msl_fast_math;
 		}
 
-		// Maps a vertex function input type (reflection) to a vertex fetch format. Returns {format, size in bytes}.
-		std::pair<MTL::VertexFormat, u32> get_vertex_format(MTL::DataType type)
+		// Size in bytes of the vertex fetch formats produced by the translator's stage_in reflection
+		u32 get_vertex_format_size(MTL::VertexFormat format)
 		{
-			switch (type)
+			switch (format)
 			{
-			case MTL::DataTypeFloat: return { MTL::VertexFormatFloat, 4 };
-			case MTL::DataTypeFloat2: return { MTL::VertexFormatFloat2, 8 };
-			case MTL::DataTypeFloat3: return { MTL::VertexFormatFloat3, 12 };
-			case MTL::DataTypeFloat4: return { MTL::VertexFormatFloat4, 16 };
-			case MTL::DataTypeHalf: return { MTL::VertexFormatHalf, 2 };
-			case MTL::DataTypeHalf2: return { MTL::VertexFormatHalf2, 4 };
-			case MTL::DataTypeHalf3: return { MTL::VertexFormatHalf3, 6 };
-			case MTL::DataTypeHalf4: return { MTL::VertexFormatHalf4, 8 };
-			case MTL::DataTypeInt: return { MTL::VertexFormatInt, 4 };
-			case MTL::DataTypeInt2: return { MTL::VertexFormatInt2, 8 };
-			case MTL::DataTypeInt3: return { MTL::VertexFormatInt3, 12 };
-			case MTL::DataTypeInt4: return { MTL::VertexFormatInt4, 16 };
-			case MTL::DataTypeUInt: return { MTL::VertexFormatUInt, 4 };
-			case MTL::DataTypeUInt2: return { MTL::VertexFormatUInt2, 8 };
-			case MTL::DataTypeUInt3: return { MTL::VertexFormatUInt3, 12 };
-			case MTL::DataTypeUInt4: return { MTL::VertexFormatUInt4, 16 };
-			default: return { MTL::VertexFormatInvalid, 0 };
+			case MTL::VertexFormatHalf: return 2;
+			case MTL::VertexFormatHalf2: return 4;
+			case MTL::VertexFormatHalf3: return 6;
+			case MTL::VertexFormatHalf4: return 8;
+			case MTL::VertexFormatFloat: case MTL::VertexFormatInt: case MTL::VertexFormatUInt: return 4;
+			case MTL::VertexFormatFloat2: case MTL::VertexFormatInt2: case MTL::VertexFormatUInt2: return 8;
+			case MTL::VertexFormatFloat3: case MTL::VertexFormatInt3: case MTL::VertexFormatUInt3: return 12;
+			case MTL::VertexFormatFloat4: case MTL::VertexFormatInt4: case MTL::VertexFormatUInt4: return 16;
+			default: return 0;
 			}
 		}
 
-		// Builds the implicit vertex descriptor for vertex functions with [[stage_in]] attributes (see
-		// stage_in_vertex_buffer_index). Returns an empty ref if the function fetches no attributes.
+		// Builds the implicit vertex descriptor for vertex shaders with [[stage_in]] attributes (see
+		// stage_in_vertex_buffer_index) from the attribute list reflected once at translation time (no MTLFunction
+		// reflection per pipeline). Returns an empty ref if the shader fetches no attributes (all RSX programs).
 		mtl::ref<MTL::VertexDescriptor> make_stage_in_descriptor(const glsl::shader& vs, const glsl::binding_layout& vs_layout, bool& error)
 		{
 			error = false;
 
-			auto function = mtl::ref(vs.library()->newFunction(mtl::ns_str(vs.entry_point())));
-			if (!function)
-			{
-				rsx_log.error("[MSL] Entry point '%s' not found in the vertex library", vs.entry_point());
-				error = true;
-				return {};
-			}
-
-			const NS::Array* attributes = function->vertexAttributes();
-			if (!attributes || attributes->count() == 0)
+			const auto& attributes = vs.vertex_attributes();
+			if (attributes.empty())
 			{
 				return {};
 			}
@@ -76,32 +61,16 @@ namespace mtl
 				return {};
 			}
 
-			std::vector<std::pair<u32, MTL::DataType>> inputs;
-			for (NS::UInteger i = 0; i < attributes->count(); ++i)
-			{
-				const auto attribute = attributes->object<MTL::VertexAttribute>(i);
-				if (attribute && attribute->isActive())
-				{
-					inputs.emplace_back(static_cast<u32>(attribute->attributeIndex()), attribute->attributeType());
-				}
-			}
-
-			if (inputs.empty())
-			{
-				return {};
-			}
-
-			std::sort(inputs.begin(), inputs.end(), FN(x.first < y.first));
-
 			auto descriptor = mtl::ref(MTL::VertexDescriptor::alloc()->init());
 			u32 offset = 0;
 
-			for (const auto& [location, type] : inputs)
+			// Sorted by location: interleaved, tightly packed (4-byte aligned) in location order
+			for (const auto& [location, format] : attributes)
 			{
-				const auto [format, size] = get_vertex_format(type);
-				if (format == MTL::VertexFormatInvalid)
+				const u32 size = get_vertex_format_size(format);
+				if (!size)
 				{
-					rsx_log.error("[MSL] Unsupported vertex attribute type %u at location %u", static_cast<u32>(type), location);
+					rsx_log.error("[MSL] Unsupported vertex attribute format %u at location %u", static_cast<u32>(format), location);
 					error = true;
 					return {};
 				}
