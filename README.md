@@ -126,7 +126,7 @@ settings.
 | Setting | Default | Why |
 |---|---|---|
 | VSync | Full | Presentation is paced to the display (ProMotion aware, see below) only with VSync on |
-| Output Scaling | MetalFX Spatial Upscaling (+ RCAS sharpening) | Stored as "FidelityFX Super Resolution" in config.yml; the RCAS slider at 0 turns sharpening off. Below a 1.25x upscale a plain bilinear draw is used |
+| Output Scaling | MetalFX Spatial Upscaling (+ RCAS sharpening) | Stored as "FidelityFX Super Resolution" in config.yml; the RCAS slider at 0 turns sharpening off. Runs whenever the image is upscaled to the window; when the resolution scale makes the image larger than the window, it is scaled down with a bilinear draw |
 | Anisotropic Filter | Automatic = 16x | Applied to the game's textures (not to render targets read by effects); pick a lower value to limit it, or Strict Rendering Mode for the PS3's own setting |
 | Pipeline archive | On | Compiled GPU pipelines are saved next to the shader cache, so later boots skip most compiles. `RPCS3_METAL_PIPELINE_ARCHIVE=0` turns it off |
 | Multithreaded RSX | On | The worker thread sleeps when idle (upstream keeps it spinning on a core forever) and only takes large copies and GPU command submission, so it no longer costs a performance core |
@@ -174,10 +174,9 @@ game's shaders once.
 ends; every extra pass stores and reloads the whole frame, which at high resolution scales is most of the GPU's work.
 The renderer now ends a pass for a feedback read (an effect sampling the depth or colour buffer being drawn) only when
 the sampled buffer was written in that pass, instead of on every such draw. Particles, fog, heat haze and deferred
-lights used to split the pass on each draw and pegged the GPU. At the output, MetalFX and its sharpening pass only run
-for upscales of 1.25x or more (at 225% or 250% on a Retina display the image is already close to the window size, and
-the plain bilinear draw looks the same), the letterbox bars are cleared by the final draw itself, and the automatic 16x
-anisotropic filtering applies to the game's textures only, not to screen-space buffers. Every 30 s the log gets a line
+lights used to split the pass on each draw and pegged the GPU. At the output, the letterbox bars are cleared by the
+final draw itself, and the automatic 16x anisotropic filtering applies to the game's textures only, not to screen-space
+buffers. Every 30 s the log gets a line
 `Metal: GPU busy ... ms per frame (...% of the time), ... render passes and ... feedback splits per frame`; if the GPU
 time per frame rises in the same scene after a while, the Mac is getting hot and lowering its GPU clock.
 
@@ -220,7 +219,7 @@ The renderer requires the Metal 4 GPU family (Apple7 = M1 and newer) and checks 
 | 16x anisotropic filtering | Yes | |
 | MSAA (2x/4x) | Yes | PS3 MSAA surfaces |
 | Unified memory, no-copy buffers | Yes | The GPU writes back to guest memory directly (texture uploads are copied, see Videos and cutscenes) |
-| MetalFX spatial upscaling (`MTL4FXSpatialScaler`) | Yes | Replaces FSR 1; used for upscales of 1.25x and more |
+| MetalFX spatial upscaling (`MTL4FXSpatialScaler`) | Yes | Replaces FSR 1; used whenever the image is upscaled |
 | `presentAfterMinimumDuration`, ProMotion refresh intervals | Yes | Frame pacing |
 | Depth bounds test | M5 (Apple10) only | Ignored on older GPUs |
 | Hardware sampler LOD bias | M5 (Apple10) only | Done in the shader on M1-M4 |
