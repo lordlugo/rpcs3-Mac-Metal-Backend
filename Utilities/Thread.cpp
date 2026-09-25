@@ -40,6 +40,7 @@ DYNAMIC_IMPORT_RENAME("Kernel32.dll", SetThreadDescriptionImport, "SetThreadDesc
 #define __USE_GNU
 #include <mach/thread_act.h>
 #include <mach/thread_policy.h>
+#include "stack_trace.h" // RPCS3 Metal fork: native call stack in fatal segfault reports
 #endif
 #if defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
 #include <pthread_np.h>
