@@ -678,6 +678,66 @@ if(TARGET 3rdparty_vulkan)
     endif()
 endif()
 
+# Native Metal 4 renderer (RPCS3 Metal fork, macOS only).
+# Every source under RSX/Metal/ (recursively) is part of the backend. The glob is re-evaluated at build time
+# (CONFIGURE_DEPENDS), so newly added files are picked up without re-running cmake by hand.
+# The shared shader pipeline (RSX/Program/GLSLCommon.cpp, RSX/Program/SPIRVCommon.cpp, ...) and glslang are part of
+# the common RSX sources/libraries above and are therefore always built.
+if(TARGET 3rdparty_metal)
+    file(GLOB_RECURSE RPCS3_METAL_SOURCES CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/RSX/Metal/*.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/RSX/Metal/*.mm"
+    )
+    file(GLOB_RECURSE RPCS3_METAL_HEADERS CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/RSX/Metal/*.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/RSX/Metal/*.hpp"
+    )
+
+    if(NOT RPCS3_METAL_SOURCES)
+        message(WARNING "RPCS3: USE_METAL is ON but no Metal backend sources were found in ${CMAKE_CURRENT_SOURCE_DIR}/RSX/Metal")
+    endif()
+
+    target_sources(rpcs3_emu PRIVATE ${RPCS3_METAL_SOURCES} ${RPCS3_METAL_HEADERS})
+
+    # Objective-C++ sources: compiled by clang as Objective-C++ based on the .mm extension, exactly like
+    # darwin/util/sysinfo_darwin.mm. Manual retain/release (metal-cpp convention), so ARC stays off.
+    # C-style casts are idiomatic in Objective-C, so the project-wide -Werror=old-style-cast is lifted for them.
+    # A C++ precompiled header cannot be used by an Objective-C++ TU, so they never use the PCH.
+    set(RPCS3_METAL_OBJCXX_SOURCES ${RPCS3_METAL_SOURCES})
+    list(FILTER RPCS3_METAL_OBJCXX_SOURCES INCLUDE REGEX "\\.mm$")
+    if(RPCS3_METAL_OBJCXX_SOURCES)
+        set_source_files_properties(${RPCS3_METAL_OBJCXX_SOURCES} PROPERTIES
+            COMPILE_OPTIONS "-fno-objc-arc;-Wno-old-style-cast"
+            SKIP_PRECOMPILE_HEADERS ON
+        )
+    endif()
+
+    # SPIRV-Cross reports errors by throwing spirv_cross::CompilerError. The translation unit that drives it is
+    # built with exceptions so failures are caught and logged instead of terminating the emulator.
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/RSX/Metal/MTLShaderCompiler.cpp" PROPERTIES
+        COMPILE_OPTIONS "-fexceptions"
+        SKIP_PRECOMPILE_HEADERS ON
+    )
+
+    # metal-cpp's selector/class tables are instantiated here; keep it out of the PCH so the
+    # *_PRIVATE_IMPLEMENTATION macros are seen before any metal-cpp header.
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/RSX/Metal/MTLImpl.cpp" PROPERTIES
+        SKIP_PRECOMPILE_HEADERS ON
+    )
+
+    target_link_libraries(rpcs3_emu
+        PUBLIC
+            3rdparty::metal         # HAVE_METAL=1 (must be visible to rpcs3qt/system_config.h users), metal-cpp, frameworks
+        PRIVATE
+            3rdparty::spirv_cross   # SPIR-V -> MSL
+    )
+endif()
+
+if(APPLE)
+    # Objective-C++ TUs cannot consume the C++ precompiled header
+    set_source_files_properties("../../darwin/util/sysinfo_darwin.mm" PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+endif()
+
 if(NOT WIN32)
     set(THREADS_PREFER_PTHREAD_FLAG ON)
 endif()

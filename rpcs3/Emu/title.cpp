@@ -91,6 +91,7 @@ namespace rpcs3
 #endif
 						break;
 					case video_renderer::vulkan:
+					case video_renderer::metal: // Metal shares the graphics adapter setting with Vulkan
 						title_string += title_data.vulkan_adapter;
 						break;
 					}

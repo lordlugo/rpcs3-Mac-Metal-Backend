@@ -2763,16 +2763,18 @@ void thread_base::start()
 #elif defined(__APPLE__)
 	pthread_attr_t attrs;
 	pthread_t thread_id{};
-	struct sched_param sp;
-	memset(&sp, 0, sizeof(struct sched_param));
-	sp.sched_priority=99;
 	pthread_attr_init(&attrs);
 	pthread_attr_setstacksize(&attrs, 0x800000);
-	
+
+	// macOS schedules threads by QoS class, which also decides P-core vs E-core placement on Apple silicon.
+	// Do NOT combine this with SCHED_RR/sched_param: an explicit POSIX policy opts the thread out of QoS
+	// (and realtime priorities are not granted to regular apps anyway).
+	// Named threads are the emulation threads (PPU/SPU/RSX, cellAudio, timers, ...), which never adjust their own
+	// priority, so they start at the highest class. Helper/worker threads lower themselves through
+	// thread_ctrl::scoped_priority(-1) (-> QOS_CLASS_UTILITY), see set_native_priority().
 	pthread_attr_set_qos_class_np(&attrs, QOS_CLASS_USER_INTERACTIVE, 0);
-	pthread_attr_setschedpolicy(&attrs, SCHED_RR);
-	pthread_attr_setschedparam(&attrs, &sp);
 	ensure(pthread_create(&thread_id, &attrs, entry_point, this) == 0);
+	pthread_attr_destroy(&attrs);
 #else
 	pthread_t thread_id{};
 	ensure(pthread_create(&thread_id, nullptr, entry_point, this) == 0);
@@ -3835,6 +3837,34 @@ void thread_ctrl::set_native_priority(int priority)
 	{
 		sig_log.error("SetThreadPriority() failed: %s", fmt::win_error{GetLastError(), nullptr});
 	}
+#elif defined(__APPLE__)
+	// macOS: map RPCS3 priorities to QoS classes instead of POSIX (SCHED_RR) priorities.
+	// On Apple silicon the QoS class also steers P-core/E-core placement.
+	//   priority > 0 : QOS_CLASS_USER_INTERACTIVE - emulation-critical threads (RSX, audio, ...)
+	//   priority < 0 : QOS_CLASS_UTILITY          - background work (PPU/SPU/shader compilation, log writer, ...)
+	//   priority == 0: the thread's normal class. That is QOS_CLASS_USER_INTERACTIVE for threads created as emulation
+	//                  threads (named threads, see thread_base::start()) and QOS_CLASS_USER_INITIATED for any other
+	//                  thread. Restoring the creation class matters because emulation threads may lower themselves
+	//                  temporarily, e.g. a PPU thread that is recycled as a compilation worker (scoped_priority(-1)).
+	static thread_local qos_class_t s_normal_qos = QOS_CLASS_UNSPECIFIED;
+
+	if (s_normal_qos == QOS_CLASS_UNSPECIFIED)
+	{
+		// First priority change on this thread: remember its normal class
+		s_normal_qos = qos_class_self() == QOS_CLASS_USER_INTERACTIVE ? QOS_CLASS_USER_INTERACTIVE : QOS_CLASS_USER_INITIATED;
+	}
+
+	qos_class_t qos = s_normal_qos;
+
+	if (priority > 0)
+		qos = QOS_CLASS_USER_INTERACTIVE;
+	if (priority < 0)
+		qos = QOS_CLASS_UTILITY;
+
+	if (int err = pthread_set_qos_class_self_np(qos, 0))
+	{
+		sig_log.error("pthread_set_qos_class_self_np() failed: %d", err);
+	}
 #else
 	int policy;
 	struct sched_param param;
@@ -3888,10 +3918,16 @@ void thread_ctrl::set_thread_affinity_mask(u64 mask)
 		sig_log.error("Failed to set thread affinity 0x%x: error: %s", mask, fmt::win_error{GetLastError(), nullptr});
 	}
 #elif __APPLE__
+#if defined(ARCH_ARM64)
+	// Apple silicon: affinity tags are not supported (THREAD_AFFINITY_POLICY fails with KERN_NOT_SUPPORTED) and threads
+	// cannot be pinned to cores. Core placement is driven by the QoS class instead (see set_native_priority()).
+	static_cast<void>(mask);
+#else
 	// Supports only one core
 	thread_affinity_policy_data_t policy = { static_cast<integer_t>(std::countr_zero(mask)) };
 	thread_port_t mach_thread = pthread_mach_thread_np(pthread_self());
 	thread_policy_set(mach_thread, THREAD_AFFINITY_POLICY, reinterpret_cast<thread_policy_t>(&policy), !mask ? 0 : 1);
+#endif
 #elif !defined(ANDROID) && (defined(__linux__) || defined(__DragonFly__) || defined(__FreeBSD__))
 	if (!mask)
 	{

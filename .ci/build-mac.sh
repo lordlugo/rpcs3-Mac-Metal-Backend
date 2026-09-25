@@ -1,4 +1,11 @@
 #!/bin/sh -ex
+# RPCS3 Metal fork: upstream's MacPorts-based CI build, kept working for Apple silicon + Metal only.
+# The supported way to build this fork (locally and in .github/workflows/macos-metal.yml) is ./build-macos.sh (Homebrew).
+if [ "$(uname -m)" != "arm64" ]; then
+  echo "RPCS3 Metal requires Apple silicon (arm64)." >&2
+  exit 1
+fi
+
 # Gather explicit version number and number of commits
 COMM_TAG=$(awk '/version{.*}/ { printf("%d.%d.%d", $5, $6, $7) }' rpcs3/rpcs3_version.cpp)
 COMM_COUNT=$(git rev-list --count HEAD)
@@ -46,12 +53,11 @@ export SDL3_DIR="/opt/local/lib/cmake/SDL3"
 export OpenCV_DIR="/opt/local/libexec/opencv4"
 export PATH="/opt/local/libexec/llvm-$LLVM_COMPILER_VER/bin:/$WORKDIR/qt-downloader/$QT_VER/clang_64/bin:/opt/local/bin:/opt/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/X11/bin:/Library/Apple/usr/bin:$PATH"
 export LDFLAGS="-L/opt/local/lib -Wl,-rpath,/opt/local/lib"
-export VULKAN_SDK="/opt/local"
 export LLVM_DIR="/opt/local/libexec/llvm-$LLVM_COMPILER_VER"
 
 # Pull all the submodules except some
 # shellcheck disable=SC2046
-git submodule -q update --init --depth=1 --jobs=8 $(awk '/path/ && !/llvm/ && !/opencv/ && !/libsdl-org/ && !/feralinteractive/ && !/curl/ && !/zlib/ { print $3 }' .gitmodules)
+git submodule -q update --init --depth=1 --jobs=8 $(awk '/path/ && !/llvm/ && !/opencv/ && !/libsdl-org/ && !/feralinteractive/ && !/curl/ && !/zlib/ && !/VulkanMemoryAllocator/ && !/FAudio/ { print $3 }' .gitmodules)
 
 mkdir build && cd build || exit 1
 # The below should be uncommented once bugs with Qt 6 QListWidgets when using the OS 26 visual style are resolved.
@@ -60,7 +66,8 @@ mkdir build && cd build || exit 1
 cmake .. \
     -DBUILD_RPCS3_TESTS="${RUN_UNIT_TESTS}" \
     -DRUN_RPCS3_TESTS="${RUN_UNIT_TESTS}" \
-    -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+    -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 \
+    -DCMAKE_OSX_ARCHITECTURES=arm64 \
     -DCMAKE_OSX_SYSROOT="$(xcrun --sdk macosx --show-sdk-path)" \
     -DMACOSX_BUNDLE_SHORT_VERSION_STRING="${COMM_TAG}" \
     -DMACOSX_BUNDLE_BUNDLE_VERSION="${COMM_COUNT}" \
@@ -71,7 +78,8 @@ cmake .. \
     -DUSE_SYSTEM_FFMPEG=OFF \
     -DUSE_NATIVE_INSTRUCTIONS=OFF \
     -DUSE_PRECOMPILED_HEADERS=OFF \
-    -DUSE_SYSTEM_MVK=ON \
+    -DUSE_METAL=ON \
+    -DUSE_VULKAN=OFF \
     -DUSE_SYSTEM_SDL=ON \
     -DUSE_SYSTEM_OPENCV=ON \
     -G Ninja

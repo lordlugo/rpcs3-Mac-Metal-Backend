@@ -1,0 +1,242 @@
+name: macOS Metal
+
+on:
+  push:
+    branches:
+      - metal-backend
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: CMake build type
+        type: choice
+        options:
+          - Release
+          - RelWithDebInfo
+          - Debug
+        default: Release
+
+concurrency:
+  group: macos-metal-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: macOS 26 arm64 (Metal)
+    runs-on: macos-26
+    timeout-minutes: 330
+    env:
+      BUILD_DIR: build-metal
+      # Release keeps CI fast and within the runner's disk space; build RelWithDebInfo locally for debugging
+      BUILD_TYPE: ${{ inputs.build_type || 'Release' }}
+      # Portable code generation (-march=armv8.4-a) so the uploaded app runs on every Apple silicon Mac
+      RPCS3_NATIVE_INSTRUCTIONS: "OFF"
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_MAXSIZE: 3G
+      CCACHE_COMPRESS: "true"
+      CCACHE_SLOPPINESS: time_macros
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: false # build-macos.sh initialises exactly the submodules it needs
+          fetch-depth: 0    # commit count is used as the bundle version
+
+      - name: Select latest Xcode 26
+        run: |
+          candidates=()
+          for app in /Applications/Xcode_26*.app; do
+            if [ -d "$app" ]; then candidates+=("$app"); fi
+          done
+          xcode=""
+          if [ "${#candidates[@]}" -gt 0 ]; then
+            # Prefer the newest release over betas
+            xcode=$(printf '%s\n' "${candidates[@]}" | grep -vi beta | sort -V | tail -n 1 || true)
+            if [ -z "$xcode" ]; then
+              xcode=$(printf '%s\n' "${candidates[@]}" | sort -V | tail -n 1)
+            fi
+          fi
+          if [ -n "$xcode" ]; then
+            echo "Selecting $xcode"
+            sudo xcode-select -s "$xcode/Contents/Developer"
+          else
+            echo "::warning::No /Applications/Xcode_26*.app found, keeping $(xcode-select -p)"
+          fi
+          xcodebuild -version
+          echo "SDK: $(xcrun --sdk macosx --show-sdk-path) ($(xcrun --sdk macosx --show-sdk-version))"
+          sw_vers
+          uname -m
+
+      - name: Restore Homebrew download cache
+        id: brew-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/Library/Caches/Homebrew/downloads
+          key: brew-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build-macos.sh') }}
+          restore-keys: |
+            brew-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Restore ccache
+        id: ccache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ env.BUILD_TYPE }}-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ runner.arch }}-${{ env.BUILD_TYPE }}-${{ github.ref_name }}-
+            ccache-${{ runner.os }}-${{ runner.arch }}-${{ env.BUILD_TYPE }}-
+
+      - name: Install dependencies (Homebrew)
+        run: ./build-macos.sh --deps
+
+      - name: Save Homebrew download cache
+        if: always() && steps.brew-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/Library/Caches/Homebrew/downloads
+          key: ${{ steps.brew-cache.outputs.cache-primary-key }}
+
+      - name: Configure
+        run: |
+          mkdir -p "$CCACHE_DIR"
+          ccache --zero-stats || true
+          case "$BUILD_TYPE" in
+            Release) type_flag=--release ;;
+            Debug) type_flag=--debug ;;
+            *) type_flag=--relwithdebinfo ;;
+          esac
+          ./build-macos.sh --configure-only "$type_flag" 2>&1 | tee configure.log
+
+      - name: Compile Metal backend objects only
+        id: metal
+        continue-on-error: true # the full build below reports the final status
+        run: |
+          targets=$(ninja -C "$BUILD_DIR" -t targets all | grep -E 'RSX/Metal/.*\.(cpp|mm)\.o:' | cut -d: -f1 || true)
+          if [ -z "$targets" ]; then
+            echo "No Metal backend objects found (is rpcs3/Emu/RSX/Metal empty?)" | tee metal-compile.log
+            exit 0
+          fi
+          echo "Compiling $(echo "$targets" | wc -l | tr -d ' ') Metal backend objects"
+          # shellcheck disable=SC2086
+          ninja -C "$BUILD_DIR" -k 0 $targets 2>&1 | tee metal-compile.log
+
+      - name: Full build
+        id: full
+        run: ninja -C "$BUILD_DIR" -k 0 2>&1 | tee full-build.log
+
+      - name: Extract errors
+        if: always()
+        run: |
+          touch metal-compile.log full-build.log
+          : > errors.txt
+          for log in metal-compile.log full-build.log; do
+            if grep -q 'error:' "$log"; then
+              echo "===== $log =====" >> errors.txt
+              grep -A3 'error:' "$log" >> errors.txt || true
+            fi
+          done
+          # Undefined symbols are printed before the "linker command failed" error line
+          if grep -q 'Undefined symbols' full-build.log; then
+            echo "===== full-build.log (undefined symbols) =====" >> errors.txt
+            grep -A25 'Undefined symbols' full-build.log >> errors.txt || true
+          fi
+          if [ -f configure.log ] && grep -q 'CMake Error' configure.log; then
+            echo "===== configure.log =====" >> errors.txt
+            grep -A8 'CMake Error' configure.log >> errors.txt || true
+          fi
+          if [ -s errors.txt ]; then
+            cat errors.txt
+          else
+            echo "No errors found." | tee errors.txt
+          fi
+
+          # Emit up to 50 (deduplicated) compiler errors as GitHub annotations
+          python3 - <<'EOF'
+          import os, re
+
+          workspace = os.environ.get("GITHUB_WORKSPACE", "").rstrip("/") + "/"
+          pattern = re.compile(r"^(?P<file>[^\s:][^:]*):(?P<line>\d+):(?:(?P<col>\d+):)?\s*(?:fatal )?error:\s*(?P<msg>.*)$")
+
+          def esc_data(s):
+              return s.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+          def esc_prop(s):
+              return esc_data(s).replace(":", "%3A").replace(",", "%2C")
+
+          seen = set()
+          count = 0
+          for log in ("metal-compile.log", "full-build.log"):
+              if count >= 50 or not os.path.exists(log):
+                  continue
+              with open(log, encoding="utf-8", errors="replace") as f:
+                  for raw in f:
+                      line = raw.rstrip("\r\n")
+                      if "error:" not in line or line in seen:
+                          continue
+                      seen.add(line)
+                      m = pattern.match(line)
+                      if m:
+                          path = m.group("file")
+                          if path.startswith(workspace):
+                              path = path[len(workspace):]
+                          props = f"file={esc_prop(path)},line={m.group('line')}"
+                          if m.group("col"):
+                              props += f",col={m.group('col')}"
+                          print(f"::error {props}::{esc_data(m.group('msg'))}")
+                      else:
+                          print(f"::error::{esc_data(line.strip())}")
+                      count += 1
+                      if count >= 50:
+                          break
+          EOF
+
+      - name: ccache statistics
+        if: always()
+        run: ccache --show-stats || true
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.ccache-restore.outputs.cache-primary-key }}
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            configure.log
+            metal-compile.log
+            full-build.log
+            errors.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Package app
+        if: success()
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent "$BUILD_DIR/bin/rpcs3.app" RPCS3-Metal-macos-arm64.zip
+          ls -lh RPCS3-Metal-macos-arm64.zip
+
+      - name: Upload app
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: RPCS3-Metal-macos-arm64-${{ github.run_number }}
+          path: RPCS3-Metal-macos-arm64.zip
+          compression-level: 0
+          retention-days: 14

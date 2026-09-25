@@ -7,20 +7,22 @@
 	<key>CFBundleExecutable</key>
 	<string>rpcs3</string>
 	<key>CFBundleGetInfoString</key>
-	<string>Open-source Sony PlayStation 3 emulator</string>
+	<string>Open-source Sony PlayStation 3 emulator (native Metal renderer)</string>
 	<key>CFBundleIconFile</key>
 	<string>rpcs3.icns</string>
 	<key>CFBundleIdentifier</key>
-	<string>net.rpcs3.rpcs3</string>
+	<string>io.github.lordlugo.rpcs3metal</string>
 	<key>CFBundleName</key>
-	<string>RPCS3</string>
+	<string>RPCS3 Metal</string>
+	<key>CFBundleDisplayName</key>
+	<string>RPCS3 Metal</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
 	<string>${MACOSX_BUNDLE_SHORT_VERSION_STRING}</string>
 	<key>CFBundleVersion</key>
 	<string>${MACOSX_BUNDLE_BUNDLE_VERSION}</string>
- 	<key>CFBundleSupportedPlatforms</key>
+	<key>CFBundleSupportedPlatforms</key>
 	<array>
 		<string>MacOSX</string>
 	</array>
@@ -29,10 +31,22 @@
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>LSMinimumSystemVersion</key>
-	<string>15.0</string>
+	<string>26.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.games</string>
+	<key>LSSupportsGameMode</key>
+	<true/>
+	<key>GCSupportsControllerUserInteraction</key>
+	<true/>
+	<key>MetalCaptureEnabled</key>
+	<true/>
+	<key>UIDesignRequiresCompatibility</key>
+	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>The camera will be used for PlayStation Eye emulation</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>The microphone will be used for Chat/SingStar emulation</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>RPCS3 Metal uses the local network for RPCN online play, UPnP port forwarding and LAN/system link multiplayer.</string>
 </dict>
 </plist>

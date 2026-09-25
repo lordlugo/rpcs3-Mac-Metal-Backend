@@ -205,6 +205,67 @@ if(USE_VULKAN)
 	endif()
 endif()
 
+# Metal (native macOS renderer, the only renderer of the RPCS3 Metal fork; see buildfiles/cmake/ForkMacOS.cmake)
+set(METAL_TARGET 3rdparty_dummy_lib)
+set(SPIRV_CROSS_TARGET 3rdparty_dummy_lib)
+if(USE_METAL)
+	if(NOT APPLE)
+		message(FATAL_ERROR "USE_METAL requires macOS.")
+	endif()
+
+	# metal-cpp: header-only C++ bindings for Metal/MetalFX/QuartzCore/Foundation.
+	# NOTE: the *_PRIVATE_IMPLEMENTATION macros are defined in exactly one TU of the Metal backend, never here.
+	add_library(3rdparty_metal INTERFACE)
+	target_include_directories(3rdparty_metal SYSTEM INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/metal-cpp")
+	# Also keep <AssertMacros.h> (pulled in by some Apple frameworks) from defining the lower-case check()/verify()/require() macros
+	target_compile_definitions(3rdparty_metal INTERFACE HAVE_METAL=1 __ASSERT_MACROS_DEFINE_VERSIONS_WITHOUT_UNDERSCORES=0)
+	target_link_libraries(3rdparty_metal INTERFACE
+		"-framework Metal"
+		"-framework MetalFX"
+		"-framework QuartzCore"
+		"-framework Foundation"
+		"-framework AppKit"
+		"-framework IOSurface"
+		"-framework CoreGraphics"
+	)
+	set(METAL_TARGET 3rdparty_metal)
+
+	# SPIRV-Cross (SPIR-V -> MSL). Static C++ libraries only; MSL depends on the GLSL backend.
+	set(SPIRV_CROSS_CLI OFF CACHE BOOL "Build the CLI binary. Requires SPIRV_CROSS_STATIC." FORCE)
+	set(SPIRV_CROSS_ENABLE_TESTS OFF CACHE BOOL "Enable SPIRV-Cross tests." FORCE)
+	set(SPIRV_CROSS_SHARED OFF CACHE BOOL "Build the C API as a single shared library." FORCE)
+	set(SPIRV_CROSS_STATIC ON CACHE BOOL "Build the C and C++ API as static libraries." FORCE)
+	set(SPIRV_CROSS_ENABLE_GLSL ON CACHE BOOL "Enable GLSL support." FORCE)
+	set(SPIRV_CROSS_ENABLE_MSL ON CACHE BOOL "Enable MSL target support." FORCE)
+	set(SPIRV_CROSS_ENABLE_HLSL OFF CACHE BOOL "Enable HLSL target support." FORCE)
+	set(SPIRV_CROSS_ENABLE_CPP OFF CACHE BOOL "Enable C++ target support." FORCE)
+	set(SPIRV_CROSS_ENABLE_REFLECT OFF CACHE BOOL "Enable JSON reflection target support." FORCE)
+	set(SPIRV_CROSS_ENABLE_C_API OFF CACHE BOOL "Enable C API wrapper support in static library." FORCE)
+	set(SPIRV_CROSS_ENABLE_UTIL OFF CACHE BOOL "Enable util module support." FORCE)
+	set(SPIRV_CROSS_SKIP_INSTALL ON CACHE BOOL "Skips installation targets." FORCE)
+
+	if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/SPIRV-Cross/SPIRV-Cross/CMakeLists.txt")
+		message(FATAL_ERROR "SPIRV-Cross submodule is missing. Run: git submodule update --init 3rdparty/SPIRV-Cross/SPIRV-Cross")
+	endif()
+
+	# SYSTEM: consumers see SPIRV-Cross headers as system headers (no warnings, no -fno-exceptions 'throw' errors).
+	# Compiler warnings of the library itself are silenced by the directory-wide -w above.
+	add_subdirectory(SPIRV-Cross/SPIRV-Cross EXCLUDE_FROM_ALL SYSTEM)
+
+	add_library(3rdparty_spirv_cross INTERFACE)
+	# Link order matters for static libs: msl -> glsl -> core
+	target_link_libraries(3rdparty_spirv_cross INTERFACE spirv-cross-msl spirv-cross-glsl spirv-cross-core)
+	target_include_directories(3rdparty_spirv_cross SYSTEM INTERFACE
+		"${CMAKE_CURRENT_SOURCE_DIR}/SPIRV-Cross"              # #include <SPIRV-Cross/spirv_msl.hpp>
+		"${CMAKE_CURRENT_SOURCE_DIR}/SPIRV-Cross/SPIRV-Cross"  # #include <spirv_msl.hpp>
+	)
+	set(SPIRV_CROSS_TARGET 3rdparty_spirv_cross)
+
+	foreach(_spirv_cross_lib spirv-cross-core spirv-cross-glsl spirv-cross-msl)
+		set_property(TARGET ${_spirv_cross_lib} PROPERTY FOLDER "3rdparty/SPIRV-Cross")
+	endforeach()
+endif()
+
 # AsmJit
 add_subdirectory(asmjit EXCLUDE_FROM_ALL)
 
@@ -374,6 +435,8 @@ add_library(3rdparty::discordRPC ALIAS 3rdparty_discordRPC)
 add_library(3rdparty::faudio ALIAS ${FAUDIO_TARGET})
 add_library(3rdparty::libevdev ALIAS ${LIBEVDEV_TARGET})
 add_library(3rdparty::vulkan ALIAS ${VULKAN_TARGET})
+add_library(3rdparty::metal ALIAS ${METAL_TARGET})
+add_library(3rdparty::spirv_cross ALIAS ${SPIRV_CROSS_TARGET})
 add_library(3rdparty::openal ALIAS 3rdparty_openal)
 add_library(3rdparty::ffmpeg ALIAS 3rdparty_ffmpeg)
 add_library(3rdparty::glew ALIAS 3rdparty_glew)

@@ -105,9 +105,32 @@ if (NOT ANDROID)
     elseif(APPLE)
         target_sources(rpcs3 PRIVATE rpcs3.icns update_helper.sh)
         set_source_files_properties(update_helper.sh PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+
+        # RPCS3 Metal fork bundle identity (keep in sync with rpcs3.plist.in). The executable stays "rpcs3".
+        set(RPCS3_MACOS_BUNDLE_ID "io.github.lordlugo.rpcs3metal")
+        set(RPCS3_MACOS_BUNDLE_NAME "RPCS3 Metal")
+
+        # Bundle version strings (normally passed by the build scripts): fall back to rpcs3_version.cpp
+        if(NOT MACOSX_BUNDLE_SHORT_VERSION_STRING)
+            file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/rpcs3_version.cpp" RPCS3_VERSION_LINE REGEX "utils::version version\\{")
+            string(REGEX MATCH "\\{ *([0-9]+), *([0-9]+), *([0-9]+)" RPCS3_VERSION_MATCH "${RPCS3_VERSION_LINE}")
+            if(RPCS3_VERSION_MATCH)
+                set(MACOSX_BUNDLE_SHORT_VERSION_STRING "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}.${CMAKE_MATCH_3}")
+            else()
+                set(MACOSX_BUNDLE_SHORT_VERSION_STRING "0.0.0")
+            endif()
+        endif()
+        if(NOT MACOSX_BUNDLE_BUNDLE_VERSION)
+            set(MACOSX_BUNDLE_BUNDLE_VERSION "1")
+        endif()
+
         set_target_properties(rpcs3
             PROPERTIES
-                MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/rpcs3.plist.in")
+                MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/rpcs3.plist.in"
+                MACOSX_BUNDLE_GUI_IDENTIFIER "${RPCS3_MACOS_BUNDLE_ID}"
+                MACOSX_BUNDLE_BUNDLE_NAME "${RPCS3_MACOS_BUNDLE_NAME}"
+                XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${RPCS3_MACOS_BUNDLE_ID}"
+                XCODE_ATTRIBUTE_CODE_SIGN_ENTITLEMENTS "${CMAKE_CURRENT_SOURCE_DIR}/rpcs3.entitlements")
     endif()
 
     target_sources(rpcs3
@@ -127,11 +150,21 @@ if (NOT ANDROID)
     # Copy icons to executable directory
     if(APPLE)
         qt_finalize_target(rpcs3)
+        if(NOT MACDEPLOYQT_EXECUTABLE)
+            # Not every Qt distribution (e.g. Homebrew) exports this variable
+            find_program(MACDEPLOYQT_EXECUTABLE macdeployqt
+                HINTS "${QT6_INSTALL_PREFIX}/${QT6_INSTALL_BINS}" "${Qt6_DIR}/../../../bin"
+                REQUIRED)
+        endif()
         add_custom_command(TARGET rpcs3 POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_SOURCE_DIR}/rpcs3.icns $<TARGET_FILE_DIR:rpcs3>/../Resources/rpcs3.icns
             COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/bin/Icons $<TARGET_FILE_DIR:rpcs3>/../Resources/Icons
             COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/bin/GuiConfigs $<TARGET_FILE_DIR:rpcs3>/../Resources/GuiConfigs
-            COMMAND "${MACDEPLOYQT_EXECUTABLE}" "${PROJECT_BINARY_DIR}/bin/rpcs3.app" "$<$<CONFIG:Debug,RelWithDebInfo>:-no-strip>")
+            COMMAND "${MACDEPLOYQT_EXECUTABLE}" "${PROJECT_BINARY_DIR}/bin/rpcs3.app" "$<$<CONFIG:Debug,RelWithDebInfo>:-no-strip>"
+            # macdeployqt rewrites install names, which invalidates the linker's ad-hoc signature (fatal on arm64).
+            # Re-sign ad hoc with the fork's entitlements (JIT, camera, microphone) so the bundle runs from the build dir.
+            # Distribution builds are re-signed by .ci/deploy-mac.sh (optionally with a Developer ID).
+            COMMAND codesign --force --deep --sign - --entitlements "${CMAKE_CURRENT_SOURCE_DIR}/rpcs3.entitlements" "${PROJECT_BINARY_DIR}/bin/rpcs3.app")
     elseif(UNIX)
         add_custom_command(TARGET rpcs3 POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/bin/Icons $<TARGET_FILE_DIR:rpcs3>/Icons

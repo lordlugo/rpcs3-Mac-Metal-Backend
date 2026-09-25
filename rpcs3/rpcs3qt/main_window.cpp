@@ -98,7 +98,9 @@
 #include "raw_mouse_settings_dialog.h"
 #endif
 
-#if defined(__linux__) || defined(__APPLE__) || (defined(_WIN32) && defined(ARCH_X64))
+// RPCS3 Metal fork: the upstream auto-updater is disabled on macOS.
+// It downloads upstream (Vulkan/MoltenVK) builds from update.rpcs3.net and would replace this app.
+#if defined(__linux__) || (defined(_WIN32) && defined(ARCH_X64))
 #define RPCS3_UPDATE_SUPPORTED
 #endif
 
@@ -3627,6 +3629,10 @@ void main_window::CreateConnects()
 		QMessageBox::warning(this, tr("Auto-updater"), tr("The auto-updater isn't available for your OS currently."));
 #endif
 	});
+#ifdef __APPLE__
+	// RPCS3 Metal fork: no auto-updater on macOS (see RPCS3_UPDATE_SUPPORTED), so don't offer "Check for Updates"
+	ui->updateAct->setVisible(false);
+#endif
 
 	connect(ui->downloadIntegrityDbAct, &QAction::triggered, this, [this]()
 	{

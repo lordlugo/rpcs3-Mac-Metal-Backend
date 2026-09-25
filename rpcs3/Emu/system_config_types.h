@@ -46,6 +46,7 @@ enum class video_renderer
 	null,
 	opengl,
 	vulkan,
+	metal, // Native Metal renderer (macOS). Appended last to keep existing values stable.
 };
 
 enum class audio_renderer

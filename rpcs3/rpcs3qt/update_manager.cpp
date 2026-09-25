@@ -62,6 +62,13 @@ void update_manager::check_for_updates(bool automatic, bool check_only, bool aut
 {
 	update_log.notice("Checking for updates: automatic=%d, check_only=%d, auto_accept=%d", automatic, check_only, auto_accept);
 
+#ifdef __APPLE__
+	// RPCS3 Metal fork: update.rpcs3.net serves upstream Vulkan/MoltenVK builds which would replace this app.
+	// The UI entry points are compiled out/hidden (main_window.cpp); this is a last line of defense.
+	update_log.notice("Skipped update check: the auto-updater is disabled in RPCS3 Metal builds");
+	return;
+#endif
+
 	m_update_info = {};
 
 	if (automatic)
@@ -325,6 +332,12 @@ bool update_manager::handle_json(bool automatic, bool check_only, bool auto_acce
 void update_manager::update(bool auto_accept, bool is_first_call)
 {
 	update_log.notice("Updating with auto_accept=%d", auto_accept);
+
+#ifdef __APPLE__
+	// RPCS3 Metal fork: never download/install upstream builds (see check_for_updates)
+	update_log.error("Update aborted: the auto-updater is disabled in RPCS3 Metal builds");
+	return;
+#endif
 
 	ensure(m_downloader);
 

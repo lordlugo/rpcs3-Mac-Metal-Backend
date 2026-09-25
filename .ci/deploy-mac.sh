@@ -1,15 +1,21 @@
 #!/bin/sh -ex
+# Package RPCS3 Metal (macOS 26+, Apple silicon, native Metal renderer).
+#
+# Environment:
+#   BUILD_DIR                      build directory containing bin/rpcs3.app (default: build)
+#   RPCS3_CODESIGN_IDENTITY        if set, sign with this identity using the hardened runtime and a secure timestamp
+#                                  (required for notarization); otherwise the app is signed ad hoc
+#   LVER, BUILD_ARTIFACTSTAGINGDIRECTORY, RELEASE_MESSAGE   set by CI (see .ci/build-mac.sh)
+#
+# No MoltenVK / Vulkan ICD / libvulkan is bundled: Metal is the only renderer of this fork.
 
-# shellcheck disable=SC2086
-cd build || exit 1
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ENTITLEMENTS="$ROOT/rpcs3/rpcs3.entitlements"
+APP_NAME="RPCS3 Metal.app"
+
+cd "${BUILD_DIR:-build}" || exit 1
 
 cd bin
-mkdir -p "rpcs3.app/Contents/Resources/vulkan/icd.d" || true
-wget https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-macos-privateapi.tar
-tar -xvf MoltenVK-macos-privateapi.tar
-cp "MoltenVK/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib" "rpcs3.app/Contents/Frameworks/libMoltenVK.dylib"
-cp "MoltenVK/MoltenVK/dynamic/dylib/macOS/MoltenVK_icd.json" "rpcs3.app/Contents/Resources/vulkan/icd.d/MoltenVK_icd.json"
-sed -i '' "s/.\//..\/..\/..\/Frameworks\//g" "rpcs3.app/Contents/Resources/vulkan/icd.d/MoltenVK_icd.json"
 
 rm -rf "rpcs3.app/Contents/Frameworks/QtPdf.framework" \
 "rpcs3.app/Contents/Frameworks/QtQml.framework" \
@@ -20,7 +26,7 @@ rm -rf "rpcs3.app/Contents/Frameworks/QtPdf.framework" \
 "rpcs3.app/Contents/Plugins/virtualkeyboard" \
 "rpcs3.app/Contents/Resources/git" || true
 
-../../.ci/optimize-mac.sh rpcs3.app
+"$ROOT/.ci/optimize-mac.sh" rpcs3.app
 
 # Download translations
 mkdir -p "rpcs3.app/Contents/translations"
@@ -38,33 +44,60 @@ else
   echo "Warning: Failed to download translations. Skipping..."
 fi
 
-# Copy Qt translations manually
-QT_TRANS="$WORKDIR/qt-downloader/$QT_VER/clang_64/translations"
-cp $QT_TRANS/qt_*.qm rpcs3.app/Contents/translations
-cp $QT_TRANS/qtbase_*.qm rpcs3.app/Contents/translations
-cp $QT_TRANS/qtmultimedia_*.qm rpcs3.app/Contents/translations
-rm -f rpcs3.app/Contents/translations/qt_help_*.qm || true
+# Copy Qt translations manually (qt-downloader Qt used by .ci/build-mac.sh, or Homebrew Qt used by build-macos.sh)
+if [ -z "${QT_TRANS:-}" ]; then
+  if [ -n "${WORKDIR:-}" ] && [ -d "$WORKDIR/qt-downloader/${QT_VER:-}/clang_64/translations" ]; then
+    QT_TRANS="$WORKDIR/qt-downloader/$QT_VER/clang_64/translations"
+  elif command -v qtpaths6 >/dev/null 2>&1; then
+    QT_TRANS="$(qtpaths6 --query QT_INSTALL_TRANSLATIONS 2>/dev/null || true)"
+  elif command -v qtpaths >/dev/null 2>&1; then
+    QT_TRANS="$(qtpaths --query QT_INSTALL_TRANSLATIONS 2>/dev/null || true)"
+  elif command -v brew >/dev/null 2>&1; then
+    QT_TRANS="$(brew --prefix qt 2>/dev/null || true)/share/qt/translations"
+  fi
+fi
+if [ -n "${QT_TRANS:-}" ] && [ -d "$QT_TRANS" ]; then
+  cp "$QT_TRANS"/qt_*.qm rpcs3.app/Contents/translations || true
+  cp "$QT_TRANS"/qtbase_*.qm rpcs3.app/Contents/translations || true
+  cp "$QT_TRANS"/qtmultimedia_*.qm rpcs3.app/Contents/translations || true
+  rm -f rpcs3.app/Contents/translations/qt_help_*.qm || true
+else
+  echo "Warning: Qt translations not found. Skipping..."
+fi
 
-# Need to do this rename hack due to case insensitive filesystem
-mv rpcs3.app RPCS3_.app
-mv RPCS3_.app RPCS3.app
+# Distinct bundle name so it can live next to an upstream RPCS3.app in /Applications
+rm -rf "$APP_NAME"
+mv rpcs3.app "$APP_NAME"
 
-# NOTE: "--deep" is deprecated
-codesign --deep -fs - RPCS3.app
+# Code signing (JIT, camera and microphone entitlements are required at runtime)
+if [ -n "${RPCS3_CODESIGN_IDENTITY:-}" ]; then
+  # Developer ID: hardened runtime + secure timestamp, ready for notarization
+  # NOTE: "--deep" is deprecated by Apple but still signs all nested frameworks/dylibs here.
+  codesign --force --deep --options runtime --timestamp \
+    --entitlements "$ENTITLEMENTS" --sign "$RPCS3_CODESIGN_IDENTITY" "$APP_NAME"
+else
+  # Ad-hoc signature (users have to right-click -> Open or remove the quarantine attribute on first launch)
+  codesign --force --deep --sign - --entitlements "$ENTITLEMENTS" "$APP_NAME"
+fi
+codesign --verify --deep --strict --verbose=2 "$APP_NAME"
 
 echo "[InternetShortcut]" > Quickstart.url
 echo "URL=https://rpcs3.net/quickstart" >> Quickstart.url
 echo "IconIndex=0" >> Quickstart.url
 
-if [ "$(arch)" = "arm64" ]; then
-  ARCHIVE_FILEPATH="$BUILD_ARTIFACTSTAGINGDIRECTORY/rpcs3-v${LVER}_macos_aarch64.7z"
+ARCHIVE_DIR="${BUILD_ARTIFACTSTAGINGDIRECTORY:-$PWD}"
+mkdir -p "$ARCHIVE_DIR"
+if command -v 7z >/dev/null 2>&1; then
+  ARCHIVE_FILEPATH="$ARCHIVE_DIR/rpcs3-metal-v${LVER:-local}_macos_arm64.7z"
+  7z a -mx9 "$ARCHIVE_FILEPATH" "$APP_NAME" Quickstart.url
 else
-  ARCHIVE_FILEPATH="$BUILD_ARTIFACTSTAGINGDIRECTORY/rpcs3-v${LVER}_macos.7z"
+  # 7-Zip not installed (e.g. local builds): fall back to a zip that preserves the code signature
+  ARCHIVE_FILEPATH="$ARCHIVE_DIR/rpcs3-metal-v${LVER:-local}_macos_arm64.zip"
+  ditto -c -k --sequesterRsrc --keepParent "$APP_NAME" "$ARCHIVE_FILEPATH"
 fi
-7z a -mx9 "$ARCHIVE_FILEPATH" RPCS3.app Quickstart.url
 FILESIZE=$(stat -f %z "$ARCHIVE_FILEPATH")
 SHA256SUM=$(shasum -a 256 "$ARCHIVE_FILEPATH" | awk '{ print $1 }')
 
 cd ..
-echo "${SHA256SUM};${FILESIZE}B" > "$RELEASE_MESSAGE"
+echo "${SHA256SUM};${FILESIZE}B" > "${RELEASE_MESSAGE:-GitHubReleaseMessage.txt}"
 cd bin

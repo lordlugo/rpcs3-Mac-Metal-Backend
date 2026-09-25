@@ -112,3 +112,6 @@
 	path = 3rdparty/protobuf/protobuf
 	url = ../../protocolbuffers/protobuf.git
 	ignore = dirty
+[submodule "3rdparty/SPIRV-Cross/SPIRV-Cross"]
+	path = 3rdparty/SPIRV-Cross/SPIRV-Cross
+	url = ../../KhronosGroup/SPIRV-Cross.git

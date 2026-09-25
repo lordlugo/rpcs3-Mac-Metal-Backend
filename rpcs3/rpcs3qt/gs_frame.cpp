@@ -94,8 +94,11 @@ gs_frame::gs_frame(QScreen* screen, const QRect& geometry, const QIcon& appIcon,
 	}
 
 #ifdef __APPLE__
+	// Native Metal renderer: make Qt back this window's NSView with a CAMetalLayer
+	if (g_cfg.video.renderer == video_renderer::metal)
+		setSurfaceType(QSurface::MetalSurface);
 	// Needed for MoltenVK to work properly on MacOS
-	if (g_cfg.video.renderer == video_renderer::vulkan)
+	else if (g_cfg.video.renderer == video_renderer::vulkan)
 		setSurfaceType(QSurface::VulkanSurface);
 #endif
 

@@ -315,7 +315,8 @@ namespace gui::utils
 		const std::string launcher_path = macos_dir + "launcher";
 
 		std::string launcher_content;
-		fmt::append(launcher_content, "#!/bin/bash\nopen -b net.rpcs3.rpcs3 --args %s", target_cli_args);
+		// RPCS3 Metal fork: launch this app (CFBundleIdentifier in rpcs3.plist.in), not an upstream RPCS3 install
+		fmt::append(launcher_content, "#!/bin/bash\nopen -b io.github.lordlugo.rpcs3metal --args %s", target_cli_args);
 
 		fs::file launcher_file(launcher_path, fs::read + fs::rewrite);
 		if (!launcher_file)
@@ -352,7 +353,7 @@ namespace gui::utils
 										  "\t<string>\?\?\?\?</string>\n"
 #if defined(ARCH_ARM64)
 										  "\t<key>CFBundleIdentifier</key>\n"
-										  "\t<string>net.rpcs3" + (serial.empty() ? "" : ("." + serial)) + "</string>\n"
+										  "\t<string>io.github.lordlugo.rpcs3metal.shortcut" + (serial.empty() ? "" : ("." + serial)) + "</string>\n"
 										  "\t<key>LSArchitecturePriority</key>\n"
 										  "\t<array>\n"
 										  "\t\t<string>arm64</string>\n"

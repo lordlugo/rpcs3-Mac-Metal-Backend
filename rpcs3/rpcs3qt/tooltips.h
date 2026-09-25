@@ -189,9 +189,17 @@ public:
 
 		// gpu
 
+#ifdef HAVE_METAL
+		const QString renderer                   = tr("Metal is the native renderer on macOS and the only hardware renderer of this build.\n\"Disable Video Output\" runs games without any graphics output.");
+#else
 		const QString renderer                   = tr("Vulkan is the fastest renderer. OpenGL is the most accurate renderer.\nIf unsure, use Vulkan. Should you have any compatibility issues, fall back to OpenGL.");
+#endif
 		const QString resolution                 = tr("This setting will be ignored if the Resolution Scale is set to anything other than 100%!\nLeave this on 1280x720. Every PS3 game is compatible with this resolution.\nOnly use 1920x1080 if the game supports it.\nRarely due to emulation bugs some games will only render at low resolutions like 480p.");
+#ifdef HAVE_METAL
+		const QString graphics_adapter           = tr("Shows the GPU used by the Metal renderer.\nOn systems with multiple Metal devices, select which GPU to use in RPCS3.");
+#else
 		const QString graphics_adapter           = tr("On multi GPU systems select which GPU to use in RPCS3 when using Vulkan.\nThis is not needed when using OpenGL.");
+#endif
 		const QString aspect_ratio               = tr("Leave this on 16:9 unless you have a 4:3 monitor.");
 		const QString frame_limit                = tr("Off is the fastest option.\nUsing the frame limiter will add extra overhead and slow down the game. However, some games will crash if the framerate is too high.\nPS3 native should only be used if Auto is not working correctly as it can introduce frame-pacing issues.\nInfinite adds a positive feedback loop which adds another vblank signal per frame allowing more games to be fps limitless.\nExperienced users with need of other frame limits should use the setting \"Second Frame Limit\" in the configuration file.");
 		const QString anti_aliasing              = tr("Emulate PS3 multisampling layout.\nCan fix some otherwise difficult to solve graphics glitches.\nLow to moderate performance hit depending on your GPU hardware.");

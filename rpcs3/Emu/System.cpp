@@ -496,7 +496,7 @@ void Emulator::Init()
 
 	// Not all renderers are known at compile time, so set a provided default if possible
 	ensure(m_supported_renderers.contains(m_default_renderer));
-	ensure(!(m_default_renderer == video_renderer::vulkan && m_default_graphics_adapter.empty()));
+	ensure(!((m_default_renderer == video_renderer::vulkan || m_default_renderer == video_renderer::metal) && m_default_graphics_adapter.empty()));
 	g_cfg.video.renderer.set(m_default_renderer);
 	g_cfg.video.vk.adapter.set(m_default_graphics_adapter);
 
@@ -1839,6 +1839,13 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 			if (g_cfg.video.renderer == video_renderer::vulkan)
 			{
 				sys_log.notice("Vulkan SDK Revision: %d", VK_HEADER_VERSION);
+			}
+#endif
+#if defined(HAVE_METAL)
+			if (g_cfg.video.renderer == video_renderer::metal)
+			{
+				// The Metal device name is stored in the shared graphics adapter setting (Video/Vulkan/Adapter)
+				sys_log.notice("Metal device: %s", g_cfg.video.vk.adapter.to_string());
 			}
 #endif
 			sys_log.notice("Used configuration:\n%s\n", g_cfg.to_string());

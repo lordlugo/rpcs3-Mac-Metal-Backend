@@ -7,6 +7,10 @@ if(CCACHE_PATH)
   set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PATH}")
 endif()
 
+# RPCS3 Metal fork: macOS 26+ / Apple silicon / Metal-only policy.
+# Must come before project() (architecture, deployment target) and before the option() list below (forced options).
+include("${CMAKE_CURRENT_SOURCE_DIR}/buildfiles/cmake/ForkMacOS.cmake")
+
 project(rpcs3 LANGUAGES C CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -35,7 +39,7 @@ option(STATIC_LINK_LLVM "Link against LLVM statically. This will get set to ON i
 option(USE_FAUDIO "FAudio audio backend" ON)
 option(USE_LIBEVDEV "libevdev-based joystick support" ON)
 option(USE_DISCORD_RPC "Discord rich presence integration" OFF)
-option(USE_VULKAN "Vulkan render backend" ON)
+option(USE_VULKAN "Vulkan render backend" ON) # Forced OFF by buildfiles/cmake/ForkMacOS.cmake (USE_METAL is declared there)
 option(USE_PRECOMPILED_HEADERS "Use precompiled headers" OFF)
 option(USE_SDL "Enables SDL input handler" ON)
 option(USE_SYSTEM_CUBEB "Prefer system cubeb instead of the builtin one" OFF)

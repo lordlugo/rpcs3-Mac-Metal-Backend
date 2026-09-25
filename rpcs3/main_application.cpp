@@ -74,8 +74,18 @@ main_application::main_application()
 		supported_renderers.insert(video_renderer::opengl);
 	}
 
+	// Make Metal the default setting if it is supported (macOS Metal build: the only hardware renderer)
+	if (m_render_creator->Metal.supported && !m_render_creator->Metal.adapters.empty())
+	{
+		const std::string adapter = ::at32(m_render_creator->Metal.adapters, 0).toStdString();
+		cfg_log.notice("Setting the default renderer to Metal. Default GPU: '%s'", adapter);
+		Emu.SetDefaultRenderer(video_renderer::metal);
+		Emu.SetDefaultGraphicsAdapter(adapter);
+
+		supported_renderers.insert(video_renderer::metal);
+	}
 	// Make Vulkan default setting if it is supported
-	if (m_render_creator->Vulkan.supported && !m_render_creator->Vulkan.adapters.empty())
+	else if (m_render_creator->Vulkan.supported && !m_render_creator->Vulkan.adapters.empty())
 	{
 		const std::string adapter = ::at32(m_render_creator->Vulkan.adapters, 0).toStdString();
 		cfg_log.notice("Setting the default renderer to Vulkan. Default GPU: '%s'", adapter);

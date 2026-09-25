@@ -2571,7 +2571,12 @@ const std::string& fs::get_config_dir([[maybe_unused]] bool get_config_subdirect
 		else // Just in case
 			dir = "./config";
 
+#ifdef __APPLE__
+		// RPCS3 Metal fork: keep config/data separate from upstream RPCS3 installs
+		dir += "/rpcs3-metal/";
+#else
 		dir += "/rpcs3/";
+#endif
 
 		if (!create_path(dir))
 		{
@@ -2621,7 +2626,12 @@ const std::string& fs::get_cache_dir()
 		else // Just in case
 			dir = "./cache";
 
+#ifdef __APPLE__
+		// RPCS3 Metal fork: separate logs, shader/PPU/SPU caches and the single-instance lock (RPCS3.buf) from upstream installs
+		dir += "/rpcs3-metal/";
+#else
 		dir += "/rpcs3/";
+#endif
 
 		if (!create_path(dir))
 		{

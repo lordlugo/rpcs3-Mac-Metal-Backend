@@ -6,6 +6,10 @@
 #include "Emu/RSX/VK/vkutils/instance.h"
 #endif
 
+#if defined(HAVE_METAL)
+#include "Emu/RSX/Metal/MTLDeviceQuery.h"
+#endif
+
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -81,7 +85,27 @@ render_creator::render_creator()
 	}
 #endif
 
+#if defined(HAVE_METAL)
+	// Metal device enumeration is a cheap system call that cannot hang like some Vulkan drivers, so no watchdog thread is needed.
+	if (mtl::is_metal4_supported())
+	{
+		for (const std::string& name : mtl::get_device_names())
+		{
+			metal_adapters.append(QString::fromStdString(name));
+		}
+
+		supports_metal = !metal_adapters.isEmpty();
+	}
+
+	if (!supports_metal)
+	{
+		cfg_log.error("No Metal 4 capable GPU found. The Metal renderer will not be available.");
+	}
+#endif
+
 	// Graphics Adapter
+	// Metal shares the graphics adapter setting (Video/Vulkan/Adapter) with Vulkan. They are never both available.
+	Metal = render_info(metal_adapters, supports_metal, emu_settings_type::VulkanAdapter);
 	Vulkan = render_info(vulkan_adapters, supports_vulkan, emu_settings_type::VulkanAdapter);
 	OpenGL = render_info();
 	NullRender = render_info();
@@ -90,7 +114,8 @@ render_creator::render_creator()
 	OpenGL.supported = false;
 #endif
 
-	renderers = { &Vulkan, &OpenGL, &NullRender };
+	// Keep this order in sync with the names passed to update_names() in settings_dialog.cpp
+	renderers = { &Metal, &Vulkan, &OpenGL, &NullRender };
 }
 
 void render_creator::update_names(const QStringList& names)
