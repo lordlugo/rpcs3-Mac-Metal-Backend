@@ -52,6 +52,7 @@ while [[ $# -gt 0 ]]; do
         --relwithdebinfo) BUILD_TYPE="RelWithDebInfo" ;;
         --configure-only) CONFIGURE_ONLY=1 ;;
         -h|--help) usage; exit 0 ;;
+        '#'*) break ;; # a pasted "# comment" (zsh passes it on as arguments without interactivecomments)
         *) usage; die "unknown option '$1'" ;;
     esac
     shift

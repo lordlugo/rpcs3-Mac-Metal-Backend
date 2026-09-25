@@ -16,9 +16,13 @@ with a **native Metal 4 backend**. Metal is the only renderer: Vulkan/MoltenVK a
 ```sh
 git clone -b metal-backend https://github.com/lordlugo/rpcs3-Mac-Metal-Backend.git rpcs3-metal
 cd rpcs3-metal
-./build-macos.sh --deps   # installs cmake, ninja, ccache, llvm, qt, sdl3, pkg-config, abseil via Homebrew
-./build-macos.sh          # initialises the needed submodules, configures and builds (RelWithDebInfo)
+./build-macos.sh --deps
+./build-macos.sh
 ```
+
+`--deps` installs cmake, ninja, ccache, llvm, qt, sdl3, pkg-config and abseil with Homebrew. The second command
+initialises the needed submodules, configures and builds (RelWithDebInfo). Paste commands without trailing `# ...`
+comments: zsh passes them on as arguments unless `setopt interactivecomments` is on.
 
 Options:
 
@@ -106,10 +110,10 @@ Mach VM/exception ports, signposts, single JIT arena for notarized hardened-runt
 
 ## Testing the Metal renderer
 
-Start from a terminal to see the log and enable Apple's debugging aids:
+Start from a terminal to see the log and enable Apple's debugging aids: Metal API and shader validation (slow, but
+catches API misuse) and the Metal performance HUD.
 
 ```sh
-# Metal API + shader validation (slow, catches API misuse) and the Metal performance HUD
 MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 MTL_HUD_ENABLED=1 \
   build-metal/bin/rpcs3.app/Contents/MacOS/rpcs3
 ```
@@ -123,6 +127,8 @@ programs" (writes GLSL and MSL to `~/Library/Caches/rpcs3-metal/shaderlog`). The
 `build-macos.sh` writes everything it prints to `build-macos.log` in the repository root.
 
 ```sh
-grep -n "error:" build-macos.log | head -50      # compile errors
-grep -n "Metal\|MSL\|MTL" ~/Library/Caches/rpcs3-metal/RPCS3.log | head -100   # renderer messages
+grep -n "error:" build-macos.log | head -50
+grep -n "Metal\|MSL\|MTL" ~/Library/Caches/rpcs3-metal/RPCS3.log | head -100
 ```
+
+The first command lists compile errors, the second the renderer's messages from the emulator log.
