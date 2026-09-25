@@ -29,6 +29,10 @@
 // Number of frames that can be queued for presentation (matches CAMetalLayer.maximumDrawableCount)
 #define MTL_MAX_DRAWABLE_COUNT 3
 
+#ifndef TEARDOWN_WAIT_TIMEOUT
+#define TEARDOWN_WAIT_TIMEOUT 5000000ull // 5 seconds: renderer destruction never blocks the UI thread forever on a hung GPU
+#endif
+
 #ifndef FRAME_PRESENT_TIMEOUT
 #define FRAME_PRESENT_TIMEOUT 10000000ull // 10 seconds
 #endif
@@ -203,6 +207,17 @@ namespace mtl
 		}
 
 		const std::string& label() const { return m_label; }
+
+		// Teardown only (no thread will ever process this list again): a fatal error inside queue_submit() leaves
+		// submit_queued set forever, and flush()/wait() would spin on it.
+		void abandon_queued_submit()
+		{
+			if (submit_queued)
+			{
+				rsx_log.error("Metal: command list '%s' was never submitted (the RSX thread stopped mid-submission)", m_label);
+				submit_queued.release(false);
+			}
+		}
 	};
 
 	struct occlusion_data
@@ -351,8 +366,17 @@ namespace mtl
 		{
 			for (auto& cb : m_cb_list)
 			{
-				cb.wait();
+				cb.abandon_queued_submit();
+				cb.wait(TEARDOWN_WAIT_TIMEOUT);
 				cb.destroy();
+			}
+		}
+
+		void abandon_queued_submits()
+		{
+			for (auto& cb : m_cb_list)
+			{
+				cb.abandon_queued_submit();
 			}
 		}
 
@@ -364,12 +388,14 @@ namespace mtl
 			}
 		}
 
-		void wait_all()
+		bool wait_all(u64 timeout_us = 0)
 		{
+			bool result = true;
 			for (auto& cb : m_cb_list)
 			{
-				cb.wait();
+				result = cb.wait(timeout_us) && result;
 			}
+			return result;
 		}
 
 		inline command_buffer_chunk* next()

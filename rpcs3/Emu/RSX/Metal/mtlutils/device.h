@@ -42,6 +42,9 @@ namespace mtl
 		shared_mutex m_residency_lock;
 		bool m_residency_dirty = false;
 		u64 m_residency_count = 0;
+		// Allocations removed from m_residency whose removal has not been committed yet. The residency set may still
+		// reference them until commit(), so they are kept alive (retained) until then.
+		std::vector<MTL::Allocation*> m_pending_evictions;
 
 		gpu_capabilities m_caps{};
 		std::string m_name;

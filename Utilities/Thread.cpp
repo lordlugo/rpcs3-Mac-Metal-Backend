@@ -2616,6 +2616,37 @@ static void signal_handler(int /*sig*/, siginfo_t* info, void* uct) noexcept
 
 	append_thread_name(msg);
 
+#if defined(__APPLE__) && defined(ARCH_ARM64)
+	// RPCS3 Metal fork: native call stack of the faulting thread, walked from the signal context (frame pointers are
+	// always kept on arm64 macOS). Emulator crashes are otherwise caught here and never reach a macOS crash report.
+	{
+		constexpr u64 addr_mask = 0x0000'7fff'ffff'ffffull; // strip pointer-authentication bits of system frames
+		std::vector<void*> frames;
+		frames.push_back(reinterpret_cast<void*>(context->uc_mcontext->__ss.__pc & addr_mask));
+		frames.push_back(reinterpret_cast<void*>(context->uc_mcontext->__ss.__lr & addr_mask));
+
+		auto fp = reinterpret_cast<const u64*>(context->uc_mcontext->__ss.__fp & addr_mask);
+		for (int i = 0; fp && i < 64; i++)
+		{
+			const u64 ret = fp[1] & addr_mask;
+			const auto next = reinterpret_cast<const u64*>(fp[0] & addr_mask);
+			if (!ret || next <= fp)
+			{
+				break;
+			}
+
+			frames.push_back(reinterpret_cast<void*>(ret));
+			fp = next;
+		}
+
+		msg += "Native call stack:\n";
+		for (const std::string& line : utils::get_backtrace_symbols(frames))
+		{
+			fmt::append(msg, "  %s\n", line);
+		}
+	}
+#endif
+
 #ifdef __APPLE__
 	thread_local bool s_tls_is_attempting_recovery = false;
 	thread_local bool s_tls_last_cause_is_executing = false;

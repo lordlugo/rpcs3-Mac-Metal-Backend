@@ -53,9 +53,9 @@ namespace mtl
 			return;
 		}
 
-		if (m_is_pending)
+		if (m_is_pending && !wait(5'000'000))
 		{
-			wait();
+			rsx_log.error("Metal: command list '%s' still in flight at destruction (GPU hang?)", m_label);
 		}
 
 		for (auto& table : m_argument_tables)

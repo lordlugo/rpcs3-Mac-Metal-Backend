@@ -119,6 +119,13 @@ namespace mtl
 			m_residency = nullptr;
 		}
 
+		// The set is gone, nothing references the evicted allocations anymore
+		for (MTL::Allocation* allocation : m_pending_evictions)
+		{
+			allocation->release();
+		}
+		m_pending_evictions.clear();
+
 		if (m_compiler)
 		{
 			m_compiler->release();
@@ -168,6 +175,11 @@ namespace mtl
 		m_residency->removeAllocation(allocation);
 		m_residency_dirty = true;
 		m_residency_count--;
+
+		// The caller releases the allocation right after this. The removal is only staged until the next commit(), and
+		// committing a set that still references a deallocated resource crashes inside the Objective-C runtime.
+		// Keep it alive until the removal is committed.
+		m_pending_evictions.push_back(const_cast<MTL::Allocation*>(allocation)->retain());
 	}
 
 	void render_device::commit_residency()
@@ -177,11 +189,22 @@ namespace mtl
 			return;
 		}
 
-		std::lock_guard lock(m_residency_lock);
-		if (m_residency_dirty)
+		std::vector<MTL::Allocation*> evicted;
 		{
-			m_residency->commit();
-			m_residency_dirty = false;
+			std::lock_guard lock(m_residency_lock);
+			if (m_residency_dirty)
+			{
+				m_residency->commit();
+				m_residency_dirty = false;
+			}
+
+			evicted.swap(m_pending_evictions);
+		}
+
+		// Removals are committed: the set no longer references these
+		for (MTL::Allocation* allocation : evicted)
+		{
+			allocation->release();
 		}
 	}
 

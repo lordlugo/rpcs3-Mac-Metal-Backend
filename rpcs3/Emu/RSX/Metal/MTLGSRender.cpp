@@ -613,9 +613,17 @@ MTLGSRender::~MTLGSRender()
 		m_current_command_buffer->end();
 	}
 
-	m_primary_cb_list.wait_all();
-	m_secondary_cb_list.wait_all();
-	m_timeline.wait(m_timeline.last_signaled_value());
+	// The destructor runs on the UI thread. After a fatal error on the RSX thread a submission can be left half-done
+	// (submit_queued never cleared) or GPU work may never complete, so every wait here is bounded.
+	m_primary_cb_list.abandon_queued_submits();
+	m_secondary_cb_list.abandon_queued_submits();
+
+	if (!m_primary_cb_list.wait_all(TEARDOWN_WAIT_TIMEOUT) ||
+		!m_secondary_cb_list.wait_all(TEARDOWN_WAIT_TIMEOUT) ||
+		!m_timeline.wait(m_timeline.last_signaled_value(), TEARDOWN_WAIT_TIMEOUT))
+	{
+		rsx_log.error("Metal: the GPU did not finish outstanding work during shutdown; continuing anyway");
+	}
 
 	// GC cleanup
 	mtl::get_resource_manager()->flush();
