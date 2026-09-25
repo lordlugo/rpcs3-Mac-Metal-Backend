@@ -29,8 +29,9 @@ namespace rsx
 			// Syncronization point, may be associated with memory changes without actually changing addresses
 			RSX(ctx)->m_graphics_state |= rsx::pipeline_state::fragment_program_needs_rehash;
 
-			const auto& sema = vm::_ref<RsxSemaphore>(addr);
-			const auto& atomic_sema = vm::_ref<atomic_t<RsxSemaphore>>(addr);
+			// Unprotected mapping: see rsx::util::write_gcm_label
+			const auto& sema = *vm::get_super_ptr<RsxSemaphore>(addr);
+			const auto& atomic_sema = *vm::get_super_ptr<atomic_t<RsxSemaphore>>(addr);
 
 			if (sema == arg)
 			{
@@ -46,6 +47,10 @@ namespace rsx
 			else
 			{
 				RSX(ctx)->flush_fifo();
+
+				// The awaited value may depend on a texture read label that is still waiting for zcull reports (directly,
+				// or through a CPU thread that waits for it). Never wait with labels held back.
+				RSX(ctx)->flush_deferred_labels();
 			}
 
 			u64 start = get_system_time();

@@ -62,8 +62,7 @@ namespace rsx
 						m_current_task->sync_tag = m_timer++;
 						m_current_task->timestamp = m_tsc;
 
-						m_pending_writes.push_back({});
-						m_pending_writes.back().query = m_current_task;
+						enqueue_write().query = m_current_task;
 						ptimer->async_tasks_pending++;
 					}
 					else
@@ -138,7 +137,7 @@ namespace rsx
 			{
 				m_current_task->owned = true;
 				end_occlusion_query(m_current_task);
-				m_pending_writes.push_back({});
+				enqueue_write();
 
 				m_current_task->active = false;
 				m_current_task->pending = true;
@@ -164,7 +163,7 @@ namespace rsx
 					return;
 				}
 
-				m_pending_writes.push_back({});
+				enqueue_write();
 			}
 
 			auto forwarder = &m_pending_writes.back();
@@ -303,6 +302,8 @@ namespace rsx
 				m_statistics_map[m_statistics_tag_id].flags = 0;
 			}
 
+			retire_deferred_labels();
+
 			if (m_statistics_map[m_statistics_tag_id].flags)
 			{
 				// Move to the next slot if this one is still in use.
@@ -332,6 +333,179 @@ namespace rsx
 		void ZCULL_control::on_sync_hint(sync_hint_payload_t payload)
 		{
 			m_sync_tag = std::max(m_sync_tag, payload.query->sync_tag);
+		}
+
+		queued_report_write& ZCULL_control::enqueue_write()
+		{
+			auto& writer = m_pending_writes.emplace_back();
+			writer.seq = ++m_write_seq;
+			return writer;
+		}
+
+		bool ZCULL_control::wants_label_deferral() const
+		{
+			if (g_cfg.video.relaxed_zcull_sync)
+			{
+				// The user traded report ordering for speed
+				return false;
+			}
+
+			if (!m_deferred_labels.empty())
+			{
+				// Labels stay in order
+				return true;
+			}
+
+			// Reports the CPU reads are pending, and at least one report write is claimed (the head of the queue is
+			// claimed whenever any entry is, see retire_deferred_labels)
+			return m_critical_reports_in_flight > 0 && !m_pending_writes.empty() && m_pending_writes.front().sink;
+		}
+
+		bool ZCULL_control::defer_label_write(::rsx::thread* ptimer, u32 address, u32 value)
+		{
+			if (!wants_label_deferral())
+			{
+				return false;
+			}
+
+			// Claimed writes (with a destination) form the head of the queue; the unclaimed tail belongs to reports
+			// requested after this label.
+			const queued_report_write* last_claimed = nullptr;
+			for (auto It = m_pending_writes.crbegin(); It != m_pending_writes.crend(); ++It)
+			{
+				if (It->sink)
+				{
+					last_claimed = &(*It);
+					break;
+				}
+			}
+
+			u64 fence = last_claimed ? last_claimed->seq : 0;
+
+			if (m_deferred_labels.empty())
+			{
+				// Only when the CPU is known to read reports: otherwise the label can go out right away
+				if (!last_claimed || m_critical_reports_in_flight <= 0)
+				{
+					return false;
+				}
+			}
+			else
+			{
+				// Labels stay in order
+				fence = std::max(fence, m_deferred_labels.back().fence);
+			}
+
+			if (!m_label_deferral_logged)
+			{
+				m_label_deferral_logged = true;
+				rsx_log.notice("ZCULL: texture read semaphores now wait for the zcull reports queued before them (reports are read by the CPU)");
+			}
+
+			m_deferred_labels.push_back({ address, value, fence, get_system_time() });
+
+			// Submit the work the label waits for now, so it lands as soon as the GPU is done with it
+			for (auto It = m_pending_writes.rbegin(); It != m_pending_writes.rend(); ++It)
+			{
+				if (!It->sink || It->seq > fence)
+				{
+					continue;
+				}
+
+				if (It->query && It->query->num_draws)
+				{
+					if (It->query->sync_tag > m_sync_tag)
+					{
+						ptimer->sync_hint(FIFO::interrupt_hint::zcull_sync, { .query = It->query });
+					}
+
+					break;
+				}
+			}
+
+			return true;
+		}
+
+		void ZCULL_control::retire_deferred_labels()
+		{
+			if (m_deferred_labels.empty())
+			{
+				return;
+			}
+
+			// Claimed writes retire in order from the head of the queue
+			retire_deferred_labels_before((!m_pending_writes.empty() && m_pending_writes.front().sink) ? m_pending_writes.front().seq : u64{ umax });
+		}
+
+		void ZCULL_control::retire_deferred_labels_before(u64 seq)
+		{
+			while (!m_deferred_labels.empty() && m_deferred_labels.front().fence < seq)
+			{
+				const auto& label = m_deferred_labels.front();
+
+				// Same write as rsx::util::write_gcm_label (unprotected mapping); the reports it waited for are stored
+				// before it (strongly ordered atomics)
+				vm::get_super_ptr<atomic_t<be_t<u32>>>(label.address)->store(be_t<u32>{ label.value });
+				m_deferred_labels.pop_front();
+			}
+		}
+
+		void ZCULL_control::flush_deferred_labels(::rsx::thread* ptimer)
+		{
+			if (m_deferred_labels.empty())
+			{
+				return;
+			}
+
+			// One submit for everything the labels wait for
+			const u64 fence = m_deferred_labels.back().fence;
+			for (auto It = m_pending_writes.rbegin(); It != m_pending_writes.rend(); ++It)
+			{
+				if (!It->sink || It->seq > fence)
+				{
+					continue;
+				}
+
+				if (It->query && It->query->num_draws)
+				{
+					if (It->query->sync_tag > m_sync_tag)
+					{
+						ptimer->sync_hint(FIFO::interrupt_hint::zcull_sync, { .query = It->query });
+					}
+
+					break;
+				}
+			}
+
+			while (!m_deferred_labels.empty())
+			{
+				const u64 before = m_deferred_labels.size();
+				const bool head_pending = !m_pending_writes.empty() && m_pending_writes.front().sink &&
+					m_pending_writes.front().seq <= m_deferred_labels.front().fence;
+
+				if (head_pending)
+				{
+					// Forced read: always retires at least the head of the queue, then writes the labels it unblocks
+					update(ptimer, m_pending_writes.front().sink);
+				}
+				else
+				{
+					retire_deferred_labels();
+				}
+
+				if (m_deferred_labels.size() == before && !head_pending)
+				{
+					// Cannot happen (a label whose reports are all written always retires); never spin
+					rsx_log.error("ZCULL: deferred labels are stuck, writing them unordered");
+
+					for (const auto& label : m_deferred_labels)
+					{
+						vm::get_super_ptr<atomic_t<be_t<u32>>>(label.address)->store(be_t<u32>{ label.value });
+					}
+
+					m_deferred_labels.clear();
+				}
+			}
 		}
 
 		void ZCULL_control::write(vm::addr_t sink, u64 timestamp, u32 type, u32 value)
@@ -420,12 +594,14 @@ namespace rsx
 			if (m_pending_writes.empty())
 			{
 				// Nothing to do
+				retire_deferred_labels();
 				return;
 			}
 
 			if (!m_critical_reports_in_flight)
 			{
-				// Valid call, but nothing important queued up
+				// Valid call, but nothing important queued up (except labels waiting for reports, if any)
+				flush_deferred_labels(ptimer);
 				return;
 			}
 
@@ -483,6 +659,9 @@ namespace rsx
 					free_query(query);
 				}
 
+				// Labels released before this report was requested go first
+				retire_deferred_labels_before(writer.seq);
+
 				retire(ptimer, &writer, counter.result);
 				processed++;
 			}
@@ -525,12 +704,16 @@ namespace rsx
 
 			//Decrement jobs counter
 			ptimer->async_tasks_pending -= processed;
+
+			// Every claimed report has been written
+			retire_deferred_labels();
 		}
 
 		void ZCULL_control::update(::rsx::thread* ptimer, u32 sync_address, bool hint)
 		{
 			if (m_pending_writes.empty())
 			{
+				retire_deferred_labels();
 				return;
 			}
 
@@ -538,6 +721,21 @@ namespace rsx
 			if (!front.sink)
 			{
 				// No writables in queue, abort
+				retire_deferred_labels();
+				return;
+			}
+
+			if (!sync_address && !m_deferred_labels.empty() &&
+				get_system_time() - m_deferred_labels.front().timestamp > max_label_delay_us) [[unlikely]]
+			{
+				// Safety net; the reports are normally written long before this
+				if (!m_label_safety_net_logged)
+				{
+					m_label_safety_net_logged = true;
+					rsx_log.warning("ZCULL: a texture read label waited more than %u ms for reports, forcing a sync", max_label_delay_us / 1000);
+				}
+
+				flush_deferred_labels(ptimer);
 				return;
 			}
 
@@ -570,8 +768,8 @@ namespace rsx
 					// Schedule ahead
 					m_next_tsc = m_tsc + min_zcull_tick_us;
 
-					// Schedule a queue flush if needed
-					if (!g_cfg.video.relaxed_zcull_sync && m_critical_reports_in_flight &&
+					// Schedule a queue flush if needed (deferred labels are waiting for the front of the queue too)
+					if (!g_cfg.video.relaxed_zcull_sync && (m_critical_reports_in_flight || !m_deferred_labels.empty()) &&
 						front.query && front.query->num_draws && front.query->sync_tag > m_sync_tag)
 					{
 						const auto elapsed = m_tsc - front.query->timestamp;
@@ -631,6 +829,9 @@ namespace rsx
 				// Release the stat tag for this object. Slots are all or nothing.
 				m_statistics_map[writer.counter_tag].flags = 0;
 
+				// Labels released before this report was requested go first
+				retire_deferred_labels_before(writer.seq);
+
 				retire(ptimer, &writer, counter.result);
 				processed++;
 			}
@@ -654,6 +855,8 @@ namespace rsx
 				}
 
 				ptimer->async_tasks_pending -= processed;
+
+				retire_deferred_labels();
 			}
 		}
 
@@ -1034,4 +1237,4 @@ namespace rsx
 			set_eval_result(pthr, failed);
 		}
 	}
-}
+}

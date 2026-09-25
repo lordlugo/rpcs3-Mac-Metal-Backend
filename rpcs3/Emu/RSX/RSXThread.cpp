@@ -2838,7 +2838,7 @@ namespace rsx
 
 		mm_flush();
 
-		if (zcull_ctrl->has_pending())
+		if (zcull_ctrl->has_pending() || zcull_ctrl->has_deferred_labels())
 		{
 			zcull_ctrl->sync(this);
 		}
@@ -2857,6 +2857,33 @@ namespace rsx
 	void thread::sync_hint(FIFO::interrupt_hint /*hint*/, rsx::reports::sync_hint_payload_t payload)
 	{
 		zcull_ctrl->on_sync_hint(payload);
+	}
+
+	bool thread::defer_texture_read_label(u32 address, u32 value)
+	{
+		if (!zcull_ctrl || backend_config.supports_host_gpu_labels || !zcull_ctrl->wants_label_deferral()) [[likely]]
+		{
+			return false;
+		}
+
+		// Same release ordering as write_gcm_label<true, ...>: memory and DMA transfers before the label
+		mm_flush();
+		g_fxo->get<rsx::dma_manager>().sync();
+
+		return zcull_ctrl->defer_label_write(this, address, value);
+	}
+
+	void thread::flush_deferred_labels()
+	{
+		if (zcull_ctrl && zcull_ctrl->has_deferred_labels() && is_current_thread()) [[unlikely]]
+		{
+			zcull_ctrl->flush_deferred_labels(this);
+		}
+	}
+
+	bool thread::has_deferred_label_at(u32 address) const
+	{
+		return zcull_ctrl && zcull_ctrl->has_deferred_label_at(address);
 	}
 
 	bool thread::is_fifo_idle() const
@@ -3377,6 +3404,11 @@ namespace rsx
 
 		// MM sync. This is a pre-emptive operation, so we can use a deferred request.
 		rsx::mm_flush_lazy();
+
+		// The flip can block for a whole frame (frame limiter, display), and labels are not written while it does.
+		// Texture read labels still waiting for zcull reports go out first (only in games that read reports after
+		// such a label; see reports::ZCULL_control::defer_label_write).
+		flush_deferred_labels();
 
 		// Marks the end of a frame scope GPU-side
 		if (g_user_asked_for_frame_capture.exchange(false) && !capture_current_frame)

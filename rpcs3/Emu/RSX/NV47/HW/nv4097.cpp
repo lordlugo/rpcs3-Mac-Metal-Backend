@@ -758,11 +758,19 @@ namespace rsx
 			if (g_cfg.video.strict_rendering_mode) [[ unlikely ]]
 			{
 				util::write_gcm_label<true, true>(ctx, reg, addr, arg);
+				return;
 			}
-			else
+
+			// Some games wait for this label and then read zcull reports with the CPU (Toy Story 3 flickers black
+			// otherwise). Strict rendering mode handles that with a full pipeline sync; instead, the label is held back
+			// until the reports queued before it are in memory, like on real hardware, without stalling the RSX.
+			// Only happens once the CPU is known to read reports (see ZCULL_control::defer_label_write).
+			if (RSX(ctx)->defer_texture_read_label(addr, arg))
 			{
-				util::write_gcm_label<true, false>(ctx, reg, addr, arg);
+				return;
 			}
+
+			util::write_gcm_label<true, false>(ctx, reg, addr, arg);
 		}
 
 		void back_end_write_semaphore_release(context* ctx, u32 reg, u32 arg)

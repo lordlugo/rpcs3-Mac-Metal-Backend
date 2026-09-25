@@ -110,8 +110,8 @@ Mach VM/exception ports, signposts, single JIT arena for notarized hardened-runt
 
 ## Defaults on this fork
 
-New installs start with these settings, and the first start of this version applies VSync and Output Scaling to an
-existing global configuration once (per-game configurations are left alone). Everything can still be changed in the
+New installs start with these settings, and the first start of a version that introduces a new default applies it to
+an existing global configuration once (per-game configurations are left alone). Everything can still be changed in the
 settings.
 
 | Setting | Default | Why |
@@ -120,6 +120,14 @@ settings.
 | Output Scaling | MetalFX Spatial Upscaling (+ RCAS sharpening) | Stored as "FidelityFX Super Resolution" in config.yml; the RCAS slider at 0 turns sharpening off |
 | Anisotropic Filter | Automatic = 16x | Applied to every texture that can be filtered; pick a lower value to limit it, or Strict Rendering Mode for the PS3's own setting |
 | Pipeline archive | On | Compiled GPU pipelines are saved next to the shader cache, so later boots skip most compiles. `RPCS3_METAL_PIPELINE_ARCHIVE=0` turns it off |
+| Multithreaded RSX | On | The worker thread sleeps when idle (upstream keeps it spinning on a core forever) and only takes large copies and GPU command submission, so it no longer costs a performance core |
+
+**ZCULL and texture semaphores.** Some games wait for a texture semaphore and then read occlusion (ZCULL) results
+with the CPU; Toy Story 3 flickers black otherwise. Upstream RPCS3 only handles this in Strict Rendering Mode, with a
+full GPU sync at every texture semaphore. This fork holds such a semaphore back until the results queued before it
+are in memory, like the real hardware, without stalling the RSX, and only once the game is seen reading results.
+Strict Rendering Mode is not needed (and keeps resolution scaling and 16x anisotropic filtering available). The log
+shows `ZCULL: texture read semaphores now wait for the zcull reports queued before them` when it kicks in.
 
 **ProMotion / frame pacing.** Each frame is held for a whole number of display refreshes with
 `presentAfterMinimumDuration` (60 fps on a 120 Hz panel = every other refresh, 30 fps = every 4th), instead of

@@ -160,7 +160,12 @@ struct cfg_root : cfg::node
 		cfg::_bool disable_vulkan_mem_allocator{ this, "Disable Vulkan Memory Allocator", false };
 		cfg::_bool full_rgb_range_output{ this, "Use full RGB output range", true, true }; // Video out dynamic range
 		cfg::_bool strict_texture_flushing{ this, "Strict Texture Flushing", false };
+#ifdef __APPLE__
+		// The offloader sleeps when idle and only takes large copies on Apple silicon (see rsx::dma_manager)
+		cfg::_bool multithreaded_rsx{ this, "Multithreaded RSX", true };
+#else
 		cfg::_bool multithreaded_rsx{ this, "Multithreaded RSX", false };
+#endif
 		cfg::_bool relaxed_zcull_sync{ this, "Relaxed ZCULL Sync", false };
 		cfg::_bool force_hw_MSAA_resolve{ this, "Force Hardware MSAA Resolve", false, true };
 		cfg::_bool stereo_enabled{ this, "3D Display Enabled", false };

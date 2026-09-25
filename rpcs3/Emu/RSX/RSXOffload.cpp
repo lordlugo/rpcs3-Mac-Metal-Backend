@@ -20,7 +20,15 @@ namespace rsx
 		atomic_t<u64> m_processed_count = 0;
 		transport_packet* m_current_job = nullptr;
 
+		// The worker is blocked waiting for work (a hint for the producer, see dma_manager::is_immediate_transfer)
+		atomic_t<bool> m_sleeping = false;
+
 		thread_base* current_thread_ = nullptr;
+
+		// When the queue runs dry, keep polling this long before sleeping: work arrives in bursts (vertex uploads and
+		// command buffer submits of one draw sequence), and a sleeping worker needs a wake-up (a system call on the
+		// producer side plus scheduling latency) for the next job.
+		static constexpr u64 idle_spin_us = 40;
 
 		void operator ()()
 		{
@@ -38,10 +46,15 @@ namespace rsx
 				thread_ctrl::set_thread_affinity_mask(thread_ctrl::get_affinity_mask(thread_class::rsx));
 			}
 
+			u64 idle_since = 0;
+
 			while (thread_ctrl::state() != thread_state::aborting)
 			{
+				bool worked = false;
+
 				for (auto&& job : m_work_queue.pop_all())
 				{
+					worked = true;
 					m_current_job = &job;
 
 					switch (job.type)
@@ -76,11 +89,48 @@ namespace rsx
 
 				m_current_job = nullptr;
 
-				if (m_enqueued_count.load() == m_processed_count.load())
+				if (worked)
 				{
-					m_processed_count.notify_all();
-					std::this_thread::yield();
+					if (m_enqueued_count.load() == m_processed_count.load())
+					{
+						m_processed_count.notify_all();
+					}
+
+					idle_since = 0;
+					continue;
 				}
+
+				// Idle. The original loop yielded forever here, which keeps a whole core busy for the entire session
+				// (on Apple silicon: a performance core taken from the PPU/SPU threads, plus power and heat that lower
+				// the clocks of the whole cluster). Poll briefly, then sleep until the next job is queued.
+				const u64 now = get_system_time();
+
+				if (!idle_since)
+				{
+					idle_since = now;
+				}
+
+				if (now - idle_since < idle_spin_us)
+				{
+					for (u32 i = 0; i < 64 && !m_work_queue; i++)
+					{
+						utils::pause();
+					}
+
+					continue;
+				}
+
+				m_sleeping.release(true);
+
+				// lf_queue::push notifies when the queue goes from empty to non-empty; thread aborts notify too.
+				// The timeout is only a safety net.
+				if (!m_work_queue)
+				{
+					thread_ctrl::wait_on(m_work_queue.get_wait_atomic(), 0, 100'000);
+				}
+
+				m_sleeping.release(false);
+				idle_since = 0;
 			}
 
 			m_processed_count = -1;
@@ -96,10 +146,21 @@ namespace rsx
 		m_thread = std::make_shared<named_thread<offload_thread>>();
 	}
 
+	bool dma_manager::is_immediate_transfer(u32 length) const
+	{
+		if (!g_cfg.video.multithreaded_rsx || length <= max_immediate_transfer_size)
+		{
+			return true;
+		}
+
+		// Waking the worker costs more than copying a medium sized block
+		return length <= max_immediate_transfer_size_idle && m_thread->m_sleeping.load();
+	}
+
 	// General transport
 	void dma_manager::copy(void *dst, std::vector<u8>& src, u32 length) const
 	{
-		if (length <= max_immediate_transfer_size || !g_cfg.video.multithreaded_rsx)
+		if (is_immediate_transfer(length))
 		{
 			std::memcpy(dst, src.data(), length);
 		}
@@ -112,7 +173,7 @@ namespace rsx
 
 	void dma_manager::copy(void *dst, void *src, u32 length) const
 	{
-		if (length <= max_immediate_transfer_size || !g_cfg.video.multithreaded_rsx)
+		if (is_immediate_transfer(length))
 		{
 			const u32 vm_addr = vm::try_get_addr(src).first;
 			rsx::reservation_lock<true, 1> rsx_lock(vm_addr, length, g_cfg.video.strict_rendering_mode && vm_addr);
@@ -128,7 +189,8 @@ namespace rsx
 	// Vertex utilities
 	void dma_manager::emulate_as_indexed(void *dst, rsx::primitive_type primitive, u32 count)
 	{
-		if (!g_cfg.video.multithreaded_rsx)
+		// Generating a few indices is cheaper than queueing the job (the result is at most 3 indices per vertex)
+		if (is_immediate_transfer(count * 3u * u32{ sizeof(u32) }))
 		{
 			write_index_array_for_non_indexed_non_native_primitive_to_buffer(
 				static_cast<char*>(dst), primitive, count);
@@ -197,6 +259,9 @@ namespace rsx
 	{
 		sync();
 		*m_thread = thread_state::aborting;
+
+		// Wake the worker if it sleeps on the queue (the abort notification covers it too; this is belt and braces)
+		m_thread->m_work_queue.notify(true);
 	}
 
 	void dma_manager::set_mem_fault_flag()

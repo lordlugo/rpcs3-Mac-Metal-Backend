@@ -56,8 +56,20 @@ namespace rsx
 		struct offload_thread;
 		std::shared_ptr<named_thread<offload_thread>> m_thread;
 
+#if defined(__APPLE__) && defined(ARCH_ARM64)
+		// Apple silicon copies tens of GB/s per core, so small copies finish long before a hand-over to the worker pays
+		// off (queue node allocation, cache line transfers between cores, and a wake-up when the worker sleeps).
+		// Only large copies are offloaded; the bar is higher while the worker sleeps (waking it costs microseconds).
+		static constexpr u32 max_immediate_transfer_size = 16 * 1024;
+		static constexpr u32 max_immediate_transfer_size_idle = 128 * 1024;
+#else
 		// TODO: Improved benchmarks here; value determined by profiling on a Ryzen CPU, rounded to the nearest 512 bytes
-		const u32 max_immediate_transfer_size = 3584;
+		static constexpr u32 max_immediate_transfer_size = 3584;
+		static constexpr u32 max_immediate_transfer_size_idle = 3584;
+#endif
+
+		// True if a transfer of this size should be done by the calling thread
+		bool is_immediate_transfer(u32 length) const;
 
 	public:
 		dma_manager() = default;

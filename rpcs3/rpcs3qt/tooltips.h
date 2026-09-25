@@ -214,7 +214,11 @@ public:
 		const QString vsync                      = tr("Enables vertical synchronization to eliminate tearing.\nAdaptive Mode - Prefers keeping up performance. It may skip frames or even tear to avoid reducing the game's framerate.\nFull Mode - No tearing allowed even if performance is reduced. This mode will by default limit your framerate to the display's refresh rate unless overriden in the driver control panel.");
 		const QString strict_rendering_mode      = tr("Enforces strict compliance to the API specification.\nMight result in degraded performance in some games.\nCan resolve rare cases of missing graphics and flickering.\nIf unsure, don't use this option.");
 		const QString stretch_to_display_area    = tr("Overrides the aspect ratio and stretches the image to the full display area.");
+#ifdef HAVE_METAL
+		const QString multithreaded_rsx          = tr("Offloads large memory copies and GPU command submission to a secondary thread, so the RSX thread can keep processing commands.\nOn Apple silicon the worker sleeps when there is nothing to do and small copies stay on the RSX thread.\nRecommended.");
+#else
 		const QString multithreaded_rsx          = tr("Offloads some RSX operations to a secondary thread.\nImproves performance for high-core processors.\nMay cause slowdown in weaker CPUs due to the extra worker thread load.");
+#endif
 
 		const QString legacy_shader_recompiler        = tr("Disables asynchronous shader compilation.\nFixes missing graphics while shaders are compiling but introduces severe stuttering or lag.\nUse this if you do not want to deal with graphics pop-in, or for testing before filing any bug reports.");
 		const QString async_shader_recompiler         = tr("This is the recommended option.\nIf a shader is not found in the cache, nothing will be rendered for this shader until it has compiled.\nYou may experience graphics pop-in.");

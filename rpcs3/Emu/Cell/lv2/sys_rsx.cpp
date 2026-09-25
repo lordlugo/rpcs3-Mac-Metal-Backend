@@ -951,7 +951,8 @@ error_code sys_rsx_context_attribute(u32 context_id, u32 package_id, u64 a3, u64
 
 		// seems gcmSysWaitLabel uses this offset, so lets set it to 0 every flip
 		// NOTE: Realhw resets 16 bytes of this semaphore for some reason
-		vm::_ptr<atomic_t<u128>>(render->label_addr + 0x10)->store(u128{});
+		// Unprotected mapping: emulator bookkeeping must not look like a guest read of pending zcull reports sharing the page
+		vm::get_super_ptr<atomic_t<u128>>(render->label_addr + 0x10)->store(u128{});
 
 		render->send_event(0, SYS_RSX_EVENT_FLIP_BASE << 1, 0);
 		break;
