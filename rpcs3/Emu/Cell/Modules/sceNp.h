@@ -6,6 +6,7 @@
 #include "util/shared_ptr.hpp"
 
 #include <set>
+#include <vector>
 
 error_code sceNpInit(u32 poolsize, vm::ptr<void> poolptr);
 error_code sceNpTerm();

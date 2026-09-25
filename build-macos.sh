@@ -174,6 +174,8 @@ COMM_COUNT="$(git -C "$ROOT" rev-list --count HEAD 2>/dev/null || echo 1)"
 
 if command -v ccache >/dev/null 2>&1; then
     echo "==> ccache: $(command -v ccache) (CMake picks it up automatically)"
+    # Let ccache cache compiles that use the precompiled header
+    export CCACHE_SLOPPINESS="pch_defines,time_macros,include_file_mtime,include_file_ctime"
 fi
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -219,7 +221,7 @@ cmake -S "$ROOT" -B "$BUILD_DIR" -G Ninja \
     -DUSE_SYSTEM_SDL=ON \
     -DUSE_SYSTEM_FFMPEG=OFF \
     -DUSE_SYSTEM_OPENCV="$USE_OPENCV" \
-    -DUSE_PRECOMPILED_HEADERS=OFF \
+    -DUSE_PRECOMPILED_HEADERS=ON \
     -DUSE_NATIVE_INSTRUCTIONS="$USE_NATIVE" \
     -DSTATIC_LINK_LLVM=OFF \
     -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
