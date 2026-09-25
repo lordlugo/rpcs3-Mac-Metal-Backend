@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	Optional, NOT used by the default (ad-hoc signed) build: these are restricted entitlements. macOS refuses to launch
+	an app that claims them without a matching provisioning profile. Merge them into rpcs3.entitlements only when
+	signing with an Apple Developer team whose provisioning profile grants them (embedded.provisionprofile).
+
+	With them, the Core Audio backend's spatial audio (surround on headphones) uses:
+	-->
+	<!-- AirPods head tracking (AUSpatialMixer kAudioUnitProperty_SpatialMixerEnableHeadTracking) -->
+	<key>com.apple.developer.coremotion.head-pose</key>
+	<true/>
+	<!-- The listener's personalized spatial audio profile (kSpatialMixerPersonalizedHRTFMode_Auto) -->
+	<key>com.apple.developer.spatial-audio.profile-access</key>
+	<true/>
+</dict>
+</plist>

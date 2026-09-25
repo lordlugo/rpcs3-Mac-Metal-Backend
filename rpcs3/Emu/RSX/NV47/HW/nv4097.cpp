@@ -765,7 +765,7 @@ namespace rsx
 			// otherwise). Strict rendering mode handles that with a full pipeline sync; instead, the label is held back
 			// until the reports queued before it are in memory, like on real hardware, without stalling the RSX.
 			// Only happens once the CPU is known to read reports (see ZCULL_control::defer_label_write).
-			if (RSX(ctx)->defer_texture_read_label(addr, arg))
+			if (RSX(ctx)->defer_label(addr, arg))
 			{
 				return;
 			}

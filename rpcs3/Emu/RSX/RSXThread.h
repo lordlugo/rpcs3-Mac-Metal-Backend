@@ -385,9 +385,15 @@ namespace rsx
 		// sync
 		void sync();
 
-		// Texture read semaphore release: returns true if the label is deferred until the zcull reports queued before
-		// it have been written (see reports::ZCULL_control::defer_label_write); the caller writes it otherwise.
-		bool defer_texture_read_label(u32 address, u32 value);
+		// Returns true if the label write is deferred until the zcull reports queued before it have been written (see
+		// reports::ZCULL_control::defer_label_write): while labels are already held back (ordering), or while reports the
+		// CPU reads are in flight. The caller writes the label itself otherwise.
+		bool defer_label(u32 address, u32 value);
+
+		// Pipeline flushing label writes (NV406E/back-end semaphore release): everything thread::sync() does except
+		// waiting for the zcull reports, which the deferred label waits for instead. False if the label must be written
+		// after a regular sync().
+		bool sync_and_defer_label(u32 address, u32 value);
 
 		// Writes the deferred labels now. Labels are strongly ordered: required before any other label write and
 		// before the FIFO waits on memory. Cheap when nothing is deferred. RSX thread only (no-op elsewhere).
@@ -395,6 +401,9 @@ namespace rsx
 
 		// A deferred label write to this address is pending
 		bool has_deferred_label_at(u32 address) const;
+
+		// Any deferred label write is pending
+		bool has_deferred_labels() const;
 		flags32_t read_barrier(u32 memory_address, u32 memory_range, bool unconditional);
 		virtual void write_barrier(u32 /*memory_address*/, u32 /*memory_range*/) {}
 		virtual void sync_hint(FIFO::interrupt_hint hint, reports::sync_hint_payload_t payload);

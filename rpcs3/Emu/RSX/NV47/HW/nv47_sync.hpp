@@ -49,6 +49,13 @@ namespace rsx
 						// Syncronization point, may be associated with memory changes without actually changing addresses
 						RSX(ctx)->m_graphics_state |= rsx::pipeline_state::fragment_program_needs_rehash;
 
+						// While zcull reports that the CPU reads are in flight, the sync would wait for the GPU here. Hold the
+						// label back until those reports are written instead: same ordering for the guest, no RSX stall.
+						if (!handled && RSX(ctx)->sync_and_defer_label(address, data))
+						{
+							return;
+						}
+
 						// Manually flush the pipeline.
 						// It is possible to stream report writes using the host GPU, but that generates too much submit traffic.
 						RSX(ctx)->sync();
@@ -60,6 +67,11 @@ namespace rsx
 					// Backend will handle it, nothing to write.
 					return;
 				}
+			}
+			else if (RSX(ctx)->has_deferred_labels() && RSX(ctx)->defer_label(address, data))
+			{
+				// Flip semaphores stay ordered behind labels that are held back for zcull reports
+				return;
 			}
 
 			// Labels are strongly ordered: texture read labels held back for zcull reports go first

@@ -691,6 +691,9 @@ void MTLGSRender::flip(const rsx::display_flip_info_t& info)
 {
 	mtl::autorelease_scope pool;
 
+	// New frame, new budget for waiting on pipelines that are still compiling (see load_program)
+	m_async_compile_wait_spent_us = 0;
+
 	// Check surface condition/status. CAMetalLayer does not report resizes, poll the window size.
 	if (m_swapchain_dims.width != m_frame->client_width() + 0u ||
 		m_swapchain_dims.height != m_frame->client_height() + 0u)

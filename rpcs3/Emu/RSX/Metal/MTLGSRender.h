@@ -242,6 +242,11 @@ private:
 
 	// One-time diagnostics
 	bool m_interpreter_warning_logged = false;
+
+	// No shader interpreter on Metal: a draw whose pipeline is still compiling may wait for it, within a per-frame
+	// budget, instead of being skipped (missing geometry / flicker the first time an effect appears)
+	static constexpr u64 async_compile_wait_budget_us = 8'000;
+	u64 m_async_compile_wait_spent_us = 0;
 	bool m_wide_lines_warning_logged = false;
 	bool m_depth_bounds_warning_logged = false;
 	bool m_logic_op_warning_logged = false;

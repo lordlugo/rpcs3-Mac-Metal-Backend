@@ -121,13 +121,41 @@ settings.
 | Anisotropic Filter | Automatic = 16x | Applied to every texture that can be filtered; pick a lower value to limit it, or Strict Rendering Mode for the PS3's own setting |
 | Pipeline archive | On | Compiled GPU pipelines are saved next to the shader cache, so later boots skip most compiles. `RPCS3_METAL_PIPELINE_ARCHIVE=0` turns it off |
 | Multithreaded RSX | On | The worker thread sleeps when idle (upstream keeps it spinning on a core forever) and only takes large copies and GPU command submission, so it no longer costs a performance core |
+| Audio renderer | Core Audio (Spatial Audio) | Native output, see [Audio](#audio). Cubeb is still available |
 
-**ZCULL and texture semaphores.** Some games wait for a texture semaphore and then read occlusion (ZCULL) results
-with the CPU; Toy Story 3 flickers black otherwise. Upstream RPCS3 only handles this in Strict Rendering Mode, with a
-full GPU sync at every texture semaphore. This fork holds such a semaphore back until the results queued before it
-are in memory, like the real hardware, without stalling the RSX, and only once the game is seen reading results.
-Strict Rendering Mode is not needed (and keeps resolution scaling and 16x anisotropic filtering available). The log
-shows `ZCULL: texture read semaphores now wait for the zcull reports queued before them` when it kicks in.
+## Audio
+
+The Core Audio renderer (Settings > Audio > Renderer, default on macOS) outputs exactly what the emulated system
+mixes: 48 kHz, 32-bit float, no resampling and no processing for stereo. When the output device supports 48 kHz it is
+switched to 48 kHz while RPCS3 uses it and switched back afterwards (other apps are resampled by macOS meanwhile).
+
+Surround: pick the formats the game may use under Settings > Audio > Audio Format (Linear PCM 5.1/7.1, Dolby Digital,
+DTS; the emulated system mixes Dolby and DTS as 5.1 PCM, like the real console does before encoding). Then:
+
+- **AirPods and other headphones**: the 5.1/7.1 channels are rendered as a virtual speaker set around you with Apple's
+  spatial audio renderer (AUSpatialMixer). Head tracking and your personalized spatial audio profile need an app signed
+  with an Apple Developer team (see `rpcs3/rpcs3-spatial-audio.entitlements`); the self-built app uses the generic
+  profile with the sound field fixed to your head.
+- **MacBook speakers**: Apple's speaker virtualization for the built-in speakers.
+- **Receivers, HDMI, multichannel interfaces**: each channel goes to the matching speaker of the layout set in
+  Audio MIDI Setup > Configure Speakers. Core Audio's standard downmix is only used when the layouts differ.
+
+Options in `config.yml` (Audio section): `Spatial Audio: Automatic | Headphones | Speakers | Off`,
+`Spatial Audio Head Tracking: true`, `Switch Device To 48 kHz: true`. The log shows the chosen route
+(`CoreAudio: Output route: ...`).
+
+**ZCULL and semaphores.** Some games wait for a semaphore and then read occlusion (ZCULL) results with the CPU;
+Toy Story 3 flickers black otherwise. Upstream RPCS3 handles this with a full GPU sync at such semaphores (and only in
+Strict Rendering Mode for texture semaphores). This fork holds the semaphore back until the results queued before it
+are in memory, like the real hardware, without stalling the RSX, once the game is seen reading results. On macOS this
+matters for most games: with 16 KiB memory pages the semaphores share a page with the results, so a CPU polling a
+semaphore looks like a CPU reading results (in Assassin's Creed II the RSX spent ~13% of its time waiting for the GPU
+there). Strict Rendering Mode is not needed. The log shows `ZCULL: semaphores now wait for the zcull reports ...`.
+
+**Shader compilation.** There is no shader interpreter on Metal yet, so a draw whose shaders are still compiling is
+skipped (missing geometry for a moment the first time an effect appears). The renderer now waits up to 8 ms per frame
+for such pipelines before skipping, and compiled pipelines are saved to the pipeline archive, so later sessions
+start with them.
 
 **ProMotion / frame pacing.** Each frame is held for a whole number of display refreshes with
 `presentAfterMinimumDuration` (60 fps on a 120 Hz panel = every other refresh, 30 fps = every 4th), instead of

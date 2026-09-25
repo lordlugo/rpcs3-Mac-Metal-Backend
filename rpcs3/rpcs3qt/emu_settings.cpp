@@ -1138,6 +1138,9 @@ QString emu_settings::GetLocalizedSetting(const QString& original, emu_settings_
 #ifdef HAVE_FAUDIO
 		case audio_renderer::faudio: return tr("FAudio", "Audio renderer");
 #endif
+#ifdef __APPLE__
+		case audio_renderer::core_audio: return tr("Core Audio (Spatial Audio)", "Audio renderer");
+#endif
 		}
 		break;
 	case emu_settings_type::MicrophoneType:

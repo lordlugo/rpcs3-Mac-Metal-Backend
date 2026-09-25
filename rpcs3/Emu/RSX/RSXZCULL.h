@@ -104,7 +104,7 @@ namespace rsx
 			occlusion_query_count = 2048,  // Number of occlusion query slots available. Real hardware actually has far fewer units before choking
 			max_safe_queue_depth  = 1792,  // Number of in-flight queries before we start forcefully flushing data from the GPU device.
 			max_stat_registers    = 8192,  // Size of the statistics cache
-			max_label_delay_us    = 20000  // Safety net: deferred labels older than this are forced out
+			max_label_delay_us    = 100000 // Safety net: deferred labels older than this are forced out (a GPU bound frame takes tens of ms)
 		};
 
 		class ZCULL_control

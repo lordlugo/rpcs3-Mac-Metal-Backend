@@ -135,37 +135,11 @@ void AudioBackend::apply_volume_static(f32 vol, u32 sample_cnt, const f32* src, 
 
 void AudioBackend::normalize(u32 sample_cnt, const f32* src, f32* dst)
 {
-	// Improved normalization with soft clipping and better dynamic range handling
-	constexpr f32 soft_clip_threshold = 0.95f;
-	constexpr f32 hard_clip_limit = 1.0f;
-
+	// Hard limit to the valid range, like the real hardware's output stage. Samples inside the range are passed
+	// through unchanged (a soft clipper would alter every peak above its knee).
 	for (u32 i = 0; i < sample_cnt; i++)
 	{
-		f32 sample = src[i];
-		f32 abs_sample = std::abs(sample);
-
-		if (abs_sample > soft_clip_threshold)
-		{
-			// Apply soft clipping for smoother distortion
-			f32 sign = std::copysign(1.0f, sample);
-			if (abs_sample > hard_clip_limit)
-			{
-				// Hard limit to prevent overflow
-				dst[i] = sign * hard_clip_limit;
-			}
-			else
-			{
-				// Soft clipping using tanh-like curve
-				f32 excess = (abs_sample - soft_clip_threshold) / (hard_clip_limit - soft_clip_threshold);
-				f32 soft_factor = soft_clip_threshold + (hard_clip_limit - soft_clip_threshold) * std::tanh(excess);
-				dst[i] = sign * soft_factor;
-			}
-		}
-		else
-		{
-			// No clipping needed
-			dst[i] = sample;
-		}
+		dst[i] = std::clamp(src[i], -1.0f, 1.0f);
 	}
 }
 

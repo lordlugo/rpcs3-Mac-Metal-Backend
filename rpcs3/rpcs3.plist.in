@@ -36,6 +36,10 @@
 	<string>public.app-category.games</string>
 	<key>LSSupportsGameMode</key>
 	<true/>
+	<!-- The Core Audio backend renders surround as spatial audio itself (AUSpatialMixer): no second, system-provided
+	     spatialization on top of it. Stereo games are output unprocessed. -->
+	<key>AVGameBypassSystemSpatialAudio</key>
+	<true/>
 	<key>GCSupportsControllerUserInteraction</key>
 	<true/>
 	<key>UIDesignRequiresCompatibility</key>

@@ -1463,6 +1463,33 @@ bool MTLGSRender::load_program()
 		m_pipeline_properties,
 		shadermode != shader_mode::recompiler, true);
 
+	// The pipeline is being compiled on a worker. Without an interpreter the draw would be skipped: wait a little for
+	// it (compiles typically take a few ms on Apple silicon), within a per-frame budget so a burst of new shaders costs
+	// at most a short hitch.
+	if (!m_program && shadermode != shader_mode::recompiler && m_async_compile_wait_spent_us < async_compile_wait_budget_us)
+	{
+		const u64 wait_start = get_system_time();
+
+		mtl::leave_uninterruptible();
+
+		while (!m_program && get_system_time() - wait_start + m_async_compile_wait_spent_us < async_compile_wait_budget_us)
+		{
+			std::this_thread::sleep_for(std::chrono::microseconds(250));
+
+			mtl::enter_uninterruptible();
+			std::tie(m_program, m_vertex_prog, m_fragment_prog) = m_prog_buffer->get_graphics_pipeline(
+				&m_program_cache_hint,
+				vertex_program,
+				fragment_program,
+				m_pipeline_properties,
+				true, true);
+			mtl::leave_uninterruptible();
+		}
+
+		m_async_compile_wait_spent_us += get_system_time() - wait_start;
+		mtl::enter_uninterruptible();
+	}
+
 	mtl::leave_uninterruptible();
 
 	if (m_prog_buffer->check_cache_missed())

@@ -399,7 +399,7 @@ namespace rsx
 			if (!m_label_deferral_logged)
 			{
 				m_label_deferral_logged = true;
-				rsx_log.notice("ZCULL: texture read semaphores now wait for the zcull reports queued before them (reports are read by the CPU)");
+				rsx_log.notice("ZCULL: semaphores now wait for the zcull reports queued before them instead of stalling the RSX (reports are read by the CPU)");
 			}
 
 			m_deferred_labels.push_back({ address, value, fence, get_system_time() });

@@ -178,6 +178,11 @@ audio_ringbuffer::~audio_ringbuffer()
 	}
 
 	backend->Close();
+
+	// The backend outlives this ring buffer (it is reused by the next one): drop the callbacks bound to `this`, a device
+	// notification could otherwise call into freed memory before the next ring buffer installs its own
+	backend->SetWriteCallback(nullptr);
+	backend->SetStateCallback(nullptr);
 }
 
 f32 audio_ringbuffer::set_frequency_ratio(f32 new_ratio)

@@ -268,7 +268,11 @@ struct cfg_root : cfg::node
 	{
 		node_audio(cfg::node* _this) : cfg::node(_this, "Audio") {}
 
+#ifdef __APPLE__
+		cfg::_enum<audio_renderer> renderer{ this, "Renderer", audio_renderer::core_audio, true };
+#else
 		cfg::_enum<audio_renderer> renderer{ this, "Renderer", audio_renderer::cubeb, true };
+#endif
 		cfg::_enum<audio_provider> provider{ this, "Audio Provider", audio_provider::cell_audio, false };
 		cfg::_enum<audio_avport> rsxaudio_port{ this, "RSXAudio Avport", audio_avport::hdmi_0, true };
 		cfg::_bool dump_to_file{ this, "Dump to file", false, true };
@@ -286,6 +290,12 @@ struct cfg_root : cfg::node
 		cfg::_enum<microphone_handler> microphone_type{ this, "Microphone Type", microphone_handler::null };
 		cfg::string microphone_devices{ this, "Microphone Devices", "@@@@@@@@@@@@" };
 		cfg::_enum<music_handler> music{ this, "Music Handler", music_handler::qt };
+#ifdef __APPLE__
+		// Core Audio backend (see Emu/Audio/CoreAudio/CoreAudioBackend.h). Read when the output is (re)opened.
+		cfg::_enum<audio_spatial_mode> spatial_mode{ this, "Spatial Audio", audio_spatial_mode::automatic };
+		cfg::_bool spatial_head_tracking{ this, "Spatial Audio Head Tracking", true };
+		cfg::_bool match_device_rate{ this, "Switch Device To 48 kHz", true };
+#endif
 	} audio{ this };
 
 	struct node_io : cfg::node

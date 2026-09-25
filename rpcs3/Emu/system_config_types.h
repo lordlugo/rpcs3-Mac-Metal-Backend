@@ -59,6 +59,18 @@ enum class audio_renderer
 #ifdef HAVE_FAUDIO
 	faudio,
 #endif
+#ifdef __APPLE__
+	core_audio,
+#endif
+};
+
+// Core Audio backend: how multichannel (surround) audio is rendered
+enum class audio_spatial_mode
+{
+	automatic,  // From the output device: spatial for headphones and built-in speakers, speaker layout otherwise
+	headphones, // Always binaural (spatial audio for headphones)
+	speakers,   // Speaker layout (built-in speakers keep Apple's speaker virtualization)
+	off,        // Speaker layout mapping / standard downmix only
 };
 
 enum class audio_provider

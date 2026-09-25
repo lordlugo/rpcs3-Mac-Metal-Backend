@@ -154,6 +154,15 @@ target_sources(rpcs3_emu PRIVATE
     Audio/Cubeb/cubeb_enumerator.cpp
 )
 
+if(APPLE)
+    # Native Core Audio output: AUHAL + AUSpatialMixer (spatial audio for surround)
+    target_sources(rpcs3_emu PRIVATE
+        Audio/CoreAudio/CoreAudioBackend.cpp
+        Audio/CoreAudio/coreaudio_enumerator.cpp
+    )
+    target_link_libraries(rpcs3_emu PRIVATE "-framework CoreAudio" "-framework AudioToolbox" "-framework CoreFoundation")
+endif()
+
 if(USE_FAUDIO)
     find_package(SDL3)
     if(SDL3_FOUND AND SDL3_VERSION VERSION_GREATER_EQUAL 3.2.0)

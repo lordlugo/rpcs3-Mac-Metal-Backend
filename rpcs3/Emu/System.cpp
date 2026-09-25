@@ -546,6 +546,13 @@ void Emulator::Init()
 		{
 			g_cfg.video.multithreaded_rsx.set(true);
 		}},
+		{ "metal-fork-defaults-v3", "Audio Renderer: Core Audio", []()
+		{
+			if (g_cfg.audio.renderer.get() == audio_renderer::cubeb)
+			{
+				g_cfg.audio.renderer.set(audio_renderer::core_audio);
+			}
+		}},
 	};
 
 	for (const fork_defaults_t& defaults : fork_defaults)

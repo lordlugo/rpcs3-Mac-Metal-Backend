@@ -30,6 +30,10 @@
 #include "Emu/Audio/Null/null_enumerator.h"
 #include "Emu/Audio/Cubeb/CubebBackend.h"
 #include "Emu/Audio/Cubeb/cubeb_enumerator.h"
+#ifdef __APPLE__
+#include "Emu/Audio/CoreAudio/CoreAudioBackend.h"
+#include "Emu/Audio/CoreAudio/coreaudio_enumerator.h"
+#endif
 #ifdef _WIN32
 #include "Emu/Audio/XAudio2/XAudio2Backend.h"
 #include "Emu/Audio/XAudio2/xaudio2_enumerator.h"
@@ -242,6 +246,9 @@ void main_application::create_callbacks()
 #ifdef HAVE_FAUDIO
 		case audio_renderer::faudio: result = std::make_shared<FAudioBackend>(); break;
 #endif
+#ifdef __APPLE__
+		case audio_renderer::core_audio: result = std::make_shared<CoreAudioBackend>(); break;
+#endif
 		}
 
 		if (!result->Initialized())
@@ -264,6 +271,9 @@ void main_application::create_callbacks()
 		case audio_renderer::cubeb: return std::make_shared<cubeb_enumerator>();
 #ifdef HAVE_FAUDIO
 		case audio_renderer::faudio: return std::make_shared<faudio_enumerator>();
+#endif
+#ifdef __APPLE__
+		case audio_renderer::core_audio: return std::make_shared<coreaudio_enumerator>();
 #endif
 		default: fmt::throw_exception("Invalid renderer index %u", renderer);
 		}

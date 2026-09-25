@@ -134,6 +134,26 @@ void fmt_class_string<audio_renderer>::format(std::string& out, u64 arg)
 #ifdef HAVE_FAUDIO
 		case audio_renderer::faudio: return "FAudio";
 #endif
+#ifdef __APPLE__
+		case audio_renderer::core_audio: return "Core Audio";
+#endif
+		}
+
+		return unknown;
+	});
+}
+
+template <>
+void fmt_class_string<audio_spatial_mode>::format(std::string& out, u64 arg)
+{
+	format_enum(out, arg, [](audio_spatial_mode value)
+	{
+		switch (value)
+		{
+		case audio_spatial_mode::automatic: return "Automatic";
+		case audio_spatial_mode::headphones: return "Headphones";
+		case audio_spatial_mode::speakers: return "Speakers";
+		case audio_spatial_mode::off: return "Off";
 		}
 
 		return unknown;

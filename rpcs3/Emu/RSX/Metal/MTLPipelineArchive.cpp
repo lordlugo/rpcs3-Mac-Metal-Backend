@@ -70,6 +70,7 @@ namespace mtl
 		constexpr std::string_view archive_extension = ".mtl4archive";
 		constexpr std::string_view base_suffix = "-base";
 		constexpr std::string_view temp_extension = ".tmp";
+		constexpr std::string_view incoming_dir = "incoming/"; // Archives are written here first (with their final name), then moved
 		constexpr std::string_view identity_file_name = "identity.txt";
 
 		// Limits for what is opened at boot. Normally one base file plus the deltas of one session remain.
@@ -226,6 +227,7 @@ namespace mtl
 			std::shared_ptr<capture_bundle> m_bundle;
 			u32 m_next_bundle_index = 0; // Init, then archive thread only
 			bool m_capture_enabled = false;
+			u32 m_write_failures = 0;           // Consecutive failed writes (archive thread only)
 
 			atomic_t<u64> m_last_build_time{ 0 }; // clock_type ticks
 			clock_type::time_point m_init_time{};
@@ -585,6 +587,9 @@ namespace mtl
 					remove_entry(m_directory + name);
 				}
 
+				// Leftovers of an interrupted write (the staging directory)
+				remove_entry(m_directory + std::string(incoming_dir.substr(0, incoming_dir.size() - 1)));
+
 				return files;
 			}
 
@@ -607,11 +612,11 @@ namespace mtl
 
 				auto bundle = std::make_shared<capture_bundle>();
 
-				// Binaries are what the archive is made of. Descriptors are captured too: they are the lookup keys, and the
-				// early SDKs captured them implicitly with binaries.
+				// Archives are made of the pipeline binaries (CaptureBinaries). CaptureDescriptors only serves pipeline scripts
+				// for the offline binary generator (serializeAsPipelinesScript); with it, every archive write failed without
+				// an error on macOS 26/27, so it is not requested.
 				auto serializer_desc = mtl::ref(MTL4::PipelineDataSetSerializerDescriptor::alloc()->init());
-				serializer_desc->setConfiguration(MTL4::PipelineDataSetSerializerConfigurationCaptureDescriptors |
-					MTL4::PipelineDataSetSerializerConfigurationCaptureBinaries);
+				serializer_desc->setConfiguration(MTL4::PipelineDataSetSerializerConfigurationCaptureBinaries);
 
 				bundle->serializer = m_device->newPipelineDataSetSerializer(serializer_desc.get());
 				if (!bundle->serializer)
@@ -772,16 +777,34 @@ namespace mtl
 				mtl::autorelease_scope pool;
 				const auto start = clock_type::now();
 
-				const std::string temp_path = m_directory + make_archive_name(m_session, bundle.index, false) + std::string(temp_extension);
+				// Written under its final name (Metal may key on the file extension) in a staging directory, then moved
+				const std::string staging = m_directory + std::string(incoming_dir);
+				if (!fs::create_path(staging.substr(0, staging.size() - 1)))
+				{
+					rsx_log.error("Metal: cannot create %s (%s)", staging, fs::g_tls_error);
+					return;
+				}
+
+				const std::string temp_path = staging + make_archive_name(m_session, bundle.index, false);
 				remove_entry(temp_path);
 
 				NS::Error* error = nullptr;
 				if (!bundle.serializer->serializeAsArchiveAndFlushToURL(NS::URL::fileURLWithPath(mtl::ns_str(temp_path)), &error))
 				{
-					rsx_log.error("Metal: cannot write the pipeline archive (%u pipeline(s)): %s", count, mtl::to_string(error));
+					rsx_log.error("Metal: cannot write the pipeline archive (%u pipeline(s)) to %s: %s", count, temp_path, mtl::to_string(error));
 					remove_entry(temp_path);
+
+					if (++m_write_failures >= 2 && m_capture_enabled)
+					{
+						// Don't keep capturing (memory) and failing (time) for the rest of the session
+						m_capture_enabled = false;
+						rsx_log.error("Metal: the pipeline archive is disabled for this session after repeated write failures");
+					}
+
 					return;
 				}
+
+				m_write_failures = 0;
 
 				const u64 size = get_entry_size(temp_path);
 				if (!size)

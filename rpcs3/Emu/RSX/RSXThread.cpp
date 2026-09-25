@@ -2859,7 +2859,7 @@ namespace rsx
 		zcull_ctrl->on_sync_hint(payload);
 	}
 
-	bool thread::defer_texture_read_label(u32 address, u32 value)
+	bool thread::defer_label(u32 address, u32 value)
 	{
 		if (!zcull_ctrl || backend_config.supports_host_gpu_labels || !zcull_ctrl->wants_label_deferral()) [[likely]]
 		{
@@ -2869,6 +2869,22 @@ namespace rsx
 		// Same release ordering as write_gcm_label<true, ...>: memory and DMA transfers before the label
 		mm_flush();
 		g_fxo->get<rsx::dma_manager>().sync();
+
+		return zcull_ctrl->defer_label_write(this, address, value);
+	}
+
+	bool thread::sync_and_defer_label(u32 address, u32 value)
+	{
+		if (!zcull_ctrl || backend_config.supports_host_gpu_labels || !zcull_ctrl->wants_label_deferral()) [[likely]]
+		{
+			return false;
+		}
+
+		// thread::sync() minus the zcull sync
+		m_eng_interrupt_mask.clear(rsx::pipe_flush_interrupt);
+		mm_flush();
+		g_fxo->get<rsx::dma_manager>().sync();
+		m_graphics_state |= rsx::pipeline_state::fragment_constants_dirty;
 
 		return zcull_ctrl->defer_label_write(this, address, value);
 	}
@@ -2884,6 +2900,11 @@ namespace rsx
 	bool thread::has_deferred_label_at(u32 address) const
 	{
 		return zcull_ctrl && zcull_ctrl->has_deferred_label_at(address);
+	}
+
+	bool thread::has_deferred_labels() const
+	{
+		return zcull_ctrl && zcull_ctrl->has_deferred_labels();
 	}
 
 	bool thread::is_fifo_idle() const
@@ -3405,10 +3426,12 @@ namespace rsx
 		// MM sync. This is a pre-emptive operation, so we can use a deferred request.
 		rsx::mm_flush_lazy();
 
-		// The flip can block for a whole frame (frame limiter, display), and labels are not written while it does.
-		// Texture read labels still waiting for zcull reports go out first (only in games that read reports after
-		// such a label; see reports::ZCULL_control::defer_label_write).
-		flush_deferred_labels();
+		// Labels held back for zcull reports: write the ones whose reports are done (the frame limiter wait below keeps
+		// retiring the rest, see handle_emu_flip)
+		if (zcull_ctrl->has_deferred_labels())
+		{
+			zcull_ctrl->update(this);
+		}
 
 		// Marks the end of a frame scope GPU-side
 		if (g_user_asked_for_frame_capture.exchange(false) && !capture_current_frame)
@@ -3630,7 +3653,21 @@ namespace rsx
 				if (target_rsx_flip_time > time + 1000)
 				{
 					const auto delay_us = target_rsx_flip_time - time;
-					lv2_obj::wait_timeout(delay_us, nullptr, false);
+
+					// Labels held back for zcull reports (CPU threads may be waiting for them) keep landing while the
+					// limiter waits: sleep in slices and retire them as their reports complete
+					const u64 deadline = get_system_time() + delay_us;
+					for (u64 now = get_system_time(); zcull_ctrl->has_deferred_labels() && now + 500 < deadline; now = get_system_time())
+					{
+						lv2_obj::wait_timeout(std::min<u64>(deadline - now, 1000), nullptr, false);
+						zcull_ctrl->update(this);
+					}
+
+					if (const u64 now = get_system_time(); now < deadline)
+					{
+						lv2_obj::wait_timeout(deadline - now, nullptr, false);
+					}
+
 					performance_counters.idle_time += delay_us;
 				}
 			}
