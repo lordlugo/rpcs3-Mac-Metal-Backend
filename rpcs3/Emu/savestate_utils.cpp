@@ -53,7 +53,7 @@ SERIALIZATION_VER(lv2_config, 9,                                1)
 
 namespace rsx
 {
-	SERIALIZATION_VER(rsx, 10,                                  1, 2/*Pending flip*/, 3/*avconf scan_mode*/)
+	SERIALIZATION_VER(rsx, 10,                                  1, 2/*Pending flip*/, 3/*avconf scan_mode*/, 4/*FIFO in local memory*/)
 }
 
 namespace np

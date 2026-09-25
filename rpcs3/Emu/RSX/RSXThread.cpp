@@ -800,6 +800,13 @@ namespace rsx
 			}
 		}
 
+		if (ar.is_writing() || version >= 4)
+		{
+			b8 local_fifo = ar.is_writing() && fifo_in_local_memory;
+			ar(local_fifo);
+			fifo_in_local_memory = local_fifo;
+		}
+
 		if (ar.is_writing())
 		{
 			if (fifo_ctrl && state & cpu_flag::again)

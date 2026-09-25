@@ -53,6 +53,21 @@ namespace rsx
 
 		atomic_t<u64> unsent_gcm_events = 0; // Unsent event bits when aborting RSX/VBLANK thread (will be sent on savestate load)
 
+		// Set when this context fetches its FIFO commands from RSX local memory instead of IO-mapped main memory.
+		// libgcm's system mode (e.g. GTA IV 1.00) queues its first commands in local memory before any IO is mapped.
+		atomic_t<bool> fifo_in_local_memory = false;
+
+		// Effective address of a FIFO offset (GET/PUT, JUMP/CALL targets), umax when unmapped
+		u32 fifo_offset_to_ea(u32 offset) const
+		{
+			if (fifo_in_local_memory && offset < local_mem_size) [[unlikely]]
+			{
+				return rsx::constants::local_mem_base + offset;
+			}
+
+			return iomap_table.get_addr(offset);
+		}
+
 		GCM_tile_reference get_tiled_memory_region(const utils::address_range32& range) const;
 	};
 }
