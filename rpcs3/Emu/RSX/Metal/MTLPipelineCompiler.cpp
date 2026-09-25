@@ -187,7 +187,13 @@ namespace mtl
 		}
 
 		descriptor->setRasterizationEnabled(rasterization_enabled);
-		descriptor->setInputPrimitiveTopology(static_cast<MTL::PrimitiveTopologyClass>(state.topology_class));
+		// RSX vertex programs always write gl_PointSize ([[point_size]] in MSL). Metal rejects such a vertex function
+		// in a pipeline declared as line/triangle ("Vertex shader writes point size but inputPrimitiveTopology is
+		// MTLPrimitiveTopologyClassTriangle"), so only point pipelines declare their class. Unspecified is Metal's
+		// default and is only required to be explicit for layered rendering, which RSX never uses.
+		descriptor->setInputPrimitiveTopology(state.topology_class == static_cast<u8>(MTL::PrimitiveTopologyClassPoint)
+			? MTL::PrimitiveTopologyClassPoint
+			: MTL::PrimitiveTopologyClassUnspecified);
 		descriptor->setRasterSampleCount(std::max<u32>(1u, state.sample_count));
 		descriptor->setAlphaToCoverageState(state.alpha_to_coverage ? MTL4::AlphaToCoverageStateEnabled : MTL4::AlphaToCoverageStateDisabled);
 		descriptor->setAlphaToOneState(state.alpha_to_one ? MTL4::AlphaToOneStateEnabled : MTL4::AlphaToOneStateDisabled);
