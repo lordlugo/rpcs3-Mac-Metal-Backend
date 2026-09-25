@@ -19,7 +19,9 @@ namespace mtl
 	class command_list;
 	class data_heap;
 	class image;
+	class image_view;
 	class render_device;
+	struct sampler;
 
 	enum runtime_state
 	{
@@ -92,6 +94,11 @@ namespace mtl
 	void copy_image_to_buffer(mtl::command_list& cmd, const mtl::image* src, const mtl::buffer* dst, const buffer_image_copy& region, const image_readback_options_t& options = {});
 	void copy_buffer_to_image(mtl::command_list& cmd, const mtl::buffer* src, const mtl::image* dst, const buffer_image_copy& region);
 
+	// Bit-exact transfers without any format conversion (Metal addition). For combined depth-stencil formats the region
+	// aspect must select exactly ONE plane (depth = 4-byte float, stencil = 1 byte). Used for surface spilling.
+	void copy_image_to_buffer_raw(mtl::command_list& cmd, const mtl::image* src, const mtl::buffer* dst, const buffer_image_copy& region);
+	void copy_buffer_to_image_raw(mtl::command_list& cmd, const mtl::buffer* src, const mtl::image* dst, const buffer_image_copy& region);
+
 	u64 calculate_working_buffer_size(u64 base_size, u32 aspect);
 
 	void copy_image_typeless(mtl::command_list& cmd, mtl::image* src, mtl::image* dst,
@@ -111,7 +118,41 @@ namespace mtl
 		const rsx::image_copy_subresource_layers& mip_layers = {},
 		bool compatible_formats = false, bool linear_filter = true);
 
+	// Implemented in MTLFormats.cpp
 	std::pair<MTL::PixelFormat, MTL::TextureSwizzleChannels> get_compatible_surface_format(rsx::surface_color_format color_format);
+
+	// Metal has no vkCmdClearColorImage / vkCmdClearDepthStencilImage. Clears every selected mip level and layer (or 3D
+	// slice) with an empty loadAction=Clear render pass. Non-renderable (block-compressed) formats are zero-filled
+	// from a scratch buffer instead and `value` is ignored.
+	struct image_clear_value
+	{
+		color4f color{ 0.f, 0.f, 0.f, 0.f };
+		f32 depth = 1.f;
+		u8 stencil = 0;
+	};
+
+	void clear_image(mtl::command_list& cmd, mtl::image* image, const image_clear_value& value, u32 base_level = 0, u32 level_count = ~0u);
+
+	// ---- Scratch resources (port of vkutils/scratch.{h,cpp}; implemented in MTLTexture.cpp) ------------------------
+	// Double-buffered, growable device_local (private) scratch buffer. New/grown buffers are zero-filled on `cmd`.
+	// Replaced buffers are retired through the GC. Stage/access masks of the VK version are unnecessary (cmd.compute()
+	// serializes every transfer).
+	mtl::buffer* get_scratch_buffer(mtl::command_list& cmd, u64 min_required_size, bool zero_memory = false);
+
+	// Shared 2D scratch image per (format, format class); at least requested_width x requested_height (aligned to 256).
+	// Usage: ShaderRead | RenderTarget (when renderable) so it can be both a copy and a scaled-blit destination.
+	mtl::image* get_typeless_helper(MTL::PixelFormat format, rsx::format_class format_class, u32 requested_width, u32 requested_height);
+
+	// Transparent-black placeholder views for unbound texture slots (types: 2D, 3D, Cube, 2DArray; 1D maps to 2D).
+	mtl::image_view* null_image_view(mtl::command_list& cmd, MTL::TextureType type);
+	mtl::sampler* null_sampler();
+
+	void clear_scratch_resources();
+
+	// Auxiliary upload heap (port of vk::get_upload_heap: 64 MiB host_visible ring, created on first use).
+	// destroy_global_resources() must call get_upload_heap()->destroy(); reset_global_resources() should call
+	// get_upload_heap()->reset_allocation_stats().
+	mtl::data_heap* get_upload_heap();
 
 	// ---- Runtime state (implemented in MTLHelpers.cpp) --------------------------------------------------------------
 	void raise_status_interrupt(runtime_state status);

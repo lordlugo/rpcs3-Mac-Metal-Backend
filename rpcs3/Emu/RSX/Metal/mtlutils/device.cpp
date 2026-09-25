@@ -44,6 +44,8 @@ namespace mtl
 		m_caps.max_threads_per_threadgroup = static_cast<u32>(m_device->maxThreadsPerThreadgroup().width);
 		m_caps.max_buffer_length = m_device->maxBufferLength();
 		m_caps.recommended_working_set = m_device->recommendedMaxWorkingSetSize();
+		// Let the OS run as many shader compilations in parallel as the machine allows (macOS 13.3+).
+		m_device->setShouldMaximizeConcurrentCompilation(true);
 		m_caps.max_compile_tasks = std::max<u32>(2u, static_cast<u32>(m_device->maximumConcurrentCompilationTaskCount()));
 		m_caps.max_texture_size_2d = 16384;
 		m_caps.max_texture_size_3d = 2048;

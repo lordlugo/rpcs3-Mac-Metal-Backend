@@ -19,6 +19,7 @@
 #include <array>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -117,7 +118,13 @@ namespace mtl
 			u32 sampler_count = 0;
 		};
 
-		// Assigns Metal indices: buffers 0.., textures 0.., samplers 0.. in input order; push constants last buffer.
+		// Assigns Metal indices for ONE stage (all inputs of the list, whatever their set):
+		//  - buffers (UBO, SSBO) 0.. in input order, push-constant block last (index 30 max);
+		//  - sampled textures (input_type_texture) first 0.., then texel buffers and storage textures (63 max);
+		//  - sampler index == texture index for sampled textures (must stay < 16);
+		//  - input_type_attachment gets no slot (framebuffer fetch [[color(n)]]).
+		// Keys are GLSL binding locations; a location may only be declared once per stage. Fails loudly otherwise.
+		// If a stage reads SSBO lengths, its buffer-size table lives at index buffer_count (see shader/program).
 		binding_layout build_binding_layout(const std::vector<program_input>& inputs);
 
 		// Resources handed to program::bind_uniform
@@ -154,6 +161,10 @@ namespace mtl
 			std::string m_entry_point;  // MSL entry point name
 			MTL::Library* m_library = nullptr;
 
+			std::mutex m_compile_lock;          // compile() may race between pipe-compiler workers sharing a shader
+			bool m_compile_failed = false;      // Do not retry (and re-log) a translation that already failed
+			bool m_needs_buffer_sizes = false;  // MSL reads spvBufferSizeConstants (GLSL SSBO .length())
+
 		public:
 			shader() = default;
 			~shader();
@@ -175,6 +186,10 @@ namespace mtl
 			const std::string& entry_point() const { return m_entry_point; }
 			MTL::Library* library() const { return m_library; }
 			bool is_compiled() const { return m_library != nullptr; }
+
+			// True if the MSL expects a buffer-size table (uint per Metal buffer index) at binding_layout::buffer_count.
+			// Only set for shaders using GLSL SSBO .length(); pipeline builders forward it to program.
+			bool needs_buffer_size_buffer() const { return m_needs_buffer_sizes; }
 		};
 
 		// Fixed-function state baked into a Metal 4 render pipeline. POD; hashed and serialized raw (shader cache).
@@ -222,10 +237,21 @@ namespace mtl
 				std::array<MTL::ResourceID, 16> samplers{};
 				std::vector<u8> push_constants;
 				bool dirty = true;
+
+				std::array<u32, 31> buffer_sizes{};     // Bound ranges, uploaded when the stage needs a buffer-size table
+				bool needs_buffer_sizes = false;
 			};
 			std::array<stage_bindings, binding_set_index_max_enum> m_bindings;
 
 			u32 m_compute_threads_per_group = 1;
+
+			// (set, binding) -> bitmask of stages (m_inputs/m_layouts index) that declare it
+			static constexpr u32 max_binding_locations = 128;
+			std::array<std::array<u8, max_binding_locations>, binding_set_index_max_enum> m_binding_stage_mask{};
+			bool m_missing_binding_reported = false;
+
+			void init_layouts();
+			template <typename F> void for_each_bound_slot(u32 set_id, u32 binding_point, F&& func);
 
 		public:
 			program(MTL::RenderPipelineState* pipeline,
@@ -251,12 +277,18 @@ namespace mtl
 			void bind_uniform(const image_binding_info& image, u32 set_id, u32 binding_point);       // sampled / storage image
 			void bind_uniform(const mtl::buffer_view* view, u32 set_id, u32 binding_point);         // texel buffer
 			void bind_uniform_array(std::span<const image_binding_info> images, u32 set_id, u32 binding_point);
+			// Vulkan semantics: [offset, offset + size) addresses the push-constant space shared by all stages; every
+			// stage whose push block covers it receives the bytes (set_id is accepted for parity, not needed).
 			void push_constants(u32 set_id, u32 offset, u32 size, const void* data);
 
 			// Sets the pipeline state on the active encoder of `cmd` (render encoder for graphics programs, compute()
 			// for compute programs), uploads push constants to `scratch` and writes + sets the stage argument tables.
 			// For graphics programs a render pass must already be open.
 			void bind(mtl::command_list& cmd, mtl::data_heap& scratch);
+
+			// For pipeline builders: the translated shader of `stage_index` (0 = vertex/compute, 1 = fragment) reads
+			// SSBO lengths, so bind() uploads the bound storage-buffer ranges to binding_layout::buffer_count.
+			void enable_buffer_size_table(u32 stage_index);
 		};
 
 		// ---- Program creation helpers (for static passes: compute kernels, overlays, blits) ----------------------

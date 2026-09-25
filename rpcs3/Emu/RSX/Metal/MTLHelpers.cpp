@@ -15,18 +15,12 @@ namespace mtl
 		return g_render_device;
 	}
 
-	bool emulate_primitive_restart(rsx::primitive_type type)
+	bool emulate_primitive_restart(rsx::primitive_type /*type*/)
 	{
-		// Metal always restarts strips on 0xFFFF / 0xFFFFFFFF. Lists never restart.
-		// RSX restart index is rewritten by the common index upload code; only non-strip topologies need emulation.
-		switch (type)
-		{
-		case rsx::primitive_type::triangle_strip:
-		case rsx::primitive_type::line_strip:
-			return false;
-		default:
-			return true;
-		}
+		// Metal always honours the restart index (0xFFFF / 0xFFFFFFFF) for strip topologies, so no emulation is
+		// needed (same as a Vulkan driver without the no-restart quirk). The common index upload already rewrites the
+		// RSX restart index to the all-ones value.
+		return false;
 	}
 
 	bool sanitize_fp_values()

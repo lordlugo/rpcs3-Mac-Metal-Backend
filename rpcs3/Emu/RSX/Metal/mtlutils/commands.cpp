@@ -1,6 +1,8 @@
 #include "stdafx.h"
 #include "commands.h"
 
+#include <mutex>
+
 namespace mtl
 {
 	command_list::~command_list()
@@ -118,6 +120,11 @@ namespace mtl
 
 		// Residency changes made while recording must be visible before the GPU runs this work.
 		g_render_device->commit_residency();
+
+		// Waits + commit + timeline signal must be atomic across threads, otherwise two submitters could interleave
+		// and signal timeline values out of order relative to their work.
+		static std::mutex s_submit_mutex;
+		std::lock_guard lock(s_submit_mutex);
 
 		if (info.wait_drawable)
 		{
