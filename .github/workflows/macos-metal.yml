@@ -3,7 +3,7 @@ name: macOS Metal
 on:
   push:
     branches:
-      - metal-backend
+      - master
   pull_request:
   workflow_dispatch:
     inputs:
