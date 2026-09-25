@@ -2771,7 +2771,7 @@ void thread_base::start()
 	// (and realtime priorities are not granted to regular apps anyway).
 	// Named threads are the emulation threads (PPU/SPU/RSX, cellAudio, timers, ...), which never adjust their own
 	// priority, so they start at the highest class. Helper/worker threads lower themselves through
-	// thread_ctrl::scoped_priority(-1) (-> QOS_CLASS_UTILITY), see set_native_priority().
+	// thread_ctrl::scoped_priority(-1) (-> QOS_CLASS_USER_INITIATED), see set_native_priority().
 	pthread_attr_set_qos_class_np(&attrs, QOS_CLASS_USER_INTERACTIVE, 0);
 	ensure(pthread_create(&thread_id, &attrs, entry_point, this) == 0);
 	pthread_attr_destroy(&attrs);
@@ -3841,7 +3841,8 @@ void thread_ctrl::set_native_priority(int priority)
 	// macOS: map RPCS3 priorities to QoS classes instead of POSIX (SCHED_RR) priorities.
 	// On Apple silicon the QoS class also steers P-core/E-core placement.
 	//   priority > 0 : QOS_CLASS_USER_INTERACTIVE - emulation-critical threads (RSX, audio, ...)
-	//   priority < 0 : QOS_CLASS_UTILITY          - background work (PPU/SPU/shader compilation, log writer, ...)
+	//   priority < 0 : QOS_CLASS_USER_INITIATED   - background work (PPU/SPU/shader compilation, log writer, ...).
+	//                  USER_INITIATED (not UTILITY) so that LLVM/shader compilation can still use performance cores.
 	//   priority == 0: the thread's normal class. That is QOS_CLASS_USER_INTERACTIVE for threads created as emulation
 	//                  threads (named threads, see thread_base::start()) and QOS_CLASS_USER_INITIATED for any other
 	//                  thread. Restoring the creation class matters because emulation threads may lower themselves
@@ -3859,7 +3860,7 @@ void thread_ctrl::set_native_priority(int priority)
 	if (priority > 0)
 		qos = QOS_CLASS_USER_INTERACTIVE;
 	if (priority < 0)
-		qos = QOS_CLASS_UTILITY;
+		qos = QOS_CLASS_USER_INITIATED;
 
 	if (int err = pthread_set_qos_class_self_np(qos, 0))
 	{
