@@ -374,6 +374,30 @@ public:
 
 				// Pause emulation if fatal error encountered
 				Emu.Pause(true);
+
+				// A thread that hits a fatal error ends quietly (see thread_ctrl::emergency_exit) and the frozen game looks
+				// like a hang, often behind a progress dialog that never closes. Say what happened, once per boot.
+				static atomic_t<u64> s_reported_emulation = umax;
+				if (const u64 emulation = static_cast<u64>(Emu.GetEmulationIdentifier()); s_reported_emulation.exchange(emulation) != emulation)
+				{
+					std::string error = _msg.substr(rpcs3_prefix.size());
+					fmt::trim_back(error, " \t\n");
+
+					Emu.CallFromMainThread([error = std::move(error)]()
+					{
+						if (!qobject_cast<QApplication*>(QCoreApplication::instance()))
+						{
+							return; // No GUI (headless)
+						}
+
+						auto box = new QMessageBox(QMessageBox::Critical, QStringLiteral("RPCS3"),
+							QObject::tr("Emulation stopped because of an error:"), QMessageBox::Ok);
+						box->setInformativeText(QString::fromStdString(error) +
+							QObject::tr("\n\nThe full log is RPCS3.log (File > Open Log Folder)."));
+						box->setAttribute(Qt::WA_DeleteOnClose);
+						box->show();
+					}, nullptr, false);
+				}
 			}
 		}
 	}
