@@ -23,6 +23,12 @@ namespace rsx
 			glyph_data.resize(bitmap_width * bitmap_height);
 			pack_info.resize(256);
 
+			if (ttf_data.empty())
+			{
+				// No usable font file anywhere: keep blank glyphs (zero-sized quads) instead of aborting the caller
+				return;
+			}
+
 			stbtt_pack_context context;
 			if (!stbtt_PackBegin(&context, glyph_data.data(), bitmap_width, bitmap_height, 0, 1, nullptr))
 			{
@@ -110,6 +116,14 @@ namespace rsx
 
 			const std::vector<std::string> font_dirs = g_emu_callbacks.get_font_dirs();
 			result.lookup_font_dirs.insert(result.lookup_font_dirs.end(), font_dirs.begin(), font_dirs.end());
+#ifdef __APPLE__
+			// QStandardPaths::FontsLocation does not list the system font folders on every macOS/Qt combination
+			// (Qt 6.11 on macOS 27 returns "/System/Cryptexes/App/System/Library/Fonts/" only), and Arial lives in
+			// Supplemental. Without these, no overlay font is found at all.
+			result.lookup_font_dirs.push_back("/System/Library/Fonts/");
+			result.lookup_font_dirs.push_back("/System/Library/Fonts/Supplemental/");
+			result.lookup_font_dirs.push_back("/Library/Fonts/");
+#endif
 			// Search dev_flash for the font too
 			result.lookup_font_dirs.push_back(g_cfg_vfs.get_dev_flash() + "data/font/");
 			result.lookup_font_dirs.push_back(g_cfg_vfs.get_dev_flash() + "data/font/SONY-CC/");
@@ -126,6 +140,10 @@ namespace rsx
 				result.font_names.emplace_back("Roboto-Regular.ttf");
 				result.font_names.emplace_back("OpenSans-Regular.ttf");
 				result.font_names.emplace_back("FreeSans.ttf");
+				// Fonts that ship with macOS
+				result.font_names.emplace_back("Arial Unicode.ttf");
+				result.font_names.emplace_back("Helvetica.ttc");
+				result.font_names.emplace_back("Geneva.ttf");
 #elif defined(_WIN32)
 				// Covers symbol blocks (e.g. Roman numerals) that plain Arial may be missing glyphs for.
 				result.font_names.emplace_back("tahoma.ttf");
@@ -149,6 +167,10 @@ namespace rsx
 				// Known system font as last fallback
 				result.font_names.emplace_back("Yu Gothic.ttf");
 				result.font_names.emplace_back("YuGothR.ttc");
+#ifdef __APPLE__
+				result.font_names.emplace_back("Hiragino Sans GB.ttc");
+				result.font_names.emplace_back("Arial Unicode.ttf");
+#endif
 #ifdef _WIN32
 				result.font_names.emplace_back("msyh.ttc");
 				result.font_names.emplace_back("simsunb.ttc");
@@ -168,6 +190,10 @@ namespace rsx
 				// Known system font as last fallback
 				result.font_names.emplace_back("Malgun Gothic.ttf");
 				result.font_names.emplace_back("malgun.ttf");
+#ifdef __APPLE__
+				result.font_names.emplace_back("AppleSDGothicNeo.ttc");
+				result.font_names.emplace_back("Arial Unicode.ttf");
+#endif
 				break;
 			}
 			}
@@ -265,11 +291,16 @@ namespace rsx
 			{
 				if (fallback_bytes.empty())
 				{
-					fmt::throw_exception("Failed to initialize font for character 0x%x on codepage %d.\nLookup dirs:\n%s\nTarget fonts:\n%s", static_cast<u32>(c), static_cast<u32>(codepage_id), fmt::merge(fs_settings.lookup_font_dirs, "\n"), fmt::merge(fs_settings.font_names, "\n"));
+					// Not fatal: this runs with the overlay message lock held (e.g. from the pad thread), and a fatal
+					// error there pauses the emulator, which blocks the UI thread on that same lock (deadlock).
+					// Draw blank glyphs instead.
+					rsx_log.error("Failed to initialize font for character 0x%x on codepage %d. Overlay text will be blank.\nLookup dirs:\n%s\nTarget fonts:\n%s", static_cast<u32>(c), static_cast<u32>(codepage_id), fmt::merge(fs_settings.lookup_font_dirs, "\n"), fmt::merge(fs_settings.font_names, "\n"));
 				}
-
-				rsx_log.error("Failed to initialize font for character 0x%x on codepage %d. Falling back to font '%s'", static_cast<u32>(c), static_cast<u32>(codepage_id), fallback_file);
-				bytes = std::move(fallback_bytes);
+				else
+				{
+					rsx_log.error("Failed to initialize font for character 0x%x on codepage %d. Falling back to font '%s'", static_cast<u32>(c), static_cast<u32>(codepage_id), fallback_file);
+					bytes = std::move(fallback_bytes);
+				}
 			}
 
 			codepage_cache.page = nullptr;
