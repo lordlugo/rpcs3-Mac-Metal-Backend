@@ -173,6 +173,15 @@ fi
 # ---------------------------------------------------------------------------------------------------------------------
 # Configure
 # ---------------------------------------------------------------------------------------------------------------------
+# `brew upgrade llvm` deletes the old Cellar version, but CMake's cache keeps pointing into it (clang-scan-deps, the
+# clang resource headers, libc++). Start from a clean build directory whenever clang or the SDK changed.
+TOOLCHAIN_ID="$("$CXX" --version | head -n1) | $("$CXX" -print-resource-dir) | $SDK_PATH"
+TOOLCHAIN_STAMP="$BUILD_DIR/.rpcs3-toolchain"
+if [[ -f "$BUILD_DIR/CMakeCache.txt" ]] && [[ "$(cat "$TOOLCHAIN_STAMP" 2>/dev/null || true)" != "$TOOLCHAIN_ID" ]]; then
+    echo "==> Toolchain changed since the last configure (Homebrew LLVM upgrade or new SDK?): rebuilding from scratch"
+    DO_CLEAN=1
+fi
+
 if (( DO_CLEAN )) && [[ -d "$BUILD_DIR" ]]; then
     echo "==> Removing $BUILD_DIR"
     rm -rf "$BUILD_DIR"
@@ -209,6 +218,8 @@ cmake -S "$ROOT" -B "$BUILD_DIR" -G Ninja \
     -DSTATIC_LINK_LLVM=OFF \
     -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+
+echo "$TOOLCHAIN_ID" > "$TOOLCHAIN_STAMP"
 
 if (( CONFIGURE_ONLY )); then
     echo "==> Configured. Build with: ninja -C \"$BUILD_DIR\""

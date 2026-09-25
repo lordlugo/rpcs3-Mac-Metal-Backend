@@ -33,6 +33,11 @@ Set `RPCS3_WITH_OPENCV=1` to also install and use Homebrew OpenCV (optional came
 The build uses Homebrew's LLVM clang (RPCS3 needs clang 19 or newer, which Apple clang does not provide) with the
 macOS SDK from the selected Xcode. ccache is used automatically when installed.
 
+Don't run `brew upgrade` while a build is running: it deletes the old LLVM from under the compiler and causes
+errors like `clang-scan-deps not found` or `use of undeclared identifier 'FLT_DIG'`. After an upgrade the script
+notices the new clang/SDK and starts from a clean `build-metal/` on its own. The build continues past failed
+files, so a single run lists every compile error.
+
 The app is written to:
 
 ```
