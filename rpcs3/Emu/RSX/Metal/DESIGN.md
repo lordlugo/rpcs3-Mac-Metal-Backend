@@ -50,7 +50,13 @@ Every component is a port of its `rpcs3/Emu/RSX/VK/` counterpart. Keep the same 
   completes), exactly as the VK backend does with `vk::get_gc()`.
 * Residency: `mtl::buffer` and `mtl::image` register themselves in the device residency set on creation and evict on
   destruction. Raw `MTL::Buffer`/`MTL::Texture` you create yourself must call `g_render_device->make_resident()` /
-  `evict()`. Views and texture-buffers created from a registered parent need nothing.
+  `evict()`. Views and texture-buffers created from a registered parent need nothing. Removals only take effect at
+  the set's `commit()`, so `evict()` keeps the allocation retained until `commit_residency()`.
+* Lossless texture compression: Apple GPUs compress Private textures transparently unless their usage forbids it.
+  `MTLTextureUsagePixelFormatView` is one of the things that forbids it, so `mtl::image` sets it only for combined
+  depth-stencil formats (stencil sampled through an `X32_Stencil8` view) and when the creator asks for it (texture
+  cache sections that may be sampled through an snorm/sRGB view). Swizzle, texture-type and subresource-range views
+  do not need it. Creating a format-changing view of a texture without the flag logs an error.
 
 ## 3. Synchronization model (Metal 4: all resources untracked)
 
@@ -140,3 +146,38 @@ Include-order pitfalls found on the first real macOS builds:
   goes through `MTLDeviceQuery.h`, which declares `mtl::create_render_thread()`.
 - Homebrew's `/opt/homebrew/include` is searched last (`-idirafter`, see `buildfiles/cmake/ForkMacOSHomebrew.cmake`)
   so Homebrew copies of bundled libraries (protobuf, libpng, ...) can't replace the bundled headers.
+
+## 9. Presentation, pacing and upscaling (MTLPresent.cpp)
+
+* Metal 4 makes the queue that renders into a drawable wait for it (`waitForDrawable`), which would stall all later
+  RSX work for up to a refresh. So `flip()` renders the final image (letterbox, upscaling, overlays) into the frame
+  context's `present_image` on the main queue, and a separate present list on the present queue (the device's async
+  queue) waits for that frame's timeline value, waits for the drawable, copies, commits, signals the drawable and
+  presents. A frame context is recycled only after its present list has completed.
+* Pacing (VSync Adaptive/Full): R = `NSScreen.minimumRefreshInterval` (1/120 s on ProMotion), G = measured guest frame
+  interval minus display back-pressure. Each frame is shown for k = max(1, floor(G/R + 0.25)) refreshes with
+  `presentAfterMinimumDuration(k*R - R/2)`, so 60 fps on 120 Hz is every other refresh and 30 fps every 4th, with no
+  1-2-3 refresh jitter. Fullscreen on an Adaptive-Sync screen uses `G - 0.5 ms`. VSync Off: `present()` without
+  display sync. Every wait on the display (frame context, `nextDrawable`, hard-sync drain) is added to
+  `m_present_pacing.blocked_time`, so waiting for the display is never mistaken for a slow guest frame.
+* The layer is opaque (guest alpha is meaningless; lets the compositor skip blending and allows direct-to-display in
+  fullscreen), `framebufferOnly = false` (the present list writes the drawable with a copy), and `drawableSize` is
+  only written when it changes (every write replaces the drawables and can stall `nextDrawable`).
+* Screen properties are sampled on the main thread by `mtl::request_surface_update` (dispatch_async, never blocks);
+  the RSX thread reads the cached copy.
+* Output scaling "FSR" = MetalFX spatial upscaling (`MTL4FXSpatialScaler`) followed by RCAS sharpening
+  (upscalers/rcas_pass, the FSR1 RCAS shader as a compute pass; strength 0 = off). Scalers are built on a worker
+  thread and cached (4 sizes); bilinear is used until the scaler is ready, when the image is not upscaled, and for
+  stereo 3D. MetalFX temporal upscaling and frame interpolation are not usable: they need per-pixel motion vectors
+  and a jittered projection, which PS3 games do not provide.
+
+## 10. Pipeline binary archive (MTLPipelineArchive.cpp)
+
+* Every pipeline is built by a capturing `MTL4Compiler` with an `MTL4PipelineDataSetSerializer`, and every compile
+  passes the archives of earlier sessions as `lookupArchives`, so known binaries are reused instead of compiled.
+* A background thread retires the capturing compiler periodically and writes the retired serializer once
+  (temp file, then rename). Files: `<ppu cache>/shaders_cache/metal_pipeline_archive/<fast|precise>/`; `identity.txt`
+  pins the OS build and GPU. `RPCS3_METAL_PIPELINE_ARCHIVE=0` disables it.
+* Shutdown waits up to 3 s for a write in progress. A write that takes longer keeps running; it is joined before
+  the next archive opens the directory and at process exit.
+

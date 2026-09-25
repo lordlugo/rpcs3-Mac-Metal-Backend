@@ -525,6 +525,32 @@ void Emulator::Init()
 		Emulator::SaveSettings(g_cfg_defaults, {});
 	}
 
+#ifdef __APPLE__
+	// RPCS3 Metal fork: config.yml stores every setting explicitly, so new defaults never reach existing installs.
+	// Apply the fork's defaults once (VSync for ProMotion-aware pacing, MetalFX output scaling). Later changes made by
+	// the user are kept: this only runs when the marker file does not exist yet.
+	if (const std::string defaults_marker = fs::get_config_dir(true) + "metal-fork-defaults-v1"; !fs::is_file(defaults_marker))
+	{
+		if (const fs::file cfg_file{cfg_path}; cfg_file && g_cfg.from_string(cfg_file.to_string()))
+		{
+			g_cfg.video.vsync.set(vsync_mode::full);
+			g_cfg.video.output_scaling.set(output_scaling_mode::fsr);
+			Emulator::SaveSettings(g_cfg.to_string(), {});
+			sys_log.notice("Applied the Metal fork defaults to the global config (VSync: Full, Output Scaling: MetalFX)");
+		}
+
+		// Restore the state this function expects at this point (defaults plus the default renderer and adapter set
+		// above); the global config is applied below
+		g_cfg.from_default();
+		g_cfg.from_string(g_cfg_defaults);
+
+		if (!fs::write_file(defaults_marker, fs::rewrite, std::string{"1\n"}))
+		{
+			sys_log.error("Failed to write '%s' (%s)", defaults_marker, fs::g_tls_error);
+		}
+	}
+#endif
+
 	// Load VFS config
 	g_cfg_vfs.load();
 	sys_log.notice("Using VFS config:\n%s", g_cfg_vfs.to_string());

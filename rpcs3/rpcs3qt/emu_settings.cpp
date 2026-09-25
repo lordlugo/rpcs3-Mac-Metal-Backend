@@ -1119,7 +1119,12 @@ QString emu_settings::GetLocalizedSetting(const QString& original, emu_settings_
 		{
 		case output_scaling_mode::nearest: return tr("Nearest", "Output Scaling Mode");
 		case output_scaling_mode::bilinear: return tr("Bilinear", "Output Scaling Mode");
+#ifdef HAVE_METAL
+		// Same config value ("FidelityFX Super Resolution"), implemented with MetalFX by the Metal renderer
+		case output_scaling_mode::fsr: return tr("MetalFX Spatial Upscaling", "Output Scaling Mode");
+#else
 		case output_scaling_mode::fsr: return tr("FidelityFX Super Resolution 1", "Output Scaling Mode");
+#endif
 		}
 		break;
 	case emu_settings_type::AudioRenderer:

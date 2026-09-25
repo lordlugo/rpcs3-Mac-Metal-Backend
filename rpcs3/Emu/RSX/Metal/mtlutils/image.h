@@ -49,13 +49,17 @@ namespace mtl
 		u32 mipmaps = 1;
 		u32 layers = 1;        // array length (cube maps: layers = 6 * cube count, type = Cube/CubeArray)
 		u8 samples = 1;
+		// Add MTL::TextureUsagePixelFormatView only if a view with another component layout (e.g. unorm -> snorm) will
+		// be created: it disables lossless compression. Not needed for swizzle, linear <-> sRGB, texture type or
+		// subresource range views; combined depth-stencil formats get it automatically (stencil-plane views).
 		MTL::TextureUsage usage = MTL::TextureUsageShaderRead;
 		memory_location storage = memory_location::device_local;
 		rsx::format_class format_class = RSX_FORMAT_CLASS_UNDEFINED;
 	};
 
-	// Owned MTL::Texture. Always created with MTLTextureUsagePixelFormatView so that views may reinterpret format
-	// (RSX aliases surfaces aggressively) and with untracked hazard mode (Metal 4 model).
+	// Owned MTL::Texture, created with untracked hazard mode (Metal 4 model). `info.usage` holds the effective usage
+	// (including the MTLTextureUsagePixelFormatView added for depth-stencil formats). RSX surface aliasing goes through
+	// copies, never through format-reinterpreting views, so most images stay eligible for lossless compression.
 	class image
 	{
 		std::string m_debug_name;
@@ -125,7 +129,8 @@ namespace mtl
 		image_view(const image_view&) = delete;
 		image_view& operator=(const image_view&) = delete;
 
-		// Returns a view of the same subresources reinterpreted as `format` (cached, owned by the root view)
+		// Returns a view of the same subresources reinterpreted as `format` (cached, owned by the root view).
+		// Unless `format` only toggles sRGB, the image must have been created with MTLTextureUsagePixelFormatView.
 		image_view* as(MTL::PixelFormat format);
 
 		mtl::image* image() const { return m_resource; }

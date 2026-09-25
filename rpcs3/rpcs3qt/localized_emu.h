@@ -249,7 +249,11 @@ private:
 		case localized_string_id::HOME_MENU_SETTINGS_VIDEO_FRAME_LIMIT: return tr("Frame Limit", "Video");
 		case localized_string_id::HOME_MENU_SETTINGS_VIDEO_ANISOTROPIC_OVERRIDE: return tr("Anisotropic Filter Override", "Video");
 		case localized_string_id::HOME_MENU_SETTINGS_VIDEO_OUTPUT_SCALING: return tr("Output Scaling", "Video");
+#ifdef HAVE_METAL
+		case localized_string_id::HOME_MENU_SETTINGS_VIDEO_RCAS_SHARPENING: return tr("MetalFX Sharpening (RCAS)", "Video");
+#else
 		case localized_string_id::HOME_MENU_SETTINGS_VIDEO_RCAS_SHARPENING: return tr("FidelityFX CAS Sharpening Intensity", "Video");
+#endif
 		case localized_string_id::HOME_MENU_SETTINGS_VIDEO_RESOLUTION_SCALE_PERCENT: return tr("Resolution Scale", "Video");
 		case localized_string_id::HOME_MENU_SETTINGS_VIDEO_RESOLUTION_SCALE_THRESHOLD: return tr("Resolution Scale Threshold", "Video");
 		case localized_string_id::HOME_MENU_SETTINGS_VIDEO_STRETCH_TO_DISPLAY: return tr("Stretch To Display Area", "Video");

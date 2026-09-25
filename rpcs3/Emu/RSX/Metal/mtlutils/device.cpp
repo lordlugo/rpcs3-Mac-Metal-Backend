@@ -2,6 +2,7 @@
 #include "device.h"
 
 #include "Emu/RSX/Metal/MTLDeviceQuery.h"
+#include "Emu/RSX/Metal/MTLPipelineArchive.h"
 
 namespace mtl
 {
@@ -111,6 +112,13 @@ namespace mtl
 
 	void render_device::destroy()
 	{
+		// The pipeline archive owns capturing compilers, serializers and archives created from this device. Bounded
+		// (UI thread): a write still running after the timeout finishes in the background and keeps what it needs alive.
+		if (m_device)
+		{
+			shutdown_pipeline_archive();
+		}
+
 		if (m_residency)
 		{
 			if (m_queue) m_queue->removeResidencySet(m_residency);

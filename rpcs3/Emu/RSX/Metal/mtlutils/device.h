@@ -63,6 +63,9 @@ namespace mtl
 		MTL::Device* handle() const { return m_device; }
 		MTL4::CommandQueue* queue() const { return m_queue; }
 		MTL4::CommandQueue* async_queue() const { return m_async_queue; }
+		// Libraries and framework objects (MetalFX). Pipeline states are built with mtl::new_render_pipeline_state /
+		// new_compute_pipeline_state (MTLPipelineArchive.h), which use the persistent pipeline archive when enabled.
+		// destroy() shuts the pipeline archive down (bounded) before releasing anything.
 		MTL4::Compiler* compiler() const { return m_compiler; }
 		MTL::ResidencySet* residency_set() const { return m_residency; }
 

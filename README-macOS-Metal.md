@@ -91,7 +91,7 @@ logs, plus the zipped app when the build succeeds.
 
 ## Status of this branch
 
-Implemented (type-checked against metal-cpp 381 on Linux, **not yet compiled or run on a Mac**):
+Implemented (builds with Homebrew LLVM on macOS 26 and runs games on Apple silicon; still early, expect bugs):
 
 - Native Metal 4 renderer (`rpcs3/Emu/RSX/Metal`, see `DESIGN.md` there): MTL4 command queue/allocators/command
   buffers, argument tables, residency sets, shared-event timeline, explicit barriers; RSX shaders translated
@@ -107,6 +107,50 @@ Known gaps: shader interpreter not ported (async mode skips draws until a shader
 emulated, wide lines drawn 1 px, last-provoking-vertex flat shading falls back to smooth, async texture streaming
 off. Not done yet from the macOS-native list: Core Audio backend, GameController (DualSense), VideoToolbox, Vision,
 Mach VM/exception ports, signposts, single JIT arena for notarized hardened-runtime builds.
+
+## Defaults on this fork
+
+New installs start with these settings, and the first start of this version applies VSync and Output Scaling to an
+existing global configuration once (per-game configurations are left alone). Everything can still be changed in the
+settings.
+
+| Setting | Default | Why |
+|---|---|---|
+| VSync | Full | Presentation is paced to the display (ProMotion aware, see below) only with VSync on |
+| Output Scaling | MetalFX Spatial Upscaling (+ RCAS sharpening) | Stored as "FidelityFX Super Resolution" in config.yml; the RCAS slider at 0 turns sharpening off |
+| Anisotropic Filter | Automatic = 16x | Applied to every texture that can be filtered; pick a lower value to limit it, or Strict Rendering Mode for the PS3's own setting |
+| Pipeline archive | On | Compiled GPU pipelines are saved next to the shader cache, so later boots skip most compiles. `RPCS3_METAL_PIPELINE_ARCHIVE=0` turns it off |
+
+**ProMotion / frame pacing.** Each frame is held for a whole number of display refreshes with
+`presentAfterMinimumDuration` (60 fps on a 120 Hz panel = every other refresh, 30 fps = every 4th), instead of
+alternating between 1, 2 and 3 refreshes. Every 30 s the log gets a line starting with `Metal: presentation over`
+that counts how many refreshes each frame stayed on screen.
+
+## Metal features used (M1 and newer)
+
+The renderer requires the Metal 4 GPU family (Apple7 = M1 and newer) and checks newer families at run time.
+
+| Feature | Used | Notes |
+|---|---|---|
+| Metal 4 command queues, allocators, argument tables, `MTL4Compiler` | Yes | The whole renderer is Metal 4 |
+| Residency sets, explicit barriers, shared-event timeline | Yes | |
+| Pipeline binary archives (`MTL4Archive`, data-set serializer) | Yes | See Defaults |
+| Framebuffer fetch / programmable blending | Yes | PS3 blending edge cases and feedback loops |
+| BC1-BC3 (DXT) texture compression | Yes | PS3 compressed textures are sampled directly |
+| Lossless texture compression | Yes | Automatic on Private textures; the renderer avoids the usage flag that disables it |
+| 16x anisotropic filtering | Yes | |
+| MSAA (2x/4x) | Yes | PS3 MSAA surfaces |
+| Unified memory, no-copy buffers | Yes | Guest memory is mapped straight into GPU buffers |
+| MetalFX spatial upscaling (`MTL4FXSpatialScaler`) | Yes | Replaces FSR 1 |
+| `presentAfterMinimumDuration`, ProMotion refresh intervals | Yes | Frame pacing |
+| Depth bounds test | M5 (Apple10) only | Ignored on older GPUs |
+| Hardware sampler LOD bias | M5 (Apple10) only | Done in the shader on M1-M4 |
+| MetalFX temporal upscaling, frame interpolation, denoiser | No | Need motion vectors and a jittered camera from the game; PS3 games don't provide them |
+| Ray tracing, mesh shaders, tensors / ML in shaders | No | Nothing in RSX (the PS3 GPU) maps to them |
+| Lossy texture compression | No | Changes pixels the game may read back; not acceptable for emulation |
+| Sparse textures and buffers | No | Guest memory is already mapped with no copy |
+| Raster order groups, tile shaders, memoryless targets | No | Framebuffer fetch covers the blending cases; PS3 render targets must stay in memory |
+| HDR / EDR output | No | PS3 output is SDR |
 
 ## Testing the Metal renderer
 

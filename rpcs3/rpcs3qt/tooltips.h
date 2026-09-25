@@ -203,7 +203,11 @@ public:
 		const QString aspect_ratio               = tr("Leave this on 16:9 unless you have a 4:3 monitor.");
 		const QString frame_limit                = tr("Off is the fastest option.\nUsing the frame limiter will add extra overhead and slow down the game. However, some games will crash if the framerate is too high.\nPS3 native should only be used if Auto is not working correctly as it can introduce frame-pacing issues.\nInfinite adds a positive feedback loop which adds another vblank signal per frame allowing more games to be fps limitless.\nExperienced users with need of other frame limits should use the setting \"Second Frame Limit\" in the configuration file.");
 		const QString anti_aliasing              = tr("Emulate PS3 multisampling layout.\nCan fix some otherwise difficult to solve graphics glitches.\nLow to moderate performance hit depending on your GPU hardware.");
+#ifdef HAVE_METAL
+		const QString anisotropic_filter         = tr("Higher values increase sharpness of textures on sloped surfaces.\nOn the Metal renderer, Automatic applies 16x to every texture that can be filtered (Apple GPUs handle it at almost no cost).\nPick a lower value to limit it, or enable Strict Rendering Mode to use the original PS3 setting.");
+#else
 		const QString anisotropic_filter         = tr("Higher values increase sharpness of textures on sloped surfaces at the cost of GPU resources.\nModern GPUs can handle this setting just fine, even at 16x.\nKeep this on Automatic if you want to use the original setting used by a real PS3.");
+#endif
 		const QString resolution_scale           = tr("Scales the game's resolution by the given percentage.\nThe base resolution is always 1280x720.\nSet this value to 100% if you want to use the normal Resolution options.\nValues below 100% will usually not improve performance.");
 		const QString minimum_scalable_dimension = tr("Only framebuffers greater than this size will be upscaled.\nIncreasing this value might fix problems with missing graphics when upscaling, especially when Write Color Buffers is enabled.\nIf unsure, don't change this option.");
 		const QString dump_color                 = tr("Enable this option if you get missing graphics or broken lighting ingame.\nMight degrade performance and introduce stuttering in some cases.\nRequired for Demon's Souls.");
@@ -222,8 +226,13 @@ public:
 		const QString async_texture_streaming   = tr("Stream textures to GPU in parallel with 3D rendering using asynchronous compute.\nCan improve performance on more powerful GPUs that have spare headroom.\nOnly works with Vulkan renderer and greatly benefits from having MTRSX enabled if you have a capable CPU.");
 		const QString exclusive_fullscreen_mode = tr("Controls which fullscreen mode RPCS3 requests from drivers when using Vulkan renderer.\nAutomatic will let the driver choose an appropriate mode, while the other options will hint the drivers on whether they should use exclusive or borderless fullscreen.\nUsing Prefer borderless fullscreen option can help if you have issues with streaming RPCS3 gameplay or if your system incorrectly enables HDR mode when using fullscreen.");
 
+#ifdef HAVE_METAL
+		const QString output_scaling_mode = tr("Final image filtering. Nearest applies no filtering, Bilinear smooths the image, and MetalFX Spatial Upscaling enhances upscaled images.\nIf the game is rendering at an internal resolution lower than your window resolution, Apple's MetalFX spatial upscaler will handle the upscale, optionally followed by RCAS sharpening.\nMetalFX falls back to Bilinear when the image is not upscaled, while it prepares a new window size, and with stereo 3D output.");
+		const QString fsr_rcas_strength   = tr("Control the RCAS sharpening applied after MetalFX Spatial Upscaling. Higher values will give sharper output but may introduce artifacts.\nSet to 0 to disable sharpening.");
+#else
 		const QString output_scaling_mode = tr("Final image filtering. Nearest applies no filtering, Bilinear smooths the image, and FidelityFX Super Resolution enhances upscaled images.\nIf the game is rendering at an internal resolution lower than your window resolution, FidelityFX will handle the upscale.\nFidelityFX can cause visual artifacts.\nFidelityFX does not work with stereo 3D output for now.");
 		const QString fsr_rcas_strength   = tr("Control the sharpening strength applied by FidelityFX Super Resolution. Higher values will give sharper output but may introduce artifacts.");
+#endif
 
 		const QString texture_lod_bias = tr("Changes Texture sampling accuracy. (Small changes have a big effect.)\nAvoid using values outside the range of -12 to +12 if you're unsure.\n-3 to +3 is plenty for most usecases");
 

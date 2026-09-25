@@ -3,10 +3,13 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wold-style-cast"
 #import <AppKit/AppKit.h>
+#import <QuartzCore/QuartzCore.h>
 #import <QuartzCore/CAMetalLayer.h>
 #pragma GCC diagnostic pop
 
 #include <dispatch/dispatch.h>
+
+#include <mutex>
 
 namespace mtl
 {
@@ -98,5 +101,82 @@ namespace mtl
 		{
 			dispatch_async(dispatch_get_main_queue(), apply);
 		}
+	}
+
+	// Written by the main thread (request_surface_update), read by the RSX thread. Static storage: a block that runs
+	// after the renderer is gone still writes valid memory.
+	static std::mutex s_surface_mutex;
+	static surface_properties s_surface_properties;
+
+	void request_surface_update(void* ns_view, CA::MetalLayer* ca_layer)
+	{
+		NSView* view = (__bridge NSView*)ns_view;
+		CAMetalLayer* layer = (__bridge CAMetalLayer*)static_cast<void*>(ca_layer);
+		if (!view)
+		{
+			return;
+		}
+
+		// MRC: the block retains view and layer while it is queued
+		auto update = ^{
+			NSWindow* window = [view window];
+			NSScreen* screen = window ? [window screen] : nil;
+			if (!screen)
+			{
+				screen = [NSScreen mainScreen];
+			}
+
+			surface_properties props{};
+			props.backing_scale = window ? [window backingScaleFactor] : (screen ? [screen backingScaleFactor] : 1.0);
+			props.fullscreen = window && (([window styleMask] & NSWindowStyleMaskFullScreen) != 0);
+
+			if (screen)
+			{
+				props.min_refresh_interval = [screen minimumRefreshInterval];
+				props.max_refresh_interval = [screen maximumRefreshInterval];
+				props.update_granularity = [screen displayUpdateGranularity];
+			}
+
+			if (layer)
+			{
+				// Same source as the drawable size (QWindow size * devicePixelRatio == bounds * backingScaleFactor)
+				if (props.backing_scale > 0. && [layer contentsScale] != props.backing_scale)
+				{
+					[layer setContentsScale:props.backing_scale];
+				}
+
+				// Every drawable pixel is written, but the alpha channel of guest images is meaningless (X8R8G8B8).
+				// An opaque layer makes the compositor ignore it (no see-through/flicker), skips blending and is
+				// required for direct-to-display in fullscreen.
+				if (![layer isOpaque])
+				{
+					[layer setOpaque:YES];
+				}
+			}
+
+			std::lock_guard lock(s_surface_mutex);
+			props.serial = s_surface_properties.serial + 1;
+			s_surface_properties = props;
+		};
+
+		if ([NSThread isMainThread])
+		{
+			update();
+		}
+		else
+		{
+			dispatch_async(dispatch_get_main_queue(), update);
+		}
+	}
+
+	surface_properties get_surface_properties()
+	{
+		std::lock_guard lock(s_surface_mutex);
+		return s_surface_properties;
+	}
+
+	double get_media_time()
+	{
+		return CACurrentMediaTime();
 	}
 }

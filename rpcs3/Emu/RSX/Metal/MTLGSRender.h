@@ -108,6 +108,44 @@ private:
 	CA::MetalLayer* m_metal_layer = nullptr;     // Backing layer of m_view (retained, released on teardown)
 	bool m_layer_framebuffer_only = true;
 
+	// Presentation (MTLPresent.cpp). The frame's work, including the passes that composite the output into the frame
+	// context's present_image, runs on the main queue. A small present list on m_present_queue then waits for that
+	// work and for the drawable, copies the image into the drawable and presents it (paced). Drawable waits therefore
+	// never hold back the main queue (next frame, DMA readbacks the guest waits on).
+	MTL4::CommandQueue* m_present_queue = nullptr; // Device async queue, or the main queue if there is none. Not owned
+	mtl::timeline m_present_timeline;              // Signaled by the present lists
+
+	// Written by drawable presented handlers (any thread), read by the RSX thread (telemetry)
+	struct present_feedback_t
+	{
+		atomic_t<f64> refresh_interval{ 1. / 60. };  // Unit of the histogram
+		atomic_t<f64> last_presented_time{ 0. };     // presentedTime of the latest displayed drawable
+		std::array<atomic_t<u32>, 6> intervals{};    // On-screen time of displayed frames in refreshes: 1, 2, 3, 4, 5, 6+
+		atomic_t<u32> dropped{ 0 };                  // Drawables that were never displayed
+
+		void on_presented(f64 presented_time);
+	};
+	std::shared_ptr<present_feedback_t> m_present_feedback;
+
+	struct present_pacing_t
+	{
+		f64 refresh_interval = 1. / 60.;   // R: fastest refresh interval of the window's screen
+		bool variable_refresh = false;      // Adaptive-Sync/ProMotion screen (minimum != maximum refresh interval)
+		bool fullscreen = false;
+		u64 surface_serial = 0;             // Last mtl::surface_properties::serial applied
+		u64 surface_request_time = 0;       // get_system_time() of the last mtl::request_surface_update
+
+		u64 last_emu_flip_time = 0;         // get_system_time() of the previous guest flip
+		u64 blocked_time = 0;               // Presentation back-pressure (us) since the previous guest flip
+		std::array<f64, 16> guest_intervals{}; // Recent guest frame intervals without back-pressure (s), ring buffer
+		u32 guest_interval_count = 0;       // Valid entries in guest_intervals
+		u32 guest_interval_next = 0;        // Next write position in guest_intervals
+		f64 last_present_time = 0.;         // Media time of the previous present request
+		f64 min_duration = 0.;              // Last presentAfterMinimumDuration argument (0: unpaced present)
+		u32 slot_refreshes = 0;             // Last pacing slot in refreshes (0: unpaced or variable refresh)
+		u64 stats_time = 0;                 // Telemetry rate limit (get_system_time())
+	} m_present_pacing;
+
 	// Occlusion queries (visibility result buffers)
 	std::unique_ptr<mtl::query_pool_manager> m_occlusion_query_manager;
 	bool m_occlusion_query_active = false;
@@ -227,6 +265,11 @@ private:
 	void present(mtl::frame_context_t *ctx);
 	bool reinitialize_swapchain();
 	void configure_metal_layer();
+
+	// Presentation pacing (MTLPresent.cpp)
+	void update_present_pacing(bool emu_flip);
+	f64 get_guest_frame_interval() const;
+	void present_drawable(mtl::frame_context_t* ctx);
 
 	mtl::viewable_image* get_present_source(mtl::present_surface_info* info, const rsx::avconf& avconfig);
 

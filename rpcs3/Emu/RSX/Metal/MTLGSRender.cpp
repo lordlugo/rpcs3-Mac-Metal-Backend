@@ -442,15 +442,26 @@ MTLGSRender::MTLGSRender(utils::serial* ar) noexcept : GSRender(ar)
 		m_metal_layer->setMaximumDrawableCount(MTL_MAX_DRAWABLE_COUNT);
 		m_metal_layer->setAllowsNextDrawableTimeout(true);
 
-		// Drawables live in the layer's residency set; the queue must see it
+		// Drawables live in the layer's residency set; the queues must see it (attached to the main and async queues)
 		m_device->attach_residency_set(m_metal_layer->residencySet());
-		mtl::sync_layer_scale(m_view, m_metal_layer);
 	}
 	else
 	{
 		rsx_log.error("Metal: the game window has no CAMetalLayer. Nothing will be presented.");
 	}
 
+	// Present lists run on the device's second queue, so that waiting for a drawable never holds back the main queue
+	// (see MTLPresent.cpp). That queue has the global and the layer's residency sets attached.
+	m_present_queue = m_device->async_queue();
+	if (!m_present_queue)
+	{
+		rsx_log.warning("Metal: no second command queue. Drawable waits will delay the main queue.");
+		m_present_queue = m_device->queue();
+	}
+
+	m_present_timeline.create(*m_device, "RSX present timeline");
+
+	// Also applies contentsScale/opaque and samples the screen's refresh properties (main thread, asynchronously)
 	m_swapchain_dims.width = m_frame->client_width();
 	m_swapchain_dims.height = m_frame->client_height();
 	configure_metal_layer();
@@ -537,6 +548,7 @@ MTLGSRender::MTLGSRender(utils::serial* ar) noexcept : GSRender(ar)
 
 	spirv::initialize_compiler_context();
 	mtl::initialize_pipe_compiler(g_cfg.video.shader_compiler_threads_count);
+	mtl::initialize_pipeline_archive(); // Persistent pipeline binaries (MTLPipelineArchive.h); before any pipeline is built
 
 	m_prog_buffer = std::make_unique<mtl::program_cache>
 	(
@@ -644,12 +656,19 @@ MTLGSRender::~MTLGSRender()
 	mtl::destroy_overlay_passes();
 	mtl::destroy_compute_tasks();
 
-	// Frame contexts (drawables)
+	// Frame contexts (drawables, present images, present lists)
 	if (m_current_frame == &m_aux_frame_context)
 	{
 		// Return resources back to the owner
 		m_current_frame = &m_frame_context_storage[m_current_queue_index];
 		m_current_frame->grab_resources(m_aux_frame_context);
+	}
+
+	// The present queue is not covered by the waits above (bounded: this runs on the UI thread)
+	const bool present_queue_idle = m_present_timeline.wait(m_present_timeline.last_signaled_value(), TEARDOWN_WAIT_TIMEOUT);
+	if (!present_queue_idle)
+	{
+		rsx_log.error("Metal: the present queue did not finish outstanding work during shutdown; continuing anyway");
 	}
 
 	for (auto& ctx : m_frame_context_storage)
@@ -659,11 +678,27 @@ MTLGSRender::~MTLGSRender()
 			ctx.drawable->release();
 			ctx.drawable = nullptr;
 		}
+
+		if (ctx.present_command_buffer)
+		{
+			if (present_queue_idle)
+			{
+				// Retire the list (no GPU wait left). Otherwise destroy() performs its own bounded wait.
+				ctx.present_command_buffer->wait(TEARDOWN_WAIT_TIMEOUT);
+			}
+
+			ctx.present_command_buffer->destroy();
+			ctx.present_command_buffer.reset();
+		}
+
+		ctx.present_image.reset();
 	}
 
 	m_current_frame = nullptr;
 	m_queued_frames.clear();
 	m_frame_context_storage.clear();
+	m_present_timeline.destroy();
+	m_present_queue = nullptr;
 
 	// Caches
 	m_rtts.destroy();
@@ -726,6 +761,9 @@ MTLGSRender::~MTLGSRender()
 
 bool MTLGSRender::on_access_violation(u32 address, bool is_writing)
 {
+	// Runs on PPU/SPU threads, which have no autorelease pool of their own
+	mtl::autorelease_scope pool;
+
 	rsx::mm_flush(address);
 
 	mtl::texture_cache::thrashed_set result;
@@ -1116,12 +1154,16 @@ void MTLGSRender::on_init_thread()
 			m_shaders_cache->load(&dlg);
 		}
 	}
+
+	// Saves every pipeline built so far to the pipeline archive (background thread)
+	mtl::on_pipeline_cache_preloaded();
 }
 
 void MTLGSRender::on_exit()
 {
 	GSRender::on_exit();
 	mtl::destroy_pipe_compiler(); // Ensure no pending shaders being compiled
+	mtl::flush_pipeline_archive_async(); // Start saving pending pipelines; render_device::destroy() waits (bounded)
 	zcull_ctrl.release();
 }
 
@@ -1137,10 +1179,14 @@ void MTLGSRender::flush_command_queue(bool hard_sync, bool do_not_switch)
 		// Clear all command buffer statuses
 		m_primary_cb_list.poke_all();
 
-		// Drain present queue
+		// Drain present queue. The main-queue work is complete here, but present lists wait for their drawables, which
+		// the display releases at the paced rate: block (not spin) and count the wait as display back-pressure, so the
+		// pacing does not mistake it for a slow guest frame.
 		while (!m_queued_frames.empty())
 		{
-			check_present_status();
+			const u64 wait_start = get_system_time();
+			frame_context_cleanup(m_queued_frames.front()); // Bounded wait (FRAME_PRESENT_TIMEOUT); pops the frame
+			m_present_pacing.blocked_time += get_system_time() - wait_start;
 		}
 
 		m_flush_requests.clear_pending_flag();

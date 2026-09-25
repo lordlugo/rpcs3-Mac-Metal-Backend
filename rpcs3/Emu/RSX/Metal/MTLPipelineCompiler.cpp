@@ -118,8 +118,9 @@ namespace mtl
 		descriptor->setComputeFunctionDescriptor(function.get());
 		descriptor->setLabel(mtl::ns_str(cs.entry_point()));
 
+		// Through the pipeline archive (reuses binaries from earlier sessions, records new ones) when it is enabled
 		NS::Error* error = nullptr;
-		MTL::ComputePipelineState* pipeline = g_render_device->compiler()->newComputePipelineState(descriptor.get(), nullptr, &error);
+		MTL::ComputePipelineState* pipeline = mtl::new_compute_pipeline_state(descriptor.get(), &error);
 
 		if (!pipeline)
 		{
@@ -228,8 +229,10 @@ namespace mtl
 			}
 		}
 
+		// Through the pipeline archive (reuses binaries from earlier sessions, records new ones) when it is enabled.
+		// The descriptor must be a deterministic function of the shaders and `state`: it is the archive lookup key.
 		NS::Error* error = nullptr;
-		MTL::RenderPipelineState* pipeline = g_render_device->compiler()->newRenderPipelineState(descriptor.get(), nullptr, &error);
+		MTL::RenderPipelineState* pipeline = mtl::new_render_pipeline_state(descriptor.get(), &error);
 
 		if (!pipeline)
 		{

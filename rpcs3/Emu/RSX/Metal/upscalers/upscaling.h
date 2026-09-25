@@ -34,6 +34,10 @@ namespace mtl
 	{
 		virtual ~upscaler() {}
 
+		// Metal addition. Called once per presented frame before the output (drawable) is acquired. One-time or
+		// otherwise slow setup belongs here (or on a worker thread), never in scale_output().
+		virtual void prepare() {}
+
 		// Without UPSCALE_AND_COMMIT: returns an image holding the upscaled src (or src itself if the upscaler cannot
 		// do better than the sampler in the following pass). With UPSCALE_AND_COMMIT: draws src_area of the result
 		// into dst_area of present_surface and returns nullptr.
@@ -53,6 +57,7 @@ namespace mtl
 		const areai& src_area, const areai& dst_area, bool linear_filter);
 
 	// Creates the upscaler for the output scaling setting. output_scaling_mode::fsr maps to MetalFX spatial upscaling
-	// (falls back to bilinear at runtime if MetalFX is unavailable). Implemented in upscalers/metalfx_pass.cpp.
+	// followed by optional RCAS sharpening (falls back to bilinear at runtime whenever MetalFX cannot be used).
+	// Implemented in upscalers/metalfx_pass.cpp.
 	std::unique_ptr<upscaler> create_upscaler(output_scaling_mode mode);
 }

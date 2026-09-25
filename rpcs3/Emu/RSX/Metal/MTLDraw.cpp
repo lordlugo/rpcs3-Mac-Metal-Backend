@@ -757,7 +757,13 @@ void MTLGSRender::load_texture_env()
 			depth_compare_mode = mtl::get_compare_function(tex.zfunc(), true);
 		}
 
-		const f32 af_level = mtl::max_aniso(tex.max_aniso());
+		// Anisotropic filtering. On this fork "Automatic" (override 0) means 16x: every Apple GPU supports 16x and it is
+		// cheap on tile-based GPUs. An explicit override (1x-16x) or Strict Rendering Mode keeps the upstream behaviour.
+		f32 af_level = mtl::max_aniso(tex.max_aniso());
+		if (!g_cfg.video.strict_rendering_mode && g_cfg.video.anisotropic_level_override == 0u)
+		{
+			af_level = 16.f;
+		}
 		const auto wrap_s = mtl::mtl_wrap_mode(tex.wrap_s());
 		const auto wrap_t = mtl::mtl_wrap_mode(tex.wrap_t());
 		const auto wrap_r = mtl::mtl_wrap_mode(tex.wrap_r());
@@ -862,6 +868,14 @@ void MTLGSRender::load_texture_env()
 				min_lod = max_lod = lod_bias = 0.f;
 				min_filter.mipmap_mode = MTL::SamplerMipFilterNearest;
 			}
+		}
+
+		if (!can_sample_linear ||
+			(min_filter.filter == MTL::SamplerMinMagFilterNearest && mag_filter == MTL::SamplerMinMagFilterNearest))
+		{
+			// No anisotropy where the game (or the format) needs exact texels: extra taps would blend neighbours of
+			// point-sampled lookups, depth values reinterpreted as colour, and SNORM/SEXT-converted data.
+			af_level = 1.f;
 		}
 
 		mtl::sampler_create_info info{};

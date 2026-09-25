@@ -4,6 +4,7 @@
 // and build Metal 4 pipeline state objects, either inline (COMPILE_INLINE) or deferred with a completion callback.
 
 #include "MTLProgramPipeline.h"
+#include "MTLPipelineArchive.h" // Pipeline persistence hooks used by MTLGSRender (initialize/preloaded/flush)
 #include "Utilities/lockless.h"
 #include "Emu/RSX/Common/simple_array.hpp"
 

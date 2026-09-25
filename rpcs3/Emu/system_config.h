@@ -128,7 +128,12 @@ struct cfg_root : cfg::node
 		cfg::_enum<msaa_level> antialiasing_level{ this, "MSAA", msaa_level::_auto };
 		cfg::_enum<shader_mode> shadermode{ this, "Shader Mode", shader_mode::async_with_interpreter };
 		cfg::_enum<gpu_preset_level> shader_precision{ this, "Shader Precision", gpu_preset_level::high };
+#ifdef __APPLE__
+		// The Metal renderer paces presentation to the display (ProMotion aware) only with VSync enabled
+		cfg::_enum<vsync_mode> vsync{ this, "VSync Mode", vsync_mode::full, true };
+#else
 		cfg::_enum<vsync_mode> vsync{ this, "VSync Mode", vsync_mode::off, true };
+#endif
 
 		cfg::_bool write_color_buffers{ this, "Write Color Buffers" };
 		cfg::_bool write_depth_buffer{ this, "Write Depth Buffer" };
@@ -178,7 +183,13 @@ struct cfg_root : cfg::node
 		cfg::_bool host_label_synchronization{ this, "Allow Host GPU Labels", false };
 		cfg::_bool disable_msl_fast_math{ this, "Disable MSL Fast Math", false };
 		cfg::_bool disable_async_host_memory_manager{ this, "Disable Asynchronous Memory Manager", false, true };
+#ifdef __APPLE__
+		// The Metal renderer implements output_scaling_mode::fsr ("FidelityFX Super Resolution" in config.yml) as MetalFX
+		// spatial upscaling (+ RCAS sharpening). It falls back to bilinear whenever MetalFX cannot be used.
+		cfg::_enum<output_scaling_mode> output_scaling{ this, "Output Scaling Mode", output_scaling_mode::fsr, true };
+#else
 		cfg::_enum<output_scaling_mode> output_scaling{ this, "Output Scaling Mode", output_scaling_mode::bilinear, true };
+#endif
 		cfg::_bool record_with_overlays{ this, "Record With Overlays", true, true };
 		cfg::_bool disable_hardware_blending{ this, "Disable Hardware Blending", false, true };
 		cfg::_bool disable_hardware_texel_remapping{ this, "Disable Hardware ColorSpace Remapping", false, true };

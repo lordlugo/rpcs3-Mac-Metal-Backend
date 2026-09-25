@@ -688,6 +688,13 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 	const int fsr_sharpening_strength_def = stoi(m_emu_settings->GetSettingDefault(emu_settings_type::FsrSharpeningStrength));
 	const auto fmt_fsr_sharpening_strength = [fsr_sharpening_strength_def](int value)
 	{
+#ifdef HAVE_METAL
+		if (value == 0)
+		{
+			// The Metal renderer skips the RCAS pass after MetalFX at 0
+			return tr("Off");
+		}
+#endif
 		if (value == fsr_sharpening_strength_def)
 		{
 			return tr("%1% (Default)").arg(value);

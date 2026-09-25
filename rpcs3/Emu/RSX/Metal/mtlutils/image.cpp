@@ -42,6 +42,39 @@ namespace mtl
 		return result ? result : static_cast<u32>(aspect_color);
 	}
 
+	// Linear <-> sRGB twins. Metal does not require MTLTextureUsagePixelFormatView for views that only toggle sRGB.
+	static MTL::PixelFormat get_linear_format(MTL::PixelFormat format)
+	{
+		switch (format)
+		{
+		case MTL::PixelFormatR8Unorm_sRGB: return MTL::PixelFormatR8Unorm;
+		case MTL::PixelFormatRG8Unorm_sRGB: return MTL::PixelFormatRG8Unorm;
+		case MTL::PixelFormatRGBA8Unorm_sRGB: return MTL::PixelFormatRGBA8Unorm;
+		case MTL::PixelFormatBGRA8Unorm_sRGB: return MTL::PixelFormatBGRA8Unorm;
+		case MTL::PixelFormatBGR10_XR_sRGB: return MTL::PixelFormatBGR10_XR;
+		case MTL::PixelFormatBGRA10_XR_sRGB: return MTL::PixelFormatBGRA10_XR;
+		case MTL::PixelFormatBC1_RGBA_sRGB: return MTL::PixelFormatBC1_RGBA;
+		case MTL::PixelFormatBC2_RGBA_sRGB: return MTL::PixelFormatBC2_RGBA;
+		case MTL::PixelFormatBC3_RGBA_sRGB: return MTL::PixelFormatBC3_RGBA;
+		case MTL::PixelFormatBC7_RGBAUnorm_sRGB: return MTL::PixelFormatBC7_RGBAUnorm;
+		default: return format;
+		}
+	}
+
+	// True if a view of `view_format` on a texture of `image_format` changes the component layout, i.e. needs the
+	// texture to be created with MTLTextureUsagePixelFormatView. Not needed (MTLTextureUsage.pixelFormatView docs,
+	// same rules as MoltenVK): same format (swizzle, texture type, level/slice range only) and linear <-> sRGB views.
+	// Stencil-plane views of combined depth-stencil formats are treated as reinterpreting (MoltenVK does the same).
+	static bool is_reinterpreting_view(MTL::PixelFormat image_format, MTL::PixelFormat view_format)
+	{
+		return get_linear_format(image_format) != get_linear_format(view_format);
+	}
+
+	static bool is_combined_depth_stencil_format(MTL::PixelFormat format)
+	{
+		return (get_format_aspect(format) & aspect_depth_stencil) == aspect_depth_stencil;
+	}
+
 	void image::create_impl(const render_device& dev, const image_create_info& create_info)
 	{
 		info = create_info;
@@ -65,8 +98,20 @@ namespace mtl
 		}
 		desc->setArrayLength(array_length);
 
-		// Always allow format reinterpretation; RSX aliases surfaces between formats all the time.
-		desc->setUsage(info.usage | MTL::TextureUsagePixelFormatView);
+		// Lossless compression: Apple GPUs compress Private textures transparently (allowGPUOptimizedContents, left at
+		// its default of true) unless the usage forbids it. MTLTextureUsagePixelFormatView is one of the things that
+		// disables it, so it is only set where a view with another component layout can be created:
+		//  - requested by the creator through info.usage (texture cache images that may be sampled through an snorm
+		//    view, see MTLTextureCache.cpp),
+		//  - always for combined depth-stencil formats, whose stencil is sampled through an X32_Stencil8 view.
+		// RSX surface aliasing / typeless transfers never use views (they copy through buffers, see MTLTexture.cpp), and
+		// swizzle, sRGB, texture type and subresource range views do not need the flag.
+		if (is_combined_depth_stencil_format(info.format))
+		{
+			info.usage |= MTL::TextureUsagePixelFormatView;
+		}
+
+		desc->setUsage(info.usage);
 		desc->setStorageMode(info.storage == memory_location::host_visible ? MTL::StorageModeShared : MTL::StorageModePrivate);
 		desc->setHazardTrackingMode(MTL::HazardTrackingModeUntracked);
 
@@ -150,6 +195,15 @@ namespace mtl
 		}
 
 		info.format = view_format;
+
+		if (!(m_resource->info.usage & MTL::TextureUsagePixelFormatView) &&
+			is_reinterpreting_view(m_resource->format(), view_format)) [[unlikely]]
+		{
+			// Caller bug: the image must be created with MTLTextureUsagePixelFormatView (see image::create_impl).
+			// Without it the view may read the (losslessly compressed) texture with the wrong layout.
+			rsx_log.error("Metal: view format %d of texture '%s' (format %d) needs MTLTextureUsagePixelFormatView, which the texture was not created with",
+				static_cast<int>(view_format), m_resource->debug_name(), static_cast<int>(m_resource->format()));
+		}
 
 		value = m_resource->value->newTextureView(
 			view_format,

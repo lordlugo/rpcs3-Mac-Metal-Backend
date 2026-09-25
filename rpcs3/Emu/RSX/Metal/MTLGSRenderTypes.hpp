@@ -2,6 +2,7 @@
 
 #include "mtlutils/commands.h"
 #include "mtlutils/data_heap.h"
+#include "mtlutils/image.h"
 #include "MTLResourceManager.h"
 
 #include "Emu/RSX/Common/simple_array.hpp"
@@ -254,8 +255,17 @@ namespace mtl
 
 		rsx::flags32_t flags = 0;
 
+		// The list whose completion ends the frame: the present list (present queue) of a presented frame, otherwise
+		// the frame's last main-queue list. Everything the frame used may be recycled once it has completed.
 		command_buffer_chunk* swap_command_buffer = nullptr;
-		u64 swap_timeline_value = 0; // Timeline value signaled once the frame's GPU work completes (0 if unknown)
+		u64 swap_timeline_value = 0; // RSX timeline value signaled once the frame's main-queue work completes (0 if unknown)
+
+		// Presentation through the present queue (MTLPresent.cpp). The present passes of the frame composite the output
+		// into present_image (same size/format as the drawable) on the main queue; present_command_buffer waits for that
+		// work and for the drawable on the present queue, then copies the image into the drawable. Both are owned by the
+		// frame context and reused once swap_command_buffer has completed.
+		std::unique_ptr<viewable_image> present_image;
+		std::unique_ptr<command_buffer_chunk> present_command_buffer;
 
 		data_heap_manager::managed_heap_snapshot_t heap_snapshot;
 		u64 last_frame_sync_time = 0;

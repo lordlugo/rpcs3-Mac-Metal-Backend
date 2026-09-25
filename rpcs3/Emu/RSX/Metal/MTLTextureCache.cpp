@@ -75,7 +75,10 @@ namespace mtl
 			((static_cast<u64>(type) & 0xF) << 58);
 	}
 
-	static MTL::TextureUsage get_texture_cache_usage(MTL::PixelFormat format)
+	// `shader_read_section`: image of a texture_upload_context::shader_read section. MTLGSRender::load_texture_env may
+	// sample those through an snorm/sRGB view (image_view::as, hardware texel remapping); no other image of the
+	// texture cache is ever viewed with another format.
+	static MTL::TextureUsage get_texture_cache_usage(MTL::PixelFormat format, bool shader_read_section)
 	{
 		// Render target usage lets the image be cleared (loadAction=Clear) and be the destination of scaled blits
 		MTL::TextureUsage usage = MTL::TextureUsageShaderRead;
@@ -83,6 +86,16 @@ namespace mtl
 		{
 			usage |= MTL::TextureUsageRenderTarget;
 		}
+
+		// An snorm view changes the component type and needs MTLTextureUsagePixelFormatView, which disables lossless
+		// compression, so only formats with an snorm twin get it. sRGB views need no flag. Decided independently of
+		// texture_create_flags::mutable_format: "Disable Hardware ColorSpace Remapping" can be toggled at runtime while
+		// sections and pooled images live on.
+		if (shader_read_section && get_compatible_snorm_format(format) != MTL::PixelFormatInvalid)
+		{
+			usage |= MTL::TextureUsagePixelFormatView;
+		}
+
 		return usage;
 	}
 
@@ -711,7 +724,7 @@ namespace mtl
 			info.mipmaps = mips;
 			info.layers = layers;
 			info.samples = 1;
-			info.usage = usage_flags | get_texture_cache_usage(format);
+			info.usage = usage_flags | get_texture_cache_usage(format, false);
 			info.storage = memory_location::device_local;
 			info.format_class = format_class;
 
@@ -734,7 +747,7 @@ namespace mtl
 		const copy_region_descriptor* copy)
 	{
 		const MTL::PixelFormat dst_format = mtl::get_compatible_sampler_format(gcm_format);
-		const MTL::TextureUsage usage_flags = get_texture_cache_usage(dst_format);
+		const MTL::TextureUsage usage_flags = get_texture_cache_usage(dst_format, false);
 		const u16 layers = (image_type == MTL::TextureTypeCube) ? 6 : 1;
 
 		// Provision
@@ -1019,6 +1032,13 @@ namespace mtl
 			}
 			// NOTE: texture_create_flags::shareable (VK concurrent sharing for the async queue) has no Metal equivalent.
 
+			if (image && !(image->info.usage & MTL::TextureUsagePixelFormatView) &&
+				(get_texture_cache_usage(image->format(), context == rsx::texture_upload_context::shader_read) & MTL::TextureUsagePixelFormatView))
+			{
+				// E.g. a blit_engine_dst section re-uploaded as shader_read: may now need an snorm view
+				reusable = false;
+			}
+
 			if (!reusable || !image || region.get_image_type() != type || image->depth() != depth) // TODO
 			{
 				// Incompatible view/type
@@ -1054,10 +1074,9 @@ namespace mtl
 		if (!image)
 		{
 			const MTL::PixelFormat mtl_format = get_compatible_sampler_format(gcm_format);
-			const MTL::TextureUsage usage_flags = get_texture_cache_usage(mtl_format);
-
-			// NOTE: texture_create_flags::mutable_format needs no special handling. Every Metal image is created with
-			// MTLTextureUsagePixelFormatView so sRGB/snorm reinterpretation views are always allowed.
+			// NOTE: texture_create_flags::mutable_format is not consulted, see get_texture_cache_usage. Pooled images
+			// are only reused if they have every requested usage bit, including MTLTextureUsagePixelFormatView.
+			const MTL::TextureUsage usage_flags = get_texture_cache_usage(mtl_format, context == rsx::texture_upload_context::shader_read);
 
 			if (auto found = find_cached_image(mtl_format, width, height, depth, mipmaps, image_type, usage_flags))
 			{
