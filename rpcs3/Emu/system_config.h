@@ -127,7 +127,7 @@ struct cfg_root : cfg::node
 		cfg::_float<0, 1000> second_frame_limit{ this, "Second Frame Limit", 0, true }; // 0 disables its effect
 		cfg::_enum<msaa_level> antialiasing_level{ this, "MSAA", msaa_level::_auto };
 		cfg::_enum<shader_mode> shadermode{ this, "Shader Mode", shader_mode::async_with_interpreter };
-		cfg::_enum<gpu_preset_level> shader_precision{ this, "Shader Precision", gpu_preset_level::high };
+		cfg::_enum<gpu_preset_level> shader_precision{ this, "Shader Precision", gpu_preset_level::ultra };
 #ifdef __APPLE__
 		// The Metal renderer paces presentation to the display (ProMotion aware) only with VSync enabled
 		cfg::_enum<vsync_mode> vsync{ this, "VSync Mode", vsync_mode::full, true };
@@ -175,7 +175,7 @@ struct cfg_root : cfg::node
 		cfg::_bool precise_zpass_count{ this, "Accurate ZCULL stats", true };
 		cfg::_int<1, 8> consecutive_frames_to_draw{ this, "Consecutive Frames To Draw", 1, true};
 		cfg::_int<1, 8> consecutive_frames_to_skip{ this, "Consecutive Frames To Skip", 1, true};
-		cfg::uint<25, 800> resolution_scale_percent{ this, "Resolution Scale", 100, true };
+		cfg::uint<25, 800> resolution_scale_percent{ this, "Resolution Scale", 200, true };
 		cfg::uint<0, 16> anisotropic_level_override{ this, "Anisotropic Filter Override", 0, true };
 		cfg::_float<-32, 32> texture_lod_bias{ this, "Texture LOD Bias Addend", 0, true };
 		cfg::uint<1, 1024> min_scalable_dimension{ this, "Minimum Scalable Dimension", 16, true };

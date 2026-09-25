@@ -126,6 +126,8 @@ settings.
 | Setting | Default | Why |
 |---|---|---|
 | VSync | Full | Presentation is paced to the display (ProMotion aware, see below) only with VSync on |
+| Shader Quality | Ultra | Full-precision 3-component dot products are built from fused multiply-adds, matching the RSX more closely; the cost on Apple GPUs is negligible |
+| Resolution Scale | 200% (2560x1440) | Sharp on Retina displays while leaving GPU headroom; MetalFX takes it the rest of the way to the window |
 | Output Scaling | MetalFX Spatial Upscaling (+ RCAS sharpening) | Stored as "FidelityFX Super Resolution" in config.yml; the RCAS slider at 0 turns sharpening off. Runs whenever the image is upscaled to the window; when the resolution scale makes the image larger than the window, it is scaled down with a bilinear draw |
 | Anisotropic Filter | Automatic = 16x | Applied to the game's textures (not to render targets read by effects); pick a lower value to limit it, or Strict Rendering Mode for the PS3's own setting |
 | Pipeline archive | On | Compiled GPU pipelines are saved next to the shader cache, so later boots skip most compiles. `RPCS3_METAL_PIPELINE_ARCHIVE=0` turns it off |

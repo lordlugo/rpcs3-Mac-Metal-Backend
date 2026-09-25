@@ -553,6 +553,19 @@ void Emulator::Init()
 				g_cfg.audio.renderer.set(audio_renderer::core_audio);
 			}
 		}},
+		{ "metal-fork-defaults-v4", "Shader Quality: Ultra, Resolution Scale: 200%", []()
+		{
+			// Only replace the previous defaults; a value the user picked is kept
+			if (g_cfg.video.shader_precision.get() == gpu_preset_level::high)
+			{
+				g_cfg.video.shader_precision.set(gpu_preset_level::ultra);
+			}
+
+			if (g_cfg.video.resolution_scale_percent.get() == 100)
+			{
+				g_cfg.video.resolution_scale_percent.set(200);
+			}
+		}},
 	};
 
 	for (const fork_defaults_t& defaults : fork_defaults)
