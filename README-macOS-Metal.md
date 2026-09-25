@@ -120,8 +120,9 @@ programs" (writes GLSL and MSL to `~/Library/Caches/rpcs3-metal/shaderlog`). The
 
 ## Reporting build or runtime problems
 
+`build-macos.sh` writes everything it prints to `build-macos.log` in the repository root.
+
 ```sh
-./build-macos.sh 2>&1 | tee build.log
-grep -n "error:" build.log | head -50      # compile errors
+grep -n "error:" build-macos.log | head -50      # compile errors
 grep -n "Metal\|MSL\|MTL" ~/Library/Caches/rpcs3-metal/RPCS3.log | head -100   # renderer messages
 ```

@@ -725,6 +725,14 @@ if(TARGET 3rdparty_metal)
         SKIP_PRECOMPILE_HEADERS ON
     )
 
+    # metal-cpp includes <objc/runtime.h>, which declares a global `typedef struct objc_method* Method;`. RSX's
+    # gcm_enums.h ends with a global `using namespace gcm;` that also makes `gcm::Method` visible, so objc/runtime.h
+    # fails to parse ("reference to 'Method' is ambiguous") whenever an RSX header is seen before metal-cpp. Parse the
+    # Objective-C runtime header first in every Metal TU so include order no longer matters.
+    # Appended after the per-file COMPILE_OPTIONS above, which would otherwise replace it. (MTLImpl.cpp is unaffected:
+    # the *_PRIVATE_IMPLEMENTATION macros only matter for metal-cpp's own headers.)
+    set_property(SOURCE ${RPCS3_METAL_SOURCES} APPEND PROPERTY COMPILE_OPTIONS -include objc/runtime.h)
+
     target_link_libraries(rpcs3_emu
         PUBLIC
             3rdparty::metal         # HAVE_METAL=1 (must be visible to rpcs3qt/system_config.h users), metal-cpp, frameworks

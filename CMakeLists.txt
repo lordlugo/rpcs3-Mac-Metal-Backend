@@ -102,6 +102,9 @@ if(APPLE AND CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
     list(APPEND CMAKE_SYSTEM_PREFIX_PATH "/opt/homebrew")
 endif()
 
+# RPCS3 Metal fork: Homebrew headers must never shadow bundled or SDK headers
+include("${CMAKE_CURRENT_SOURCE_DIR}/buildfiles/cmake/ForkMacOSHomebrew.cmake")
+
 if(MSVC)
     add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/wd4530;/utf-8>") # C++ exception handler used, but unwind semantics are not enabled
 endif()

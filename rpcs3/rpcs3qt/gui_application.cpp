@@ -66,7 +66,7 @@
 #endif
 
 #if defined(HAVE_METAL)
-#include "Emu/RSX/Metal/MTLGSRender.h"
+#include "Emu/RSX/Metal/MTLDeviceQuery.h"
 #endif
 
 #ifdef _WIN32
@@ -815,7 +815,7 @@ void gui_application::create_callbacks()
 		case video_renderer::metal:
 		{
 #if defined(HAVE_METAL)
-			g_fxo->init<rsx::thread, named_thread<MTLGSRender>>(ar);
+			mtl::create_render_thread(ar);
 #endif
 			break;
 		}

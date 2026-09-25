@@ -57,6 +57,11 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
+# Everything this script prints also goes to build-macos.log next to it (full compile errors, for bug reports)
+LOG_FILE="$ROOT/build-macos.log"
+exec > >(tee "$LOG_FILE") 2>&1
+echo "==> Full log: $LOG_FILE"
+
 # ---------------------------------------------------------------------------------------------------------------------
 # Host checks: macOS 26+, native arm64 (not Rosetta), Xcode command line tools, Homebrew
 # ---------------------------------------------------------------------------------------------------------------------
@@ -237,7 +242,7 @@ if [[ -n "${JOBS:-}" ]]; then
 fi
 if ! cmake --build "$BUILD_DIR" ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} -- -k 0; then
     echo >&2
-    die "build failed; see the 'error:' lines above (tip: ./build-macos.sh 2>&1 | tee build.log; grep -n 'error:' build.log)"
+    die "build failed; see the 'error:' lines above or in $LOG_FILE (grep -n 'error:' build-macos.log)"
 fi
 
 APP="$BUILD_DIR/bin/rpcs3.app"

@@ -131,3 +131,12 @@ SPIRV-Cross throws `spirv_cross::CompilerError`; the translation TU (`MTLShaderC
 No macOS toolchain in the dev container. `/home/claude/mtl-check.sh <files>` type-checks with clang against the real
 metal-cpp headers and stub Apple SDK headers (RPCS3 warning-as-error set included). Every `.cpp` must pass it.
 `.mm` files cannot be checked here — keep them tiny.
+
+Include-order pitfalls found on the first real macOS builds:
+
+- `<objc/runtime.h>` (pulled in by metal-cpp) declares a global `Method` typedef, and `gcm_enums.h` ends with a global
+  `using namespace gcm;` (which contains `gcm::Method`). CMake force-includes `objc/runtime.h` into every file under
+  `RSX/Metal/` so the order of includes doesn't matter. Code outside this folder must not include metal-cpp; UI code
+  goes through `MTLDeviceQuery.h`, which declares `mtl::create_render_thread()`.
+- Homebrew's `/opt/homebrew/include` is searched last (`-idirafter`, see `buildfiles/cmake/ForkMacOSHomebrew.cmake`)
+  so Homebrew copies of bundled libraries (protobuf, libpng, ...) can't replace the bundled headers.
