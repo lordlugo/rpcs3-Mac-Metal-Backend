@@ -1190,7 +1190,14 @@ namespace mtl
 			{
 				caps.supports_byteswap = (image_linear_size >= 1024) || (image_setup_flags & source_is_gpu_resident);
 				caps.supports_hw_deswizzle = caps.supports_byteswap;
-				caps.supports_zero_copy = caps.supports_byteswap;
+
+				// No zero-copy uploads: with a passthrough DMA buffer the GPU would read the texture from guest memory
+				// when the command list executes, possibly frames after the RSX reached the draw and after the game was
+				// told (texture read semaphore) that it may overwrite the memory. Video players decode the next frame
+				// into the same buffer (Bink on SPU, cellVdec): the GPU then copies a half-written frame, which shows as
+				// tearing, blocky frames and flicker. The data is copied into the upload heap here instead, which is what
+				// the RSX would have read at this point (a memcpy; Apple silicon copies tens of GB/s).
+				caps.supports_zero_copy = false;
 				caps.supports_vtc_decoding = false;
 				check_hw_caps = false;
 			}

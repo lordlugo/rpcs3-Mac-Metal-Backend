@@ -1011,12 +1011,11 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 	});
 
 	EnhanceComboBox(emu_settings_type::AudioChannelLayout, ui->combo_audio_channel_layout, tooltips.settings.audio_channel_layout, ui->gb_audio_channel_layout);
-	connect(ui->combo_audio_format, &QComboBox::currentIndexChanged, this, [this](int index)
-	{
-		const auto [text, value] = get_data(ui->combo_audio_format, index);
-		ui->list_audio_formats->setEnabled(static_cast<audio_format>(value) == audio_format::manual);
-	});
 	EnhanceComboBox(emu_settings_type::AudioFormat, ui->combo_audio_format, tooltips.settings.audio_format, ui->gb_audio_format);
+
+	// The format list stays usable in every mode (a disabled list ignores clicks, which looks like broken check boxes).
+	// Ticking or unticking a format is a manual selection, so the audio format switches to "Manual" (see below).
+	ui->list_audio_formats->setEnabled(true);
 
 	// Manual audio format selection
 	const std::string audio_formats_str = m_emu_settings->GetSetting(emu_settings_type::AudioFormats);
@@ -1049,8 +1048,25 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 		}
 		ui->list_audio_formats->addItem(item);
 	}
+	connect(ui->list_audio_formats, &QListWidget::itemChanged, this, [this](QListWidgetItem* item)
+	{
+		if (!item || item->data(Qt::UserRole).toUInt() == static_cast<u32>(audio_format_flag::lpcm_2_48khz))
+		{
+			return;
+		}
+
+		// The selection only applies in "Manual" mode
+		if (const int manual_index = find_item(ui->combo_audio_format, static_cast<int>(audio_format::manual));
+			manual_index >= 0 && ui->combo_audio_format->currentIndex() != manual_index)
+		{
+			ui->combo_audio_format->setCurrentIndex(manual_index);
+		}
+	});
 	connect(this, &settings_dialog::signal_restore_dependant_defaults, this, [this]()
 	{
+		// Restoring the defaults is not a manual selection (no switch to "Manual")
+		const QSignalBlocker blocker(ui->list_audio_formats);
+
 		const u32 default_audio_formats = std::stoi(m_emu_settings->GetSettingDefault(emu_settings_type::AudioFormats));
 		for (int i = 0; i < ui->list_audio_formats->count(); ++i)
 		{

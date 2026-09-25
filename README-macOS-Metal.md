@@ -129,8 +129,9 @@ The Core Audio renderer (Settings > Audio > Renderer, default on macOS) outputs 
 mixes: 48 kHz, 32-bit float, no resampling and no processing for stereo. When the output device supports 48 kHz it is
 switched to 48 kHz while RPCS3 uses it and switched back afterwards (other apps are resampled by macOS meanwhile).
 
-Surround: pick the formats the game may use under Settings > Audio > Audio Format (Linear PCM 5.1/7.1, Dolby Digital,
-DTS; the emulated system mixes Dolby and DTS as 5.1 PCM, like the real console does before encoding). Then:
+Surround: tick the formats the game may use in the list under Settings > Audio > Audio Format (Linear PCM 5.1/7.1,
+Dolby Digital, DTS; the emulated system mixes Dolby and DTS as 5.1 PCM, like the real console does before encoding).
+Ticking a format sets Audio Format to Manual, which is the mode that uses the list. Then:
 
 - **AirPods and other headphones**: the 5.1/7.1 channels are rendered as a virtual speaker set around you with Apple's
   spatial audio renderer (AUSpatialMixer). Head tracking and your personalized spatial audio profile need an app signed
@@ -157,6 +158,20 @@ skipped (missing geometry for a moment the first time an effect appears). The re
 for such pipelines before skipping, and compiled pipelines are saved to the pipeline archive, so later sessions
 start with them.
 
+**Videos and cutscenes.** Texture uploads are copied out of guest memory when the RSX reaches the draw, instead of
+letting the GPU read guest memory later ("zero-copy"). Video players (Bink, the PS3's video decoder) decode the next
+frame into the same buffer as soon as the RSX has read the current one; with zero-copy the GPU could read a frame that
+was half overwritten, which showed as tearing, blocky frames and flicker during videos.
+
+**Colors.** The game image is tagged as sRGB, so macOS color-matches it to the display like any other SDR content.
+Before, it was shown untagged, which on P3 and XDR displays (every recent MacBook Pro, iMac and Studio Display) made
+colors more saturated and contrast different from the same game on a TV or on other Macs. No setting needed.
+
+**Check boxes on macOS 26/27.** Qt draws check boxes and radio buttons by rendering an AppKit button into the widget;
+with the Liquid Glass controls (always on macOS 27, where the Info.plist compatibility key is ignored) the tick is not
+drawn, so ticked boxes looked empty (game patches, settings, format lists). RPCS3 now paints these indicators itself
+in the macOS look (accent color, white tick) and leaves the rest of the native style alone.
+
 **ProMotion / frame pacing.** Each frame is held for a whole number of display refreshes with
 `presentAfterMinimumDuration` (60 fps on a 120 Hz panel = every other refresh, 30 fps = every 4th), instead of
 alternating between 1, 2 and 3 refreshes. Every 30 s the log gets a line starting with `Metal: presentation over`
@@ -176,7 +191,7 @@ The renderer requires the Metal 4 GPU family (Apple7 = M1 and newer) and checks 
 | Lossless texture compression | Yes | Automatic on Private textures; the renderer avoids the usage flag that disables it |
 | 16x anisotropic filtering | Yes | |
 | MSAA (2x/4x) | Yes | PS3 MSAA surfaces |
-| Unified memory, no-copy buffers | Yes | Guest memory is mapped straight into GPU buffers |
+| Unified memory, no-copy buffers | Yes | Guest memory is mapped straight into GPU buffers (texture uploads are copied, see Videos and cutscenes) |
 | MetalFX spatial upscaling (`MTL4FXSpatialScaler`) | Yes | Replaces FSR 1 |
 | `presentAfterMinimumDuration`, ProMotion refresh intervals | Yes | Frame pacing |
 | Depth bounds test | M5 (Apple10) only | Ignored on older GPUs |
@@ -186,7 +201,7 @@ The renderer requires the Metal 4 GPU family (Apple7 = M1 and newer) and checks 
 | Lossy texture compression | No | Changes pixels the game may read back; not acceptable for emulation |
 | Sparse textures and buffers | No | Guest memory is already mapped with no copy |
 | Raster order groups, tile shaders, memoryless targets | No | Framebuffer fetch covers the blending cases; PS3 render targets must stay in memory |
-| HDR / EDR output | No | PS3 output is SDR |
+| HDR / EDR output | No | PS3 output is SDR; the layer is tagged sRGB so macOS color-matches it on P3/XDR displays |
 
 ## Testing the Metal renderer
 

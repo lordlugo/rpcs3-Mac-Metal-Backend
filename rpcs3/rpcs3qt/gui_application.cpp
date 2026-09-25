@@ -52,6 +52,10 @@
 #include <QTextDocument>
 #include <QStyleFactory>
 #include <QStyleHints>
+#include <QStyleOption>
+#include <QProxyStyle>
+#include <QPainter>
+#include <QPainterPath>
 
 #include <clocale>
 
@@ -1214,6 +1218,159 @@ void gui_application::StopPlaytime()
 	m_timer_playtime.invalidate();
 }
 
+#ifdef __APPLE__
+namespace
+{
+	// Qt's macOS style draws check boxes and radio buttons by rendering an NSButton cell into the widget
+	// (drawInteriorWithFrame). With the Liquid Glass controls (macOS 26 without the compatibility mode, always on macOS 27,
+	// which ignores UIDesignRequiresCompatibility) the cell no longer draws its checked state that way: a ticked box looks
+	// empty, in the patch manager, the settings, every list with check boxes. These indicators are painted here in the
+	// look of macOS (accent color, white check mark) instead. Everything else stays native.
+	class mac_indicator_style final : public QProxyStyle
+	{
+	public:
+		explicit mac_indicator_style(QStyle* base)
+			: QProxyStyle(base)
+		{
+		}
+
+		void drawPrimitive(PrimitiveElement element, const QStyleOption* option, QPainter* painter, const QWidget* widget) const override
+		{
+			if (option && painter)
+			{
+				switch (element)
+				{
+				case PE_IndicatorCheckBox:
+				case PE_IndicatorItemViewItemCheck:
+					draw_indicator(false, *option, *painter);
+					return;
+				case PE_IndicatorRadioButton:
+					draw_indicator(true, *option, *painter);
+					return;
+				default:
+					break;
+				}
+			}
+
+			QProxyStyle::drawPrimitive(element, option, painter, widget);
+		}
+
+	private:
+		static void draw_indicator(bool radio, const QStyleOption& option, QPainter& painter)
+		{
+			const QPalette& palette = option.palette;
+			const State state = option.state;
+			const bool enabled = state.testFlag(State_Enabled);
+			const bool mixed = !radio && state.testFlag(State_NoChange);
+			const bool on = mixed || state.testFlag(State_On);
+			const bool pressed = enabled && state.testFlag(State_Sunken);
+			const bool dark = palette.color(QPalette::Window).lightness() < 128;
+
+			// The selected row of a list is already filled with the accent color: invert the check box there
+			const bool on_selection = state.testFlag(State_Selected) && qstyleoption_cast<const QStyleOptionViewItem*>(&option);
+
+			QColor accent = palette.color(QPalette::Active, QPalette::Accent);
+			if (!accent.isValid() || accent.alpha() == 0)
+			{
+				accent = palette.color(QPalette::Active, QPalette::Highlight);
+			}
+
+			QColor fill;
+			QColor border;
+			const QColor mark = on_selection ? accent : QColor(Qt::white);
+
+			if (on)
+			{
+				fill = on_selection ? QColor(Qt::white) : accent;
+				border = fill.darker(dark ? 100 : 112);
+
+				if (pressed)
+				{
+					fill = fill.darker(120);
+				}
+			}
+			else
+			{
+				fill = pressed ? (dark ? QColor(255, 255, 255, 70) : QColor(222, 222, 222)) : (dark ? QColor(255, 255, 255, 36) : QColor(Qt::white));
+				border = on_selection ? QColor(255, 255, 255, 200) : (dark ? QColor(255, 255, 255, 90) : QColor(0, 0, 0, 80));
+			}
+
+			// Centered square, one pixel of room on every side for the antialiased edge
+			const qreal side = std::max(8.0, std::min(option.rect.width(), option.rect.height()) - 2.0);
+			QRectF box(0.0, 0.0, side, side);
+			box.moveCenter(QRectF(option.rect).center());
+
+			painter.save();
+			painter.setRenderHint(QPainter::Antialiasing, true);
+
+			if (!enabled)
+			{
+				painter.setOpacity(painter.opacity() * 0.45);
+			}
+
+			const QRectF frame = box.adjusted(0.5, 0.5, -0.5, -0.5);
+			painter.setPen(QPen(border, 1.0));
+			painter.setBrush(fill);
+
+			if (radio)
+			{
+				painter.drawEllipse(frame);
+			}
+			else
+			{
+				const qreal radius = side * 0.22;
+				painter.drawRoundedRect(frame, radius, radius);
+			}
+
+			if (on)
+			{
+				if (radio)
+				{
+					QRectF dot(0.0, 0.0, side * 0.4, side * 0.4);
+					dot.moveCenter(box.center());
+					painter.setPen(Qt::NoPen);
+					painter.setBrush(mark);
+					painter.drawEllipse(dot);
+				}
+				else
+				{
+					painter.setPen(QPen(mark, std::max(1.5, side * 0.13), Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+					painter.setBrush(Qt::NoBrush);
+
+					if (mixed)
+					{
+						const qreal y = box.center().y();
+						painter.drawLine(QPointF(box.left() + side * 0.27, y), QPointF(box.right() - side * 0.27, y));
+					}
+					else
+					{
+						QPainterPath check;
+						check.moveTo(box.left() + side * 0.26, box.top() + side * 0.53);
+						check.lineTo(box.left() + side * 0.43, box.top() + side * 0.70);
+						check.lineTo(box.left() + side * 0.75, box.top() + side * 0.31);
+						painter.drawPath(check);
+					}
+				}
+			}
+
+			painter.restore();
+		}
+	};
+}
+#endif
+
+// Platform fixes for a Qt style (takes ownership of the style)
+static QStyle* apply_style_fixes(QStyle* style)
+{
+#ifdef __APPLE__
+	if (style && style->name().compare(QStringLiteral("macos"), Qt::CaseInsensitive) == 0)
+	{
+		return new mac_indicator_style(style);
+	}
+#endif
+	return style;
+}
+
 /*
 * Handle a request to change the stylesheet based on the current entry in the settings.
 */
@@ -1270,7 +1427,7 @@ void gui_application::OnChangeStyleSheetRequest()
 	// Reset style to default before doing anything else, or we will get unexpected effects in custom stylesheets.
 	if (QStyle* style = QStyleFactory::create(m_default_style))
 	{
-		setStyle(style);
+		setStyle(apply_style_fixes(style));
 	}
 
 	const auto match_native_style = [&stylesheet_name]() -> QString
@@ -1307,7 +1464,7 @@ void gui_application::OnChangeStyleSheetRequest()
 		{
 			gui_log.notice("Using native style '%s'", native_style);
 			setStyleSheet("/* none */");
-			setStyle(style);
+			setStyle(apply_style_fixes(style));
 		}
 		else
 		{

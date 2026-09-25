@@ -152,6 +152,21 @@ namespace mtl
 				{
 					[layer setOpaque:YES];
 				}
+
+				// The emulated video output is sRGB (Rec.709 primaries). Tag the layer so macOS color-matches it to the
+				// display like any other sRGB content: an untagged layer is shown in the display's own gamut, which on
+				// P3/XDR screens oversaturates every color and shifts contrast compared with the rest of the desktop.
+				static CGColorSpaceRef s_srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+				if (s_srgb && (![layer colorspace] || !CFEqual([layer colorspace], s_srgb)))
+				{
+					[layer setColorspace:s_srgb];
+				}
+
+				// SDR output: no extended range (EDR would let values above 1.0 through and change tone mapping)
+				if ([layer wantsExtendedDynamicRangeContent])
+				{
+					[layer setWantsExtendedDynamicRangeContent:NO];
+				}
 			}
 
 			std::lock_guard lock(s_surface_mutex);
