@@ -9,12 +9,12 @@ with a **native Metal 4 backend**. Metal is the only renderer: Vulkan/MoltenVK a
 - A Mac with Apple silicon (M1 or newer). Intel Macs are not supported.
 - macOS 26.0 or newer.
 - Xcode 26 or its command line tools (`xcode-select --install`).
-- [Homebrew](https://brew.sh) (in `/opt/homebrew`).
+- [Homebrew](https://brew.sh) (any prefix; `brew` must be on your `PATH`).
 
 ## Building
 
 ```sh
-git clone <this repository> rpcs3-metal
+git clone -b metal-backend https://github.com/lordlugo/rpcs3-Mac-Metal-Backend.git rpcs3-metal
 cd rpcs3-metal
 ./build-macos.sh --deps   # installs cmake, ninja, ccache, llvm, qt, sdl3, pkg-config, abseil via Homebrew
 ./build-macos.sh          # initialises the needed submodules, configures and builds (RelWithDebInfo)
@@ -79,3 +79,44 @@ arm64 runner (Release by default; other build types can be picked when starting 
 Metal backend objects first (`metal-compile.log`), then the whole project
 (`full-build.log`), collects all compiler errors in `errors.txt` (also shown as annotations) and uploads the
 logs, plus the zipped app when the build succeeds.
+
+## Status of this branch
+
+Implemented (type-checked against metal-cpp 381 on Linux, **not yet compiled or run on a Mac**):
+
+- Native Metal 4 renderer (`rpcs3/Emu/RSX/Metal`, see `DESIGN.md` there): MTL4 command queue/allocators/command
+  buffers, argument tables, residency sets, shared-event timeline, explicit barriers; RSX shaders translated
+  GLSL -> SPIR-V -> MSL (SPIRV-Cross) and compiled with `MTL4Compiler` on worker threads; texture cache and surface
+  cache (D24S8 stored as Depth32Float_Stencil8), zero-copy guest memory DMA, compute kernels, native overlays/UI,
+  MSAA resolve, occlusion queries, CAMetalLayer presentation, MetalFX spatial upscaling (the "FSR" setting).
+- Programmable blending through framebuffer fetch, feedback loops by render pass splits (counted in the debug
+  overlay), shader-side sampler LOD bias on M1-M4, depth bounds on M5 (Apple10) only.
+- macOS-only build: Apple silicon, macOS 26+, no Vulkan/MoltenVK/OpenGL, own bundle ID and folders, updater off,
+  QoS-based thread priorities, Game Mode and local-network plist keys, entitlements.
+
+Known gaps: shader interpreter not ported (async mode skips draws until a shader is compiled), logic ops not
+emulated, wide lines drawn 1 px, last-provoking-vertex flat shading falls back to smooth, async texture streaming
+off. Not done yet from the macOS-native list: Core Audio backend, GameController (DualSense), VideoToolbox, Vision,
+Mach VM/exception ports, signposts, single JIT arena for notarized hardened-runtime builds.
+
+## Testing the Metal renderer
+
+Start from a terminal to see the log and enable Apple's debugging aids:
+
+```sh
+# Metal API + shader validation (slow, catches API misuse) and the Metal performance HUD
+MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 MTL_HUD_ENABLED=1 \
+  build-metal/bin/rpcs3.app/Contents/MacOS/rpcs3
+```
+
+Useful settings: GPU → Renderer "Metal", Shader Mode "Async Shader Recompiler", "Debug output" / "Log shader
+programs" (writes GLSL and MSL to `~/Library/Caches/rpcs3-metal/shaderlog`). The RPCS3 log is in
+`~/Library/Caches/rpcs3-metal/RPCS3.log`.
+
+## Reporting build or runtime problems
+
+```sh
+./build-macos.sh 2>&1 | tee build.log
+grep -n "error:" build.log | head -50      # compile errors
+grep -n "Metal\|MSL\|MTL" ~/Library/Caches/rpcs3-metal/RPCS3.log | head -100   # renderer messages
+```
