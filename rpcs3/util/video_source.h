@@ -2,6 +2,8 @@
 
 #include "types.hpp"
 #include <functional>
+#include <string>
+#include <vector>
 
 class video_source
 {

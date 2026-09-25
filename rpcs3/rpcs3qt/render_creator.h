@@ -5,6 +5,8 @@
 #include <QString>
 #include <QStringList>
 
+#include <vector>
+
 class render_creator
 {
 public:

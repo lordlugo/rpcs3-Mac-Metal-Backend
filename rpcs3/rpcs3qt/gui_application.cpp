@@ -56,6 +56,7 @@
 #include <clocale>
 
 #include "Emu/RSX/Null/NullGSRender.h"
+#include "Emu/system_config.h"
 
 #ifndef __APPLE__
 #include "Emu/RSX/GL/GLGSRender.h"
