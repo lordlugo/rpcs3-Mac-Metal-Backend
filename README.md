@@ -30,6 +30,7 @@ Options:
 | --- | --- |
 | `--release` / `--debug` | Build type (default: `RelWithDebInfo`) |
 | `--clean` | Delete `build-metal/` first (full rebuild) |
+| `--no-lto` | Skip link-time optimization: the final link takes seconds instead of minutes (slightly slower app) |
 | `--configure-only` | Initialise submodules and run CMake without building |
 
 Set `RPCS3_WITH_OPENCV=1` to also install and use Homebrew OpenCV (optional camera features).
@@ -91,22 +92,30 @@ logs, plus the zipped app when the build succeeds.
 
 ## Status
 
-Implemented (builds with Homebrew LLVM on macOS 26 and runs games on Apple silicon; still early, expect bugs):
+Builds with Homebrew LLVM on macOS 26 and newer and runs games on Apple silicon. Still early: expect bugs, and
+report them with the log (see the end of this page).
 
-- Native Metal 4 renderer (`rpcs3/Emu/RSX/Metal`, see `DESIGN.md` there): MTL4 command queue/allocators/command
-  buffers, argument tables, residency sets, shared-event timeline, explicit barriers; RSX shaders translated
-  GLSL -> SPIR-V -> MSL (SPIRV-Cross) and compiled with `MTL4Compiler` on worker threads; texture cache and surface
-  cache (D24S8 stored as Depth32Float_Stencil8), zero-copy guest memory DMA, compute kernels, native overlays/UI,
-  MSAA resolve, occlusion queries, CAMetalLayer presentation, MetalFX spatial upscaling (the "FSR" setting).
-- Programmable blending through framebuffer fetch, feedback loops by render pass splits (counted in the debug
-  overlay), shader-side sampler LOD bias on M1-M4, depth bounds on M5 (Apple10) only.
-- macOS-only build: Apple silicon, macOS 26+, no Vulkan/MoltenVK/OpenGL, own bundle ID and folders, updater off,
-  QoS-based thread priorities, Game Mode and local-network plist keys, entitlements.
+- **Graphics:** native Metal 4 renderer (`rpcs3/Emu/RSX/Metal`, design notes in `DESIGN.md` there). Metal 4 command
+  queues, allocators and argument tables, residency sets, explicit barriers. RSX shaders are translated
+  GLSL -> SPIR-V -> MSL (SPIRV-Cross) and compiled with `MTL4Compiler` on worker threads. Texture and surface caches
+  (D24S8 stored as Depth32Float_Stencil8), programmable blending and feedback loops through framebuffer fetch, MSAA,
+  occlusion queries (ZCULL), compute kernels, native overlays, MetalFX spatial upscaling, ProMotion frame pacing.
+- **Audio:** Core Audio output, lossless stereo and spatial audio surround (see [Audio](#audio)).
+- **Controllers:** DualShock 3, DualShock 4, DualSense and other gamepads, through RPCS3's own handlers or SDL
+  (which uses Apple's GameController framework on macOS).
+- **macOS app:** Apple silicon and macOS 26+ only, no Vulkan/MoltenVK/OpenGL, own bundle ID and folders, updater off,
+  QoS thread priorities, Game Mode, sRGB color management, check boxes drawn correctly on macOS 26/27.
 
-Known gaps: shader interpreter not ported (async mode skips draws until a shader is compiled), logic ops not
-emulated, wide lines drawn 1 px, last-provoking-vertex flat shading falls back to smooth, async texture streaming
-off. Not done yet from the macOS-native list: Core Audio backend, GameController (DualSense), VideoToolbox, Vision,
-Mach VM/exception ports, signposts, single JIT arena for notarized hardened-runtime builds.
+### Known limitations of the Metal renderer
+
+| Missing | What you may notice | Why |
+|---|---|---|
+| Shader interpreter | An object or effect missing for a moment the first time it appears. The shader modes with "Shader Interpreter" behave like "Async Recompiler" | Not ported to Metal yet. The renderer waits up to 8 ms per frame for a compiling shader, and the pipeline archive keeps compiled shaders for later sessions |
+| Logic operations | Rare: a draw that combines colors with a logic operation (XOR, AND, ...) writes its color unchanged | Metal has no logic operation state; shader emulation not written yet |
+| Wide lines | Lines are always 1 pixel wide (some debug views and UI elements) | Metal only draws 1-pixel lines |
+| Flat shading (last vertex) | Flat-shaded surfaces are drawn with smooth shading (colors blend across a triangle) | Metal has no provoking-vertex setting |
+
+The log shows a one-time warning starting with `Metal:` when a game uses one of these.
 
 ## Defaults on this fork
 
@@ -191,7 +200,7 @@ The renderer requires the Metal 4 GPU family (Apple7 = M1 and newer) and checks 
 | Lossless texture compression | Yes | Automatic on Private textures; the renderer avoids the usage flag that disables it |
 | 16x anisotropic filtering | Yes | |
 | MSAA (2x/4x) | Yes | PS3 MSAA surfaces |
-| Unified memory, no-copy buffers | Yes | Guest memory is mapped straight into GPU buffers (texture uploads are copied, see Videos and cutscenes) |
+| Unified memory, no-copy buffers | Yes | The GPU writes back to guest memory directly (texture uploads are copied, see Videos and cutscenes) |
 | MetalFX spatial upscaling (`MTL4FXSpatialScaler`) | Yes | Replaces FSR 1 |
 | `presentAfterMinimumDuration`, ProMotion refresh intervals | Yes | Frame pacing |
 | Depth bounds test | M5 (Apple10) only | Ignored on older GPUs |
@@ -216,8 +225,8 @@ MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 MTL_HUD_ENABLED=1 \
 To record a frame for Xcode's Metal debugger, also set `MTL_CAPTURE_ENABLED=1`. The capture layer is not enabled in
 normal launches because it costs performance.
 
-Useful settings: GPU → Renderer "Metal", Shader Mode "Async Shader Recompiler", "Debug output" / "Log shader
-programs" (writes GLSL and MSL to `~/Library/Caches/rpcs3-metal/shaderlog`). The RPCS3 log is in
+Useful settings: GPU → Shader Mode "Async Recompiler (multi-threaded)", and Debug → "Log shader programs" (writes
+the GLSL and MSL of every shader to `~/Library/Caches/rpcs3-metal/shaderlog`). The RPCS3 log is in
 `~/Library/Caches/rpcs3-metal/RPCS3.log`.
 
 ## Reporting build or runtime problems

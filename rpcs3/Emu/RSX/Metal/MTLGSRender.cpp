@@ -330,7 +330,8 @@ namespace mtl
 		}
 
 		// LogicOp and Blend are mutually exclusive. If both are enabled, LogicOp takes precedence.
-		// Logic ops themselves are emulated by the fragment shader through framebuffer fetch.
+		// Metal has no logic op state and the shader emulation is not written yet: blending is off and the color is
+		// written as is (warned once in MTLDraw.cpp).
 		if (!REGS(ctx)->logic_op_enabled() && !force_disable_blending)
 		{
 			if (const auto blend_enabled = REGS(ctx)->blend_enabled_mask())

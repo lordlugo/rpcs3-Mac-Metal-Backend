@@ -250,6 +250,7 @@ private:
 	bool m_wide_lines_warning_logged = false;
 	bool m_depth_bounds_warning_logged = false;
 	bool m_logic_op_warning_logged = false;
+	bool m_flat_shading_warning_logged = false;
 
 public:
 	u64 get_cycles() final;

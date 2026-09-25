@@ -113,7 +113,7 @@ SPIRV-Cross throws `spirv_cross::CompilerError`; the translation TU (`MTLShaderC
 | No scaled blit | `mtl::copy_scaled_image` = sampled draw through the overlay blit pass [C,T] |
 | MSAA writes from compute | Unresolve as per-sample fragment pass [C] |
 | Stencil masks not dynamic | `MTLDepthStencilState` cache keyed on all depth/stencil state [R] |
-| Logic ops | Framebuffer-fetch emulation in the fragment shader when a logic op is enabled (else ignored + logged) [S] |
+| Logic ops | Not emulated yet: blending off, color written unchanged (logged once). Planned: framebuffer-fetch emulation in the fragment shader [S] |
 | Y-up NDC | VK already flips via viewport; Metal: negate `gl_Position.y` in the vertex epilogue (SPIRV-Cross `flip_vert_y`) and keep top-left viewport origin [S,R] |
 | 1D textures without mips | Decompiler emits 2D (height 1) for 1D samplers [S,T] |
 | Texel buffer size | Vertex streams read via `texture_buffer` views; if > max width, bind a window (VK `window()` logic) [R] |

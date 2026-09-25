@@ -523,6 +523,18 @@ void MTLGSRender::update_draw_state()
 		rsx_log.warning("Metal: wide lines are not supported; lines are rendered 1px wide.");
 	}
 
+	if (!m_logic_op_warning_logged && regs.logic_op_enabled())
+	{
+		m_logic_op_warning_logged = true;
+		rsx_log.warning("Metal: logic operations are not emulated; draws using one write their color unchanged.");
+	}
+
+	if (!m_flat_shading_warning_logged && regs.shade_mode() == rsx::shading_mode::flat)
+	{
+		m_flat_shading_warning_logged = true;
+		rsx_log.warning("Metal: flat shading (last provoking vertex) is not supported; smooth shading is used instead.");
+	}
+
 	if (regs.blend_enabled_mask())
 	{
 		// Update blend constants
