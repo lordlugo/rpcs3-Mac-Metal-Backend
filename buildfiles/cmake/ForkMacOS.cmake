@@ -41,6 +41,16 @@ endif()
 set(CMAKE_OSX_DEPLOYMENT_TARGET "${_rpcs3_fork_osx_target}" CACHE STRING "Minimum macOS version (RPCS3 Metal fork: ${RPCS3_FORK_MIN_MACOS} or newer)" FORCE)
 unset(_rpcs3_fork_osx_target)
 
+# RPCS3 does not use C++20 modules. With C++20 and the Ninja generator, CMake >= 3.28 otherwise scans every
+# source with clang-scan-deps, which Homebrew's LLVM does not always ship at the path CMake derives
+# ("clang-scan-deps: No such file or directory").
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF CACHE BOOL "Scan C++ sources for module dependencies (RPCS3 Metal fork: off, no modules are used)")
+
+# CMake 4 removed compatibility with cmake_minimum_required() < 3.5, which some 3rdparty submodules still declare.
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0 AND NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM)
+	set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "Minimum policy version for old 3rdparty CMake files")
+endif()
+
 # Renderer / backend policy. These are declared with option() in the top-level CMakeLists.txt;
 # the FORCEd cache entries below make those option() calls no-ops.
 set(USE_VULKAN OFF CACHE BOOL "Vulkan render backend (always OFF: Metal is the only renderer of this fork)" FORCE)
