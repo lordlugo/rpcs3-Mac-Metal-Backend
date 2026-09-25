@@ -38,8 +38,6 @@
 	<true/>
 	<key>GCSupportsControllerUserInteraction</key>
 	<true/>
-	<key>MetalCaptureEnabled</key>
-	<true/>
 	<key>UIDesignRequiresCompatibility</key>
 	<true/>
 	<key>NSCameraUsageDescription</key>

@@ -163,8 +163,11 @@ namespace mtl
 		ensure(m_is_open);
 		end_encoder();
 
+		// Encoders are returned autoreleased (+0). Keep our own reference so the encoder survives any autorelease pool
+		// drained while it is open; end_render_pass() drops it.
 		m_render_encoder = m_commands->renderCommandEncoder(desc, options);
 		ensure(m_render_encoder, "Metal: failed to begin render pass");
+		m_render_encoder->retain();
 
 		open_encoder_barrier(m_render_encoder, stages_render);
 		return m_render_encoder;
@@ -187,8 +190,10 @@ namespace mtl
 		if (!m_compute_encoder)
 		{
 			end_render_pass();
+			// Autoreleased (+0): retained here, released in end_encoder()
 			m_compute_encoder = m_commands->computeCommandEncoder();
 			ensure(m_compute_encoder, "Metal: failed to begin compute encoder");
+			m_compute_encoder->retain();
 			open_encoder_barrier(m_compute_encoder, stages_compute);
 			m_compute_commands_since_barrier = 0;
 		}

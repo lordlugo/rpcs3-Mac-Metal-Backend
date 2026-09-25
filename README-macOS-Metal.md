@@ -118,6 +118,9 @@ MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 MTL_HUD_ENABLED=1 \
   build-metal/bin/rpcs3.app/Contents/MacOS/rpcs3
 ```
 
+To record a frame for Xcode's Metal debugger, also set `MTL_CAPTURE_ENABLED=1`. The capture layer is not enabled in
+normal launches because it costs performance.
+
 Useful settings: GPU → Renderer "Metal", Shader Mode "Async Shader Recompiler", "Debug output" / "Log shader
 programs" (writes GLSL and MSL to `~/Library/Caches/rpcs3-metal/shaderlog`). The RPCS3 log is in
 `~/Library/Caches/rpcs3-metal/RPCS3.log`.
