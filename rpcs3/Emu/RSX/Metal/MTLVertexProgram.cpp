@@ -332,6 +332,11 @@ void MTLVertexDecompilerThread::insertOutputs(std::stringstream& OS, const std::
 	{
 		OS << "layout(location=" << mtl::get_varying_register_location("usr") << ") out flat uvec4 draw_params_payload;\n";
 	}
+
+	// Games draw the same geometry in several passes with different programs (depth pre-pass, G-buffer, lighting) and
+	// test depth for equality between them. Fast math lets the Metal compiler round the position differently in each
+	// program; an invariant position ([[position, invariant]] + preserveInvariance) is computed the same way everywhere.
+	OS << "invariant gl_Position;\n";
 }
 
 void MTLVertexDecompilerThread::insertFSExport(std::stringstream& OS)

@@ -520,6 +520,7 @@ namespace mtl::glsl
 		options->setLanguageVersion(MTL::LanguageVersion3_2);
 		options->setMathMode(fast_math ? MTL::MathModeFast : MTL::MathModeSafe);
 		options->setMathFloatingPointFunctions(fast_math ? MTL::MathFloatingPointFunctionsFast : MTL::MathFloatingPointFunctionsPrecise);
+		options->setPreserveInvariance(true); // Honors [[invariant]] vertex positions (RSX vertex programs)
 		options->setLibraryType(MTL::LibraryTypeExecutable);
 
 		auto descriptor = mtl::ref(MTL4::LibraryDescriptor::alloc()->init());

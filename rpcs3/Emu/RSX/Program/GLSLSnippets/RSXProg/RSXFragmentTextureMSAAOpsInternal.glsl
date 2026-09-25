@@ -18,7 +18,14 @@ vec4 sampleTexture2DMS(in _MSAA_SAMPLER_TYPE_ tex, const in vec2 coords, const i
 	const vec2 sample_count = vec2(2., textureSamples(tex) * 0.5);
 	const ivec2 image_size = ivec2(textureSize(tex) * sample_count);
 	const ivec2 clamp_bounds = image_size - ivec2(1);
-	const ivec2 icoords = ivec2(normalized_coords * image_size);
+
+	// Position in the sample-expanded image, snapped to 1/128 texel like the fixed-point texel addressing of a texture
+	// unit. A lookup at a pixel centre lands exactly on the boundary between the two samples of that pixel; without the
+	// snap, float rounding (interpolation, fast math) picks either sample from one lookup to the next, so an edge pixel
+	// could mix the depth of one surface with the normal or the light of another (outlines along geometry edges in
+	// light pre-pass / deferred games). Multiplying by a power of two keeps the snapped value exact.
+	const vec2 texel_coords = floor(fma(normalized_coords, vec2(image_size) * 128., vec2(0.5))) * (1. / 128.);
+	const ivec2 icoords = ivec2(texel_coords);
 	const vec4 sample0 = texelFetch2DMS(tex, clamp_bounds, sample_count, icoords, ivec2(0));
 
 	if (_get_bits(flags, FILTERED_MAG_BIT, 2) == 0)
@@ -54,8 +61,8 @@ vec4 sampleTexture2DMS(in _MSAA_SAMPLER_TYPE_ tex, const in vec2 coords, const i
 
 		if (actual_step.x > uv_step.x)
 		{
-		    // Downscale in X, centered
-		    const vec3 weights = compute2x2DownsampleWeights(normalized_coords.x, uv_step.x, actual_step.x);
+		    // Downscale in X, centered (in texel units, consistent with the snapped texel index)
+		    const vec3 weights = compute2x2DownsampleWeights(texel_coords.x, 1.0, actual_step.x * image_size.x);
 
 		    const vec4 sample4 = texelFetch2DMS(tex, clamp_bounds, sample_count, icoords, ivec2(2, 0));    // Further bottom right
 		    a = fma(sample0, weights.xxxx, sample1 * weights.y) + (sample4 * weights.z);                   // Weighted sum
@@ -69,7 +76,7 @@ vec4 sampleTexture2DMS(in _MSAA_SAMPLER_TYPE_ tex, const in vec2 coords, const i
 		else if (actual_step.x < uv_step.x)
 		{
 		    // Upscale in X
-		    factor = fract(normalized_coords.x * image_size.x);
+		    factor = fract(texel_coords.x);
 		    a = mix(sample0, sample1, factor);
 		    b = mix(sample2, sample3, factor);
 		}
@@ -83,14 +90,14 @@ vec4 sampleTexture2DMS(in _MSAA_SAMPLER_TYPE_ tex, const in vec2 coords, const i
 	else if (actual_step.y > uv_step.y)
 	{
 		// Downscale in Y
-		const vec3 weights = compute2x2DownsampleWeights(normalized_coords.y, uv_step.y, actual_step.y);
+		const vec3 weights = compute2x2DownsampleWeights(texel_coords.y, 1.0, actual_step.y * image_size.y);
 		// We only have 2 rows computed for performance reasons, so combine rows 1 and 2
 		return a * weights.x + b * (weights.y + weights.z);
 	}
 	else if (actual_step.y < uv_step.y)
 	{
 		// Upscale in Y
-		factor = fract(normalized_coords.y * image_size.y);
+		factor = fract(texel_coords.y);
 		return mix(a, b, factor);
 	}
 }

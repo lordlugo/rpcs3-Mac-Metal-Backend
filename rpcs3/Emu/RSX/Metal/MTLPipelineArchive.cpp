@@ -64,8 +64,9 @@ namespace mtl
 		using namespace std::chrono_literals;
 		using clock_type = std::chrono::steady_clock;
 
-		// Bump when the naming or the policy changes: a different identity discards every archive
-		constexpr u32 archive_format_version = 1;
+		// Bump when the naming or the policy changes, or when every shader binary changes: a different identity discards
+		// every archive. 2: invariant vertex positions and snapped MSAA texture lookups.
+		constexpr u32 archive_format_version = 2;
 
 		constexpr std::string_view archive_extension = ".mtl4archive";
 		constexpr std::string_view base_suffix = "-base";

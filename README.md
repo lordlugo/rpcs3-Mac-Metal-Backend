@@ -162,6 +162,14 @@ matters for most games: with 16 KiB memory pages the semaphores share a page wit
 semaphore looks like a CPU reading results (in Assassin's Creed II the RSX spent ~13% of its time waiting for the GPU
 there). Strict Rendering Mode is not needed. The log shows `ZCULL: semaphores now wait for the zcull reports ...`.
 
+**MSAA lighting (outlines along edges).** Games that light the scene in a separate pass (for example Ben 10
+Ultimate Alien: Cosmic Destruction) read their anti-aliased buffers back at each pixel. A lookup at a pixel centre falls
+exactly between the pixel's two samples, and float rounding used to pick either one at random, so pixels on geometry
+edges mixed the depth, normal and light of different surfaces: thin colored outlines tracing the geometry. These reads
+now snap to one sample, like the PS3's texture unit. Vertex positions are also computed identically in every pass
+(invariant), so depth-equal multi-pass drawing cannot leave gaps either. The first boot after updating recompiles the
+game's shaders once.
+
 **Shader compilation.** There is no shader interpreter on Metal yet, so a draw whose shaders are still compiling is
 skipped (missing geometry for a moment the first time an effect appears). The renderer now waits up to 8 ms per frame
 for such pipelines before skipping, and compiled pipelines are saved to the pipeline archive, so later sessions
