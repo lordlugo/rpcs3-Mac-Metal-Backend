@@ -219,10 +219,14 @@ fi
 # Build
 # ---------------------------------------------------------------------------------------------------------------------
 echo "==> Building"
+# `-k 0`: keep building after a failed file so one run reports every compile error, not just the first few
+BUILD_ARGS=()
 if [[ -n "${JOBS:-}" ]]; then
-    cmake --build "$BUILD_DIR" --parallel "$JOBS"
-else
-    cmake --build "$BUILD_DIR"
+    BUILD_ARGS+=(--parallel "$JOBS")
+fi
+if ! cmake --build "$BUILD_DIR" ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} -- -k 0; then
+    echo >&2
+    die "build failed; see the 'error:' lines above (tip: ./build-macos.sh 2>&1 | tee build.log; grep -n 'error:' build.log)"
 fi
 
 APP="$BUILD_DIR/bin/rpcs3.app"
