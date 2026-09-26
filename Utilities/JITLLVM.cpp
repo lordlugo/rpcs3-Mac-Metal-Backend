@@ -552,14 +552,18 @@ public:
 			// (no oversized zero-filled intermediate buffer and extra copy), and unzip_exact() verifies its CRC
 			const usz out_size = gz_object_size(cached);
 
-			// Read the compressed data without zero-filling the buffer first
-			std::unique_ptr<u8[]> cached_data(new u8[in_size]);
-
+			std::unique_ptr<u8[]> cached_data;
 			std::unique_ptr<llvm::WritableMemoryBuffer> buf;
 
-			if (out_size && cached.read_at(0, cached_data.get(), in_size) == in_size)
+			if (out_size)
 			{
-				buf = llvm::WritableMemoryBuffer::getNewUninitMemBuffer(out_size);
+				// Read the compressed data without zero-filling the buffer first
+				cached_data.reset(new u8[in_size]);
+
+				if (cached.read_at(0, cached_data.get(), in_size) == in_size)
+				{
+					buf = llvm::WritableMemoryBuffer::getNewUninitMemBuffer(out_size);
+				}
 			}
 
 			if (!buf || !unzip_exact(cached_data.get(), in_size, buf->getBufferStart(), buf->getBufferSize()))
