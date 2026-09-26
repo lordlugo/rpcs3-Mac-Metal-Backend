@@ -20,6 +20,33 @@
 
 LOG_CHANNEL(jit_log, "JIT");
 
+// If directory ASMJIT doesn't exist, nothing will be written
+static constexpr u64 c_jit_dump_size = 0x1'0000'0000;
+
+static void* get_jit_dump()
+{
+	static void* g_asm = []() -> void*
+	{
+		fs::remove_all(fs::get_cache_dir() + "/ASMJIT/", false);
+
+		fs::file objs(fmt::format("%s/ASMJIT/.objects", fs::get_cache_dir()), fs::read + fs::rewrite);
+
+		if (!objs || !objs.trunc(c_jit_dump_size))
+		{
+			return nullptr;
+		}
+
+		return utils::memory_map_fd(objs.get_handle(), c_jit_dump_size, utils::protection::rw);
+	}();
+
+	return g_asm;
+}
+
+bool jit_announce_enabled()
+{
+	return get_jit_dump() != nullptr;
+}
+
 void jit_announce(uptr func, usz size, std::string_view name)
 {
 #ifdef __linux__
@@ -58,25 +85,12 @@ void jit_announce(uptr func, usz size, std::string_view name)
 		return;
 	}
 
-	// If directory ASMJIT doesn't exist, nothing will be written
-	static constexpr u64 c_dump_size = 0x1'0000'0000;
+	static constexpr u64 c_dump_size = c_jit_dump_size;
 	static constexpr u64 c_index_size = c_dump_size / 16;
 	static atomic_t<u64> g_index_off = 0;
 	static atomic_t<u64> g_data_off = c_index_size;
 
-	static void* g_asm = []() -> void*
-	{
-		fs::remove_all(fs::get_cache_dir() + "/ASMJIT/", false);
-
-		fs::file objs(fmt::format("%s/ASMJIT/.objects", fs::get_cache_dir()), fs::read + fs::rewrite);
-
-		if (!objs || !objs.trunc(c_dump_size))
-		{
-			return nullptr;
-		}
-
-		return utils::memory_map_fd(objs.get_handle(), c_dump_size, utils::protection::rw);
-	}();
+	void* const g_asm = get_jit_dump();
 
 	if (g_asm && size < c_index_size)
 	{

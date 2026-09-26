@@ -188,6 +188,13 @@ struct JITAnnouncer : llvm::JITEventListener
 	{
 		using namespace llvm;
 
+		// Building the debug object copies and re-parses every loaded object on the compiling thread (which may be a
+		// stalled SPU/PPU thread), so skip it when jit_announce() would discard the symbols anyway
+		if (!jit_announce_enabled())
+		{
+			return;
+		}
+
 		object::OwningBinary<object::ObjectFile> debug_obj_ = info.getObjectForDebug(obj);
 		if (!debug_obj_.getBinary())
 		{

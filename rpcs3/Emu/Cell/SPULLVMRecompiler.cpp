@@ -1740,17 +1740,7 @@ public:
 
 		std::string function_log;
 
-		this->dump(func, function_log);
 		bool to_log_func = false;
-
-		if (g_cfg.core.spu_debug && !add_loc->logged.exchange(1))
-		{
-			if (!fs::write_file(m_spurt->get_cache_path() + "spu.log", fs::write + fs::append, function_log))
-			{
-				// Fallback: write to main log
-				to_log_func = true;
-			}
-		}
 
 		for (u32 data : func.data)
 		{
@@ -1760,6 +1750,25 @@ public:
 
 			if (itype == spu_itype::RDCH && op.ra == SPU_RdDec)
 			{
+				to_log_func = true;
+			}
+		}
+
+		// Disassembling the whole program is expensive and runs on the SPU thread that waits for this code, so only do it
+		// when the text is used: SPU Debug writes it to spu.log/spu-ir.log, and functions reading the decrementer are
+		// dumped to the main log. If verification fails without SPU Debug, the dump is built at that point instead.
+		const bool dump_func = g_cfg.core.spu_debug || to_log_func;
+
+		if (dump_func)
+		{
+			this->dump(func, function_log);
+		}
+
+		if (g_cfg.core.spu_debug && !add_loc->logged.exchange(1))
+		{
+			if (!fs::write_file(m_spurt->get_cache_path() + "spu.log", fs::write + fs::append, function_log))
+			{
+				// Fallback: write to main log
 				to_log_func = true;
 			}
 		}
@@ -3894,15 +3903,27 @@ public:
 		m_function_queue.clear();
 		m_function_table = nullptr;
 
+		// Printing the IR is expensive (it runs on the SPU thread that waits for this code), so only do it when SPU Debug
+		// writes it to spu-ir.log or verification failed; in both cases the log text is the same as when always printed
+		const bool log_ir = g_cfg.core.spu_debug || verifyModule(*_module);
+
+		if (log_ir && !dump_func)
+		{
+			this->dump(func, function_log);
+		}
+
 		// Append for now
 		std::string& llvm_log = function_log;
 		raw_string_ostream out(llvm_log);
 
-		fmt::append(llvm_log, "LLVM IR at 0x%x:\n", func.entry_point);
-		out << *_module; // print IR
-		out << "\n\n";
+		if (log_ir)
+		{
+			fmt::append(llvm_log, "LLVM IR at 0x%x:\n", func.entry_point);
+			out << *_module; // print IR
+			out << "\n\n";
+		}
 
-		if (verifyModule(*_module, &out))
+		if (log_ir && verifyModule(*_module, &out))
 		{
 			out.flush();
 			spu_log.error("LLVM: Verification failed at 0x%x:\n%s", func.entry_point, llvm_log);
@@ -4421,11 +4442,17 @@ public:
 		std::string llvm_log;
 		raw_string_ostream out(llvm_log);
 
-		fmt::append(llvm_log, "LLVM IR (interpreter):\n");
-		out << *_module; // print IR
-		out << "\n\n";
+		// Only print the (large) IR when SPU Debug writes it to spu-ir.log or verification failed
+		const bool log_ir = g_cfg.core.spu_debug || verifyModule(*_module);
 
-		if (verifyModule(*_module, &out))
+		if (log_ir)
+		{
+			fmt::append(llvm_log, "LLVM IR (interpreter):\n");
+			out << *_module; // print IR
+			out << "\n\n";
+		}
+
+		if (log_ir && verifyModule(*_module, &out))
 		{
 			out.flush();
 			spu_log.error("LLVM: Verification failed:\n%s", llvm_log);

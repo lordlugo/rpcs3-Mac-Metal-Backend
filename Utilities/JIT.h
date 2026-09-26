@@ -55,6 +55,9 @@ using native_args = std::array<asmjit::a64::Gp, 4>;
 
 void jit_announce(uptr func, usz size, std::string_view name);
 
+// Whether jit_announce() records anything (only when the ASMJIT dump directory exists in the cache directory)
+bool jit_announce_enabled();
+
 void jit_announce(auto* func, usz size, std::string_view name)
 {
 	jit_announce(uptr(func), size, name);
