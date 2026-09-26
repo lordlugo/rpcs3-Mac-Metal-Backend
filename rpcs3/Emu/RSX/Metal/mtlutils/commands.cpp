@@ -195,6 +195,13 @@ namespace mtl
 		m_next_pass_orders_vertex = false;
 		m_pass_orders_vertex = false;
 		m_compute_commands_since_barrier = 0;
+
+		// The tables keep their contents, but every recording starts from a known state (cheap: one full write each)
+		for (auto& shadow : m_argument_table_shadows)
+		{
+			shadow.invalidate();
+		}
+		m_render_bindings = {};
 	}
 
 	void command_list::end()
@@ -269,6 +276,7 @@ namespace mtl
 		ensure(m_render_encoder, "Metal: failed to begin render pass");
 		m_render_encoder->retain();
 		m_pass_serial = ++g_pass_serial;
+		m_render_bindings = {}; // A new encoder starts without pipeline state or argument tables
 		gpu_stats().render_passes++;
 
 		if (m_next_pass_orders_vertex)

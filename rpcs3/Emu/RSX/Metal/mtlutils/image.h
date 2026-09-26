@@ -121,6 +121,7 @@ namespace mtl
 
 	public:
 		MTL::Texture* value = nullptr;
+		MTL::ResourceID resource_id{};   // value->gpuResourceID(), fixed for the view's lifetime (bound by resource ID)
 		image_view_info info{};
 
 		image_view(mtl::image* resource, const image_view_info& view_info = {});
@@ -153,9 +154,18 @@ namespace mtl
 		// Full-resource identity view (render target binding, copies)
 		image_view* get_identity_view(u32 aspect_mask = aspect_color | aspect_depth);
 
+		// 2D view of one level and one layer of `aspect` (as given, not masked with the image aspect), identity swizzle:
+		// raw texel access for scaled copies. Cached and released with the other views.
+		image_view* get_subresource_view(u32 level, u32 layer, u32 aspect);
+
 		void set_native_component_layout(const MTL::TextureSwizzleChannels& new_layout);
 		void release_views();
 	};
+
+	// True if Metal objects should be given debug labels: GPU frame capture (MTL_CAPTURE_ENABLED=1), API validation
+	// (MTL_DEBUG_LAYER=1), RPCS3_METAL_DEBUG_LABELS=1 or the "Debug output" setting. Otherwise image::set_debug_name
+	// only keeps the name for log messages, and hot paths skip formatting names altogether.
+	bool debug_labels_enabled();
 
 	// Applies an RSX remap vector on top of a base channel layout (a, r, g, b order like the VK helper)
 	MTL::TextureSwizzleChannels apply_swizzle_remap(const std::array<MTL::TextureSwizzle, 4>& base_remap_argb, const rsx::texture_channel_remap_t& remap);

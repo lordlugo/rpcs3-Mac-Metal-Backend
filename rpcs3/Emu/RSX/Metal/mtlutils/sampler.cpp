@@ -134,6 +134,7 @@ namespace mtl
 
 		value = dev.handle()->newSamplerState(desc.get());
 		ensure(value, "Metal: failed to create sampler state");
+		m_resource_id = value->gpuResourceID();
 	}
 
 	sampler::~sampler()

@@ -150,8 +150,17 @@ namespace mtl
 			MTL::Texture* texture = nullptr;          // A view (mtl::image_view::value) or full texture
 			MTL::SamplerState* sampler = nullptr;     // nullptr for storage images / texelFetch-only textures
 
+			// What bind_uniform writes. Taken from the IDs mtl::image_view / mtl::sampler cache at creation, so binding
+			// wrapped objects sends no Objective-C message; raw objects are queried here.
+			MTL::ResourceID texture_id{};
+			MTL::ResourceID sampler_id{};
+
 			image_binding_info() = default;
-			image_binding_info(MTL::Texture* tex, MTL::SamplerState* smp) : texture(tex), sampler(smp) {}
+			image_binding_info(MTL::Texture* tex, MTL::SamplerState* smp)
+				: texture(tex), sampler(smp)
+				, texture_id(tex ? tex->gpuResourceID() : MTL::ResourceID{})
+				, sampler_id(smp ? smp->gpuResourceID() : MTL::ResourceID{})
+			{}
 			image_binding_info(const mtl::image_view* view, const mtl::sampler* smp);
 		};
 
@@ -237,6 +246,11 @@ namespace mtl
 
 			std::array<std::vector<program_input>, binding_set_index_max_enum> m_inputs;
 			std::array<binding_layout, binding_set_index_max_enum> m_layouts;
+			std::array<std::vector<resource_slot>, binding_set_index_max_enum> m_table_slots; // m_layouts[].slots, flat for bind()
+
+			// Unique for the process lifetime (unlike the pipeline's address): identifies the pipeline state set on a
+			// render encoder, see command_list::render_encoder_bindings
+			u64 m_uid = 0;
 
 			struct stage_bindings
 			{

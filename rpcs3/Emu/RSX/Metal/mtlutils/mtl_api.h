@@ -38,16 +38,22 @@
 #include <string>
 #include <string_view>
 
+// The Objective-C runtime functions @autoreleasepool compiles to (exported by libobjc; the SDK headers do not declare them)
+extern "C" void* objc_autoreleasePoolPush(void);
+extern "C" void objc_autoreleasePoolPop(void* context);
+
 namespace mtl
 {
 	// Autorelease pool RAII. Metal-cpp does not have ARC; autoreleased temporaries leak without a pool.
+	// Same scoping as @autoreleasepool (and NS::AutoreleasePool), but without allocating a pool object: alloc + init +
+	// release would be three Objective-C messages, and a draw enters two of these scopes.
 	class autorelease_scope
 	{
-		NS::AutoreleasePool* m_pool;
+		void* m_context;
 
 	public:
-		autorelease_scope() : m_pool(NS::AutoreleasePool::alloc()->init()) {}
-		~autorelease_scope() { m_pool->release(); }
+		autorelease_scope() : m_context(objc_autoreleasePoolPush()) {}
+		~autorelease_scope() { objc_autoreleasePoolPop(m_context); }
 
 		autorelease_scope(const autorelease_scope&) = delete;
 		autorelease_scope& operator=(const autorelease_scope&) = delete;

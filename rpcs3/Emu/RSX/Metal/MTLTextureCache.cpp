@@ -775,7 +775,11 @@ namespace mtl
 			view_swizzle = source->native_component_map;
 		}
 
-		image->set_debug_name(fmt::format("Temp view, fmt=0x%x", gcm_format));
+		if (mtl::debug_labels_enabled())
+		{
+			image->set_debug_name(fmt::format("Temp view, fmt=0x%x", gcm_format));
+		}
+
 		image->set_native_component_layout(view_swizzle);
 		auto view = image->get_view(remap_vector);
 
@@ -1217,7 +1221,10 @@ namespace mtl
 			rsx::component_order::default_, create_flags);
 
 		auto image = section->get_raw_texture();
-		image->set_debug_name(fmt::format("Raw Texture @0x%x", rsx_range.start));
+		if (mtl::debug_labels_enabled())
+		{
+			image->set_debug_name(fmt::format("Raw Texture @0x%x", rsx_range.start));
+		}
 
 		mtl::enter_uninterruptible();
 

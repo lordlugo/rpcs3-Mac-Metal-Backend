@@ -613,9 +613,17 @@ namespace mtl
 					}
 				}
 
-				// Source views (single level, single slice, 2D)
-				auto make_view = [&](u32 aspect) -> std::unique_ptr<mtl::image_view>
+				// Source views (single level, single slice, 2D). Viewable images keep them (released with the image, or
+				// through the GC with its other views); views of other images (the blit scratch) are temporary.
+				auto viewable_sample_image = dynamic_cast<mtl::viewable_image*>(sample_image);
+				std::unique_ptr<mtl::image_view> view0, view1;
+				auto make_view = [&](u32 aspect, std::unique_ptr<mtl::image_view>& temporary) -> mtl::image_view*
 				{
+					if (viewable_sample_image)
+					{
+						return viewable_sample_image->get_subresource_view(sample_level, sample_layer, aspect);
+					}
+
 					image_view_info info{};
 					info.type = MTL::TextureType2D;
 					info.base_level = sample_level;
@@ -623,28 +631,24 @@ namespace mtl
 					info.base_layer = sample_layer;
 					info.layer_count = 1;
 					info.aspect = aspect;
-					return std::make_unique<mtl::image_view>(sample_image, info);
+					temporary = std::make_unique<mtl::image_view>(sample_image, info);
+					return temporary.get();
 				};
 
-				std::unique_ptr<mtl::image_view> view0, view1;
 				std::vector<mtl::image_view*> views;
 
 				if (pass->m_dst_aspect == aspect_depth_stencil)
 				{
-					view0 = make_view(aspect_depth);
-					view1 = make_view(aspect_stencil);
-					views = { view0.get(), view1.get() };
+					views = { make_view(aspect_depth, view0), make_view(aspect_stencil, view1) };
 				}
 				else if (needs_depth_view || pass->m_dst_aspect == aspect_color)
 				{
 					// Color and depth read the first plane (depth of a depth-stencil source, or color)
-					view0 = make_view((src_aspect & aspect_depth) ? static_cast<u32>(aspect_depth) : static_cast<u32>(aspect_color));
-					views = { view0.get() };
+					views = { make_view((src_aspect & aspect_depth) ? static_cast<u32>(aspect_depth) : static_cast<u32>(aspect_color), view0) };
 				}
 				else
 				{
-					view0 = make_view(aspect_stencil);
-					views = { view0.get() };
+					views = { make_view(aspect_stencil, view0) };
 				}
 
 				if (dst_renderable)
@@ -691,7 +695,7 @@ namespace mtl
 					}
 				}
 
-				// The views are referenced by the recorded pass
+				// Temporary views (if any) are referenced by the recorded pass
 				gc->dispose(view0);
 				gc->dispose(view1);
 			}

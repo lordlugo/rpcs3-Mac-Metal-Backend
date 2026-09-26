@@ -579,19 +579,50 @@ void MTLGSRender::update_draw_state()
 		rsx_log.warning("Metal: flat shading (last provoking vertex) is not supported; smooth shading is used instead.");
 	}
 
+	// Encoder state persists for the whole pass: only changes are sent (m_encoder_state is reset when the pass opens)
 	if (regs.blend_enabled_mask())
 	{
 		// Update blend constants
-		auto blend_colors = rsx::get_constant_blend_colors();
-		encoder->setBlendColor(blend_colors[0], blend_colors[1], blend_colors[2], blend_colors[3]);
+		const auto blend_colors = rsx::get_constant_blend_colors();
+		// Bitwise: -0.f and +0.f compare equal but may blend differently
+		if (!m_encoder_state.blend_color_valid ||
+			std::memcmp(blend_colors.data(), m_encoder_state.blend_color.data(), sizeof(blend_colors)) != 0)
+		{
+			encoder->setBlendColor(blend_colors[0], blend_colors[1], blend_colors[2], blend_colors[3]);
+			m_encoder_state.blend_color = blend_colors;
+			m_encoder_state.blend_color_valid = true;
+		}
 	}
 
 	// Fixed-function state that Vulkan keeps in the pipeline object is encoder state on Metal
 	m_rasterizer_state = mtl::decode_rasterizer_state(m_ctx);
-	encoder->setCullMode(m_rasterizer_state.cull_mode);
-	encoder->setFrontFacingWinding(m_rasterizer_state.front_face);
-	encoder->setDepthClipMode(m_rasterizer_state.depth_clip_mode);
-	encoder->setTriangleFillMode(m_rasterizer_state.fill_mode);
+	const bool rasterizer_valid = m_encoder_state.rasterizer_valid;
+
+	if (!rasterizer_valid || m_rasterizer_state.cull_mode != m_encoder_state.cull_mode)
+	{
+		encoder->setCullMode(m_rasterizer_state.cull_mode);
+		m_encoder_state.cull_mode = m_rasterizer_state.cull_mode;
+	}
+
+	if (!rasterizer_valid || m_rasterizer_state.front_face != m_encoder_state.front_face)
+	{
+		encoder->setFrontFacingWinding(m_rasterizer_state.front_face);
+		m_encoder_state.front_face = m_rasterizer_state.front_face;
+	}
+
+	if (!rasterizer_valid || m_rasterizer_state.depth_clip_mode != m_encoder_state.depth_clip_mode)
+	{
+		encoder->setDepthClipMode(m_rasterizer_state.depth_clip_mode);
+		m_encoder_state.depth_clip_mode = m_rasterizer_state.depth_clip_mode;
+	}
+
+	if (!rasterizer_valid || m_rasterizer_state.fill_mode != m_encoder_state.fill_mode)
+	{
+		encoder->setTriangleFillMode(m_rasterizer_state.fill_mode);
+		m_encoder_state.fill_mode = m_rasterizer_state.fill_mode;
+	}
+
+	m_encoder_state.rasterizer_valid = true;
 
 	// Depth/stencil tests without the corresponding attachment are meaningless (and rejected by Metal validation)
 	if (!m_draw_fbo.depth_stencil)
@@ -615,7 +646,16 @@ void MTLGSRender::update_draw_state()
 		const bool two_sided_stencil = regs.two_sided_stencil_test_enabled();
 		const u32 front_ref = regs.stencil_func_ref();
 		const u32 back_ref = two_sided_stencil ? regs.back_stencil_func_ref() : front_ref;
-		encoder->setStencilReferenceValues(front_ref, back_ref);
+
+		if (!m_encoder_state.stencil_reference_valid ||
+			front_ref != m_encoder_state.stencil_reference_front ||
+			back_ref != m_encoder_state.stencil_reference_back)
+		{
+			encoder->setStencilReferenceValues(front_ref, back_ref);
+			m_encoder_state.stencil_reference_front = front_ref;
+			m_encoder_state.stencil_reference_back = back_ref;
+			m_encoder_state.stencil_reference_valid = true;
+		}
 	}
 
 	// The remaining dynamic state should only be set once and we have signals to enable/disable mid-renderpass
@@ -2386,5 +2426,7 @@ void MTLGSRender::clear_surface(u32 mask)
 	// The next draw must restore the full encoder state (viewport, scissor, depth bias, depth bounds, ...)
 	m_encoder_state.pipeline = nullptr;
 	m_encoder_state.depth_stencil = ds_state;
+	m_encoder_state.rasterizer_valid = false;
+	m_encoder_state.stencil_reference_valid = false;
 	m_current_command_buffer->flags |= mtl::command_list::cb_reload_dynamic_state;
 }

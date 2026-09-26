@@ -20,6 +20,11 @@ namespace mtl
 			constexpr u32 max_texture_slots = 64;                                         // Argument tables are sized to 64
 			constexpr u32 max_sampler_slots = gpu_capabilities::max_samplers_per_stage;  // 16
 
+			static_assert(max_texture_slots <= argument_table_shadow::max_textures);
+
+			// program::m_uid source (programs are built on pipe-compiler threads)
+			atomic_t<u64> g_next_program_uid = 0;
+
 			bool is_buffer_type(program_input_type type)
 			{
 				return type == input_type_uniform_buffer || type == input_type_storage_buffer;
@@ -221,6 +226,8 @@ namespace mtl
 		image_binding_info::image_binding_info(const mtl::image_view* view, const mtl::sampler* smp)
 			: texture(view ? view->value : nullptr)
 			, sampler(smp ? smp->value : nullptr)
+			, texture_id(view ? view->resource_id : MTL::ResourceID{})
+			, sampler_id(smp ? smp->resource_id() : MTL::ResourceID{})
 		{
 		}
 
@@ -230,6 +237,7 @@ namespace mtl
 			const std::vector<program_input>& vertex_inputs,
 			const std::vector<program_input>& fragment_inputs)
 			: m_render_pipeline(ensure(pipeline))
+			, m_uid(++g_next_program_uid)
 		{
 			m_inputs[binding_set_index_vertex] = vertex_inputs;
 			m_inputs[binding_set_index_fragment] = fragment_inputs;
@@ -239,6 +247,7 @@ namespace mtl
 		program::program(MTL::ComputePipelineState* pipeline,
 			const std::vector<program_input>& compute_inputs)
 			: m_compute_pipeline(ensure(pipeline))
+			, m_uid(++g_next_program_uid)
 		{
 			m_inputs[binding_set_index_compute] = compute_inputs;
 			init_layouts();
@@ -268,6 +277,14 @@ namespace mtl
 			for (u32 stage = 0; stage < binding_set_index_max_enum; ++stage)
 			{
 				m_layouts[stage] = build_binding_layout(m_inputs[stage]);
+
+				// bind() visits every slot of the stage on each draw: iterate a contiguous copy, not the hash map
+				auto& table_slots = m_table_slots[stage];
+				table_slots.clear();
+				for (const auto& [location, slot] : m_layouts[stage].slots)
+				{
+					table_slots.push_back(slot);
+				}
 
 				auto& bindings = m_bindings[stage];
 				bindings.push_constants.assign(m_layouts[stage].push_constant_size, 0);
@@ -376,8 +393,8 @@ namespace mtl
 
 		void program::bind_uniform(const image_binding_info& image, u32 set_id, u32 binding_point)
 		{
-			const MTL::ResourceID texture_id = image.texture ? image.texture->gpuResourceID() : MTL::ResourceID{};
-			const MTL::ResourceID sampler_id = image.sampler ? image.sampler->gpuResourceID() : MTL::ResourceID{};
+			const MTL::ResourceID texture_id = image.texture_id;
+			const MTL::ResourceID sampler_id = image.sampler_id;
 
 			for_each_bound_slot(set_id, binding_point, [&](u32 stage, const resource_slot& slot)
 			{
@@ -401,7 +418,7 @@ namespace mtl
 
 		void program::bind_uniform(const mtl::buffer_view* view, u32 set_id, u32 binding_point)
 		{
-			const MTL::ResourceID texture_id = (view && view->value) ? view->value->gpuResourceID() : MTL::ResourceID{};
+			const MTL::ResourceID texture_id = view ? view->resource_id : MTL::ResourceID{};
 
 			for_each_bound_slot(set_id, binding_point, [&](u32 stage, const resource_slot& slot)
 			{
@@ -433,11 +450,11 @@ namespace mtl
 				for (u32 i = 0; i < count; ++i)
 				{
 					const auto& image = images[i];
-					bindings.textures[slot.texture_index + i] = image.texture ? image.texture->gpuResourceID() : MTL::ResourceID{};
+					bindings.textures[slot.texture_index + i] = image.texture_id;
 
 					if (slot.sampler_index != umax)
 					{
-						bindings.samplers[slot.sampler_index + i] = image.sampler ? image.sampler->gpuResourceID() : MTL::ResourceID{};
+						bindings.samplers[slot.sampler_index + i] = image.sampler_id;
 					}
 				}
 
@@ -475,15 +492,18 @@ namespace mtl
 
 		void program::bind(mtl::command_list& cmd, mtl::data_heap& scratch)
 		{
-			auto write_table = [&](u32 stage, MTL4::ArgumentTable* table)
+			auto write_table = [&](u32 stage, argument_table_slot table_slot)
 			{
+				MTL4::ArgumentTable* table = cmd.argument_table(table_slot);
+				argument_table_shadow& contents = cmd.argument_table_contents(table_slot);
 				const binding_layout& layout = m_layouts[stage];
 				auto& bindings = m_bindings[stage];
 				bool missing = false;
 
-				// Argument tables are shared by every program recorded into this command list: always re-write every
-				// slot this stage uses (the table's contents are captured by each draw/dispatch).
-				for (const auto& [location, slot] : layout.slots)
+				// Argument tables are shared by every program recorded into this command list, and each draw/dispatch
+				// snapshots the table when encoded. Every slot this stage uses must hold this program's resource, but only
+				// the slots whose value differs from what the table holds are written (see argument_table_shadow).
+				for (const resource_slot& slot : m_table_slots[stage])
 				{
 					if (slot.buffer_index != umax)
 					{
@@ -491,7 +511,11 @@ namespace mtl
 						{
 							const MTL::GPUAddress address = bindings.buffers[slot.buffer_index + i];
 							missing |= !address;
-							table->setAddress(address, slot.buffer_index + i);
+
+							if (contents.update_buffer(slot.buffer_index + i, address))
+							{
+								table->setAddress(address, slot.buffer_index + i);
+							}
 						}
 						continue;
 					}
@@ -502,7 +526,11 @@ namespace mtl
 						{
 							const MTL::ResourceID texture_id = bindings.textures[slot.texture_index + i];
 							missing |= !texture_id._impl;
-							table->setTexture(texture_id, slot.texture_index + i);
+
+							if (contents.update_texture(slot.texture_index + i, texture_id))
+							{
+								table->setTexture(texture_id, slot.texture_index + i);
+							}
 						}
 					}
 
@@ -515,17 +543,27 @@ namespace mtl
 							{
 								sampler_id = g_default_sampler.get();
 							}
-							table->setSamplerState(sampler_id, slot.sampler_index + i);
+
+							if (contents.update_sampler(slot.sampler_index + i, sampler_id))
+							{
+								table->setSamplerState(sampler_id, slot.sampler_index + i);
+							}
 						}
 					}
 				}
 
+				// Fresh scratch allocations: these (almost) always change
 				if (layout.push_constant_buffer_index != umax)
 				{
 					const usz length = bindings.push_constants.size();
 					const auto heap_offset = scratch.alloc<256>(length);
 					std::memcpy(scratch.map(heap_offset, length), bindings.push_constants.data(), length);
-					table->setAddress(scratch.gpu_address(heap_offset), layout.push_constant_buffer_index);
+
+					const MTL::GPUAddress address = scratch.gpu_address(heap_offset);
+					if (contents.update_buffer(layout.push_constant_buffer_index, address))
+					{
+						table->setAddress(address, layout.push_constant_buffer_index);
+					}
 				}
 
 				if (bindings.needs_buffer_sizes)
@@ -534,7 +572,12 @@ namespace mtl
 					const usz length = sizeof(u32) * std::max(layout.buffer_count, 1u);
 					const auto heap_offset = scratch.alloc<256>(length);
 					std::memcpy(scratch.map(heap_offset, length), bindings.buffer_sizes.data(), length);
-					table->setAddress(scratch.gpu_address(heap_offset), layout.buffer_count);
+
+					const MTL::GPUAddress address = scratch.gpu_address(heap_offset);
+					if (contents.update_buffer(layout.buffer_count, address))
+					{
+						table->setAddress(address, layout.buffer_count);
+					}
 				}
 
 				if (missing && !m_missing_binding_reported) [[unlikely]]
@@ -544,33 +587,47 @@ namespace mtl
 				}
 
 				bindings.dirty = false;
+				return table;
 			};
 
 			if (is_compute())
 			{
 				// compute() orders this command after the previous one; the caller's dispatch can then use
 				// compute_unordered() since it depends only on this bind.
+				// NOTE: The pipeline state and the table are set for every dispatch. The compute encoder also records the
+				// copies and fills, and dispatches are rare next to draws, so its state is not tracked.
 				MTL4::ComputeCommandEncoder* encoder = cmd.compute();
 				encoder->setComputePipelineState(m_compute_pipeline);
-
-				MTL4::ArgumentTable* table = cmd.argument_table(table_compute);
-				write_table(binding_set_index_compute, table);
-				encoder->setArgumentTable(table);
+				encoder->setArgumentTable(write_table(binding_set_index_compute, table_compute));
 				return;
 			}
 
 			MTL4::RenderCommandEncoder* encoder = cmd.render_encoder();
 			ensure(encoder, "Graphics program bound outside of a render pass");
 
-			encoder->setRenderPipelineState(m_render_pipeline);
+			// The pipeline state and the stage tables are render encoder state: set once per encoder (and pipeline).
+			// Changes to a table's contents after it was set are seen by the draws encoded later.
+			render_encoder_bindings& encoder_state = cmd.render_bindings();
 
-			MTL4::ArgumentTable* vertex_table = cmd.argument_table(table_vertex);
-			write_table(binding_set_index_vertex, vertex_table);
-			encoder->setArgumentTable(vertex_table, MTL::RenderStageVertex);
+			if (encoder_state.program_uid != m_uid)
+			{
+				encoder->setRenderPipelineState(m_render_pipeline);
+				encoder_state.program_uid = m_uid;
+			}
 
-			MTL4::ArgumentTable* fragment_table = cmd.argument_table(table_fragment);
-			write_table(binding_set_index_fragment, fragment_table);
-			encoder->setArgumentTable(fragment_table, MTL::RenderStageFragment);
+			MTL4::ArgumentTable* vertex_table = write_table(binding_set_index_vertex, table_vertex);
+			if (!(encoder_state.tables_set & (1u << table_vertex)))
+			{
+				encoder->setArgumentTable(vertex_table, MTL::RenderStageVertex);
+				encoder_state.tables_set |= (1u << table_vertex);
+			}
+
+			MTL4::ArgumentTable* fragment_table = write_table(binding_set_index_fragment, table_fragment);
+			if (!(encoder_state.tables_set & (1u << table_fragment)))
+			{
+				encoder->setArgumentTable(fragment_table, MTL::RenderStageFragment);
+				encoder_state.tables_set |= (1u << table_fragment);
+			}
 		}
 
 		// ---- Static program helpers ---------------------------------------------------------------------------------
