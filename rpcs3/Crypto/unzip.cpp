@@ -64,6 +64,41 @@ std::vector<u8> unzip(const void* src, usz size)
 	return out;
 }
 
+bool unzip_exact(const void* src, usz size, void* dst, usz dst_size)
+{
+	// zlib counts in 32-bit units; everything unzipped this way is far smaller
+	if (!src || !size || !dst || !dst_size || size > u32{umax} || dst_size > u32{umax})
+	{
+		return false;
+	}
+
+	z_stream zs{};
+#ifndef _MSC_VER
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wold-style-cast"
+#endif
+	if (inflateInit2(&zs, 16 + 15) != Z_OK)
+	{
+		return false;
+	}
+#ifndef _MSC_VER
+#pragma GCC diagnostic pop
+#endif
+	zs.avail_in = static_cast<uInt>(size);
+	zs.next_in = static_cast<const u8*>(src);
+	zs.avail_out = static_cast<uInt>(dst_size);
+	zs.next_out = static_cast<u8*>(dst);
+
+	// With enough room for the whole output a single Z_FINISH call completes the stream. Z_STREAM_END is only
+	// returned after the gzip trailer's CRC and length have been verified, so anything else (damaged data, a
+	// truncated stream or output that doesn't fit) is a failure; trailing garbage is rejected as well.
+	const int res = inflate(&zs, Z_FINISH);
+	const bool ok = res == Z_STREAM_END && zs.avail_in == 0 && zs.avail_out == 0;
+
+	inflateEnd(&zs);
+	return ok;
+}
+
 bool unzip(const void* src, usz size, fs::file& out)
 {
 	if (!src || !size || !out)

@@ -526,6 +526,7 @@ namespace llvm
 	class ExecutionEngine;
 	class Module;
 	class StringRef;
+	class MemoryBuffer;
 }
 
 enum class thread_state : u32;
@@ -576,11 +577,18 @@ public:
 	// Add object (path to obj file)
 	bool add(const std::string& path);
 
+	// Add object previously read by load() (path is only used for logging)
+	bool add(std::unique_ptr<llvm::MemoryBuffer> object, const std::string& path);
+
 	// Update global mapping for a single value
 	void update_global_mapping(const std::string& name, u64 addr);
 
-	// Check object file
+	// Cheap check that an object file exists and isn't truncated (header/trailer only, no unzip)
 	static bool check(const std::string& path);
+
+	// Read, unzip and validate an object file (removed if damaged); nullptr if it's missing or invalid.
+	// Thread-safe, so the objects of a module can be loaded in parallel before they are add()ed in order.
+	static std::unique_ptr<llvm::MemoryBuffer> load(const std::string& path);
 
 	// Finalize
 	void fin();

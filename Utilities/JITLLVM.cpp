@@ -499,27 +499,75 @@ public:
 		module_file.commit();
 	}
 
+	// Size a compressed object file unzips to according to its gzip trailer, looking only at the file's size,
+	// header and trailer. 0 if the file can't be a complete gzip stream (empty, truncated, not gzip).
+	static usz gz_object_size(const fs::file& cached)
+	{
+		const u64 size = cached.size();
+
+		// 10-byte header, deflate data, 8-byte trailer (CRC32, ISIZE)
+		if (size < 18)
+		{
+			return 0;
+		}
+
+		u8 header[3]{};
+		u8 trailer[4]{};
+
+		if (cached.read_at(0, header, sizeof(header)) != sizeof(header) || cached.read_at(size - sizeof(trailer), trailer, sizeof(trailer)) != sizeof(trailer))
+		{
+			return 0;
+		}
+
+		// ID1, ID2, CM (deflate)
+		if (header[0] != 0x1f || header[1] != 0x8b || header[2] != 8)
+		{
+			return 0;
+		}
+
+		// ISIZE: uncompressed size modulo 2^32, little-endian (objects are far smaller than 4 GiB)
+		const usz out_size = trailer[0] | (trailer[1] << 8) | (trailer[2] << 16) | (usz{trailer[3]} << 24);
+
+		// Deflate can't compress better than ~1032:1; a larger claim means a damaged trailer (don't allocate it)
+		if (out_size > size * 1032)
+		{
+			return 0;
+		}
+
+		return out_size;
+	}
+
 	static std::unique_ptr<llvm::MemoryBuffer> load(const std::string& path)
 	{
 		if (fs::file cached{path + ".gz", fs::read})
 		{
-			const std::vector<u8> cached_data = cached.to_vector<u8>();
+			const u64 in_size = cached.size();
 
-			if (cached_data.empty()) [[unlikely]]
+			if (in_size == 0) [[unlikely]]
 			{
 				return nullptr;
 			}
 
-			const std::vector<u8> out = unzip(cached_data);
+			// The trailer gives the exact size, so the object is unzipped straight into the buffer handed to LLVM
+			// (no oversized zero-filled intermediate buffer and extra copy), and unzip_exact() verifies its CRC
+			const usz out_size = gz_object_size(cached);
 
-			if (out.empty())
+			// Read the compressed data without zero-filling the buffer first
+			std::unique_ptr<u8[]> cached_data(new u8[in_size]);
+
+			std::unique_ptr<llvm::WritableMemoryBuffer> buf;
+
+			if (out_size && cached.read_at(0, cached_data.get(), in_size) == in_size)
+			{
+				buf = llvm::WritableMemoryBuffer::getNewUninitMemBuffer(out_size);
+			}
+
+			if (!buf || !unzip_exact(cached_data.get(), in_size, buf->getBufferStart(), buf->getBufferSize()))
 			{
 				jit_log.error("LLVM: Failed to unzip module: '%s'", path);
 				return nullptr;
 			}
 
-			auto buf = llvm::WritableMemoryBuffer::getNewUninitMemBuffer(out.size());
-			std::memcpy(buf->getBufferStart(), out.data(), out.size());
 			return buf;
 		}
 
@@ -912,35 +960,75 @@ bool jit_compiler::add(const std::string& path)
 		return false;
 	}
 
-	if (auto object_file = llvm::object::ObjectFile::createObjectFile(*cache))
+	return add(std::move(cache), path);
+}
+
+bool jit_compiler::add(std::unique_ptr<llvm::MemoryBuffer> object, const std::string& path)
+{
+	if (!object)
 	{
-		m_engine->addObjectFile(llvm::object::OwningBinary<llvm::object::ObjectFile>(std::move(*object_file), std::move(cache)));
-		jit_log.trace("ObjectCache: Successfully added %s", path);
-		return true;
+		jit_log.error("ObjectCache: Nothing to add: %s", path);
+		return false;
 	}
-	else
+
+	auto object_file = llvm::object::ObjectFile::createObjectFile(*object);
+
+	if (!object_file)
 	{
+		llvm::consumeError(object_file.takeError());
 		jit_log.error("ObjectCache: Adding failed: %s", path);
 		return false;
 	}
+
+	m_engine->addObjectFile(llvm::object::OwningBinary<llvm::object::ObjectFile>(std::move(*object_file), std::move(object)));
+	jit_log.trace("ObjectCache: Successfully added %s", path);
+	return true;
 }
 
 bool jit_compiler::check(const std::string& path)
 {
-	if (auto cache = ObjectCache::load(path))
+	// Only the size, gzip header and trailer are looked at: unzipping every object here would repeat the work
+	// that load() does (with full validation) for the modules that actually get linked
+	if (fs::file cached{path + ".gz", fs::read})
 	{
-		if (auto object_file = llvm::object::ObjectFile::createObjectFile(*cache))
-		{
-			return true;
-		}
+		return ObjectCache::gz_object_size(cached) != 0;
+	}
 
-		if (fs::remove_file(path))
-		{
-			jit_log.error("ObjectCache: Removed damaged file: %s", path);
-		}
+	if (fs::file cached{path, fs::read})
+	{
+		return cached.size() != 0;
 	}
 
 	return false;
+}
+
+std::unique_ptr<llvm::MemoryBuffer> jit_compiler::load(const std::string& path)
+{
+	auto cache = ObjectCache::load(path);
+
+	if (!cache)
+	{
+		// Missing, or failed to unzip (CRC/length mismatch): recompiling the module overwrites the file
+		return nullptr;
+	}
+
+	auto object_file = llvm::object::ObjectFile::createObjectFile(*cache);
+
+	if (object_file)
+	{
+		return cache;
+	}
+
+	llvm::consumeError(object_file.takeError());
+
+	// Remove the file that was read (the compressed one takes precedence in ObjectCache::load), otherwise
+	// recompiling the module would load the same damaged object again through ObjectCache::getObject()
+	if (fs::remove_file(path + ".gz") || fs::remove_file(path))
+	{
+		jit_log.error("ObjectCache: Removed damaged file: %s", path);
+	}
+
+	return nullptr;
 }
 
 void jit_compiler::update_global_mapping(const std::string& name, u64 addr)
