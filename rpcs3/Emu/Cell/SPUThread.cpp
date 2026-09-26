@@ -3701,7 +3701,7 @@ void do_cell_atomic_128_store(u32 addr, const void* to_write)
 			result = utils::get_tsc() - perf0.get();
 		}
 
-		if (result > 20000 && g_cfg.core.perf_report) [[unlikely]]
+		if (result > utils::cycles_to_tsc_ticks(20000) && g_cfg.core.perf_report) [[unlikely]]
 		{
 			perf_log.warning("STORE128: took too long: %.3fus (%u c) (addr=0x%x)", result / (utils::get_tsc_freq() / 1000'000.), result, addr);
 		}
@@ -4274,7 +4274,7 @@ bool spu_thread::process_mfc_cmd()
 			spu_log.trace(u8"GETLLAR after fail: addr=0x%x, time=%u c", last_faddr, (perf0.get() - last_ftsc));
 		}
 
-		if (addr == last_faddr && perf0.get() - last_ftsc < 1000 && (vm::reservation_acquire(addr) & -128) == last_ftime)
+		if (addr == last_faddr && perf0.get() - last_ftsc < utils::cycles_to_tsc_ticks(1000) && (vm::reservation_acquire(addr) & -128) == last_ftime)
 		{
 			rtime = last_ftime;
 			raddr = last_faddr;
@@ -4326,7 +4326,7 @@ bool spu_thread::process_mfc_cmd()
 						if ([&]() -> bool
 						{
 							// Validation that it is indeed GETLLAR spinning (large time window is intentional)
-							if (last_getllar_addr != addr || last_getllar_gpr1 != gpr[1]._u32[3] || perf0.get() - last_gtsc >= 5'000 || (interrupts_enabled && ch_events.load().mask))
+							if (last_getllar_addr != addr || last_getllar_gpr1 != gpr[1]._u32[3] || perf0.get() - last_gtsc >= utils::cycles_to_tsc_ticks(5'000) || (interrupts_enabled && ch_events.load().mask))
 							{
 								// Seemingly not
 								getllar_busy_waiting_switch = umax;
@@ -4373,7 +4373,7 @@ bool spu_thread::process_mfc_cmd()
 								}
 							}
 							// Don't be stubborn, force operating sleep if too much time has passed
-							else if (getllar_busy_waiting_switch == 1 && perf0.get() > getllar_evaluate_time && perf0.get() - getllar_evaluate_time >= 400'000)
+							else if (getllar_busy_waiting_switch == 1 && perf0.get() > getllar_evaluate_time && perf0.get() - getllar_evaluate_time >= utils::cycles_to_tsc_ticks(400'000))
 							{
 								// Hidden value to force busy waiting
 								if (!g_cfg.core.spu_getllar_spin_optimization_disabled)

@@ -3470,7 +3470,7 @@ static T ppu_load_acquire_reservation(ppu_thread& ppu, u32 addr)
 		ppu_log.trace(u8"LARX after fail: addr=0x%x, faddr=0x%x, time=%u c", addr, ppu.last_faddr, (perf0.get() - ppu.last_ftsc));
 	}
 
-	if ((addr & addr_mask) == (ppu.last_faddr & addr_mask) && (perf0.get() - ppu.last_ftsc) < 600 && (vm::reservation_acquire(addr) & -128) == ppu.last_ftime)
+	if ((addr & addr_mask) == (ppu.last_faddr & addr_mask) && (perf0.get() - ppu.last_ftsc) < utils::cycles_to_tsc_ticks(600) && (vm::reservation_acquire(addr) & -128) == ppu.last_ftime)
 	{
 		be_t<u64> rdata;
 		std::memcpy(&rdata, &ppu.rdata[addr & 0x78], 8);

@@ -219,6 +219,20 @@ namespace utils
 		while (get_tsc() < stop);
 	}
 
+	// Convert a duration tuned in x86 TSC cycles (~3GHz) to get_tsc() ticks on this host, using the same scale as busy_wait().
+	// Use it wherever a get_tsc()/perf_meter delta is compared against a literal cycle count: on Apple Silicon the counter
+	// runs at 24MHz, so an unscaled threshold would be ~125x longer (e.g. 400'000 "cycles" = 16.7ms instead of ~133us).
+	// Never returns 0 so that "delta < threshold" checks can still pass.
+	inline u64 cycles_to_tsc_ticks(u64 x86_cycles)
+	{
+#ifdef ARCH_ARM64
+		const u64 ticks = (x86_cycles / 100) * arm_timer_scale;
+		return ticks ? ticks : 1;
+#else
+		return x86_cycles;
+#endif
+	}
+
 #ifdef ARCH_X64
 	inline u64 get_wait_cycles(u64 timeout_us, u64 tsc_freq)
 	{
