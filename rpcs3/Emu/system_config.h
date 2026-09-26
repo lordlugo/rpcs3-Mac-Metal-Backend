@@ -135,7 +135,7 @@ struct cfg_root : cfg::node
 		cfg::_enum<vsync_mode> vsync{ this, "VSync Mode", vsync_mode::off, true };
 #endif
 
-		cfg::_bool write_color_buffers{ this, "Write Color Buffers" };
+		cfg::_bool write_color_buffers{ this, "Write Color Buffers", true };
 		cfg::_bool write_depth_buffer{ this, "Write Depth Buffer" };
 		cfg::_bool read_color_buffers{ this, "Read Color Buffers" };
 		cfg::_bool read_depth_buffer{ this, "Read Depth Buffer" };
@@ -207,7 +207,7 @@ struct cfg_root : cfg::node
 
 			cfg::string adapter{ this, "Adapter" };
 			cfg::_enum<vk_exclusive_fs_mode> exclusive_fullscreen_mode{ this, "Exclusive Fullscreen Mode", vk_exclusive_fs_mode::unspecified};
-			cfg::_bool asynchronous_texture_streaming{ this, "Asynchronous Texture Streaming", false };
+			cfg::_bool asynchronous_texture_streaming{ this, "Asynchronous Texture Streaming", true };
 			cfg::_enum<vk_gpu_scheduler_mode> asynchronous_scheduler{ this, "Asynchronous Queue Scheduler", vk_gpu_scheduler_mode::safe };
 			cfg::uint<256, 65536> vram_allocation_limit{ this, "VRAM allocation limit (MB)", 65536, false };
 			cfg::_bool use_rebar_upload_heap{ this, "Use Re-BAR for GPU uploads", true, false };

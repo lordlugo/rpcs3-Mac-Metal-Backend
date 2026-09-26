@@ -592,6 +592,11 @@ void Emulator::Init()
 				g_cfg.video.resolution_scale_percent.set(200);
 			}
 		}},
+		{ "metal-fork-defaults-v5", "Write Color Buffers: On, Asynchronous Texture Streaming: On", []()
+		{
+			g_cfg.video.write_color_buffers.set(true);
+			g_cfg.video.vk.asynchronous_texture_streaming.set(true);
+		}},
 	};
 
 	for (const fork_defaults_t& defaults : fork_defaults)
