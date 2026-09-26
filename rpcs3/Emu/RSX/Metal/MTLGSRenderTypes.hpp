@@ -94,6 +94,8 @@ namespace mtl
 	// A command list of the renderer's rings (vk::command_buffer_chunk equivalent).
 	// Adds eid tagging (GC scopes), a reset counter used by occlusion queries and support for deferred submission
 	// through the RSX offloader thread (MTRSX). All completion paths report the event id to the resource manager.
+	// A primary list's prologue (command_list::prologue()) is committed by submit() in the same call, on whichever
+	// thread submits, and completes with the list: the waits and the eid tag below cover it.
 	struct command_buffer_chunk : public mtl::command_list
 	{
 		u64 eid_tag = 0;
@@ -362,13 +364,20 @@ namespace mtl
 	public:
 		command_buffer_chain() = default;
 
-		void create(const mtl::render_device& dev, MTL4::CommandQueue* queue, mtl::timeline& tl, std::string_view label, mtl::command_list::access_type_hint access)
+		// `enable_prologues`: see mtl::command_list::prologue(). Only for the RSX thread's primary lists.
+		void create(const mtl::render_device& dev, MTL4::CommandQueue* queue, mtl::timeline& tl, std::string_view label, mtl::command_list::access_type_hint access,
+			bool enable_prologues = false)
 		{
 			u32 index = 0;
 			for (auto& cb : m_cb_list)
 			{
 				cb.create(dev, queue, tl, fmt::format("%s #%u", label, index++));
 				cb.access_hint = access;
+
+				if (enable_prologues)
+				{
+					cb.enable_prologue();
+				}
 			}
 		}
 

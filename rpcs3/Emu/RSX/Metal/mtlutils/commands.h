@@ -6,6 +6,7 @@
 #include "Utilities/mutex.h"
 
 #include <array>
+#include <memory>
 
 namespace mtl
 {
@@ -38,12 +39,16 @@ namespace mtl
 		u64 feedback_splits = 0;
 		std::array<u64, static_cast<u32>(pass_split_reason::count)> splits_by_reason{};
 		u64 feedback_reads_in_pass = 0; // feedback reads served without a split (see render_target feedback streaks)
+		u64 uploads_ahead = 0;          // image uploads from memory recorded into a list's prologue (no pass end)
+		u64 uploads_inline = 0;         // image uploads from memory recorded inline
+		u64 uploads_inline_split = 0;   // ... of which ended an open render pass
 	};
 
 	gpu_stats_t get_gpu_stats_and_reset();
 	void count_feedback_split(pass_split_reason reason = pass_split_reason::read_after_write);
 	void count_feedback_read_in_pass();
 	void count_draw_render_pass();
+	void count_image_upload(bool ahead_of_pass, bool ended_pass);
 
 	struct submit_info_t
 	{
@@ -69,6 +74,14 @@ namespace mtl
 	//  - Inside a render pass nothing can be waited on (Apple GPUs do not support fragment->fragment barriers inside a
 	//    pass); to read a render target that is being written, end the pass (feedback loop handling lives in the renderer).
 	// This is conservative and correct; it can be relaxed later with finer stage masks.
+	//
+	// Prologue (opt-in, enable_prologue()): a second command buffer, committed in the same commit call right before
+	// this list's buffer. It shares the submission's waits, timeline signal, fence and GC event id. Because every encoder
+	// of this list begins with a queue barrier, ALL work of this list executes after the prologue, including work that
+	// was recorded before the prologue work in program order; the prologue's own encoders wait for all earlier queue
+	// work like any other. Only record work into it whose inputs were not produced by GPU work of this list and whose
+	// outputs no work already recorded in this list reads or writes: texture uploads from memory into images that are
+	// new to this list (shared scratch memory is fine, see the scratch pool in MTLTexture.cpp).
 	class command_list
 	{
 	public:
@@ -119,6 +132,12 @@ namespace mtl
 		bool m_is_open = false;
 		bool m_is_pending = false;
 		fence m_submit_fence{};
+
+		// Prologue list (created on first use). It is never submitted or waited on by itself: this list commits it and
+		// this list's completion implies its completion.
+		std::unique_ptr<command_list> m_prologue;
+		bool m_prologue_enabled = false;
+		bool m_prologue_recorded = false; // m_prologue was begun during the current recording and goes with its commit
 
 		std::string m_label;
 
@@ -171,6 +190,15 @@ namespace mtl
 
 		// Force the next encoder to wait for everything encoded before it (default behaviour anyway).
 		void full_barrier();
+
+		// --- Prologue (see the class comment) ----------------------------------------------------------------------
+		// Allows prologue() on this list. Only for lists recorded and submitted by one thread at a time (the renderer's
+		// primary lists).
+		void enable_prologue() { m_prologue_enabled = true; }
+		bool can_record_prologue() const { return m_prologue_enabled && m_is_open; }
+		// The prologue list of the current recording (begun on first use), or nullptr if prologues are not enabled or
+		// this list is not recording. Record into it with the usual helpers; it has its own encoders and argument tables.
+		command_list* prologue();
 
 		// --- Argument tables (one per stage slot, reused across encoders; contents captured at draw/dispatch) ---
 		MTL4::ArgumentTable* argument_table(argument_table_slot slot) const { return m_argument_tables[slot]; }

@@ -472,8 +472,9 @@ MTLGSRender::MTLGSRender(utils::serial* ar) noexcept : GSRender(ar)
 		swapchain_unavailable = true;
 	}
 
-	// Command lists
-	m_primary_cb_list.create(*m_device, m_device->queue(), m_timeline, "RSX primary", mtl::command_list::access_type_hint::flush_only);
+	// Command lists. Primary lists may record texture uploads into a prologue so that they do not end the open render
+	// pass (texture_cache::upload_image_from_cpu, "Asynchronous Texture Streaming").
+	m_primary_cb_list.create(*m_device, m_device->queue(), m_timeline, "RSX primary", mtl::command_list::access_type_hint::flush_only, true);
 	m_current_command_buffer = m_primary_cb_list.get();
 	m_current_command_buffer->begin();
 

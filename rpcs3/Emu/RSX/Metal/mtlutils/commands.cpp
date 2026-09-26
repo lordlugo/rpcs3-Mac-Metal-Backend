@@ -17,6 +17,9 @@ namespace mtl
 			atomic_t<u64> feedback_splits = 0;
 			std::array<atomic_t<u64>, static_cast<u32>(pass_split_reason::count)> splits_by_reason{};
 			atomic_t<u64> feedback_reads_in_pass = 0;
+			atomic_t<u64> uploads_ahead = 0;
+			atomic_t<u64> uploads_inline = 0;
+			atomic_t<u64> uploads_inline_split = 0;
 			atomic_t<u32> errors_logged = 0;
 		};
 
@@ -79,6 +82,9 @@ namespace mtl
 			stats.splits_by_reason[i] = state.splits_by_reason[i].exchange(0);
 		}
 		stats.feedback_reads_in_pass = state.feedback_reads_in_pass.exchange(0);
+		stats.uploads_ahead = state.uploads_ahead.exchange(0);
+		stats.uploads_inline = state.uploads_inline.exchange(0);
+		stats.uploads_inline_split = state.uploads_inline_split.exchange(0);
 		return stats;
 	}
 
@@ -97,6 +103,22 @@ namespace mtl
 	void count_draw_render_pass()
 	{
 		gpu_stats().draw_render_passes++;
+	}
+
+	void count_image_upload(bool ahead_of_pass, bool ended_pass)
+	{
+		auto& state = gpu_stats();
+		if (ahead_of_pass)
+		{
+			state.uploads_ahead++;
+			return;
+		}
+
+		state.uploads_inline++;
+		if (ended_pass)
+		{
+			state.uploads_inline_split++;
+		}
 	}
 
 	command_list::~command_list()
@@ -152,6 +174,10 @@ namespace mtl
 			rsx_log.error("Metal: command list '%s' still in flight at destruction (GPU hang?)", m_label);
 		}
 
+		// Committed together with this list: the wait above covered it
+		m_prologue.reset();
+		m_prologue_recorded = false;
+
 		for (auto& table : m_argument_tables)
 		{
 			if (table)
@@ -195,6 +221,10 @@ namespace mtl
 		m_next_pass_orders_vertex = false;
 		m_pass_orders_vertex = false;
 		m_compute_commands_since_barrier = 0;
+
+		// A prologue of a recording that was ended but never submitted is dropped with it (end() closed it)
+		ensure(!m_prologue || !m_prologue->m_is_open);
+		m_prologue_recorded = false;
 	}
 
 	void command_list::end()
@@ -203,6 +233,35 @@ namespace mtl
 		end_encoder();
 		m_commands->endCommandBuffer();
 		m_is_open = false;
+
+		if (m_prologue && m_prologue->m_is_open)
+		{
+			m_prologue->end();
+		}
+	}
+
+	command_list* command_list::prologue()
+	{
+		if (!can_record_prologue())
+		{
+			return nullptr;
+		}
+
+		if (!m_prologue)
+		{
+			m_prologue = std::make_unique<command_list>();
+			m_prologue->create(*m_device, m_queue, *m_timeline, m_label + " prologue");
+		}
+
+		if (!m_prologue_recorded)
+		{
+			// The prologue's previous recording was committed with this list's previous submission, which begin()
+			// waited for before this recording started: its allocator can be reset.
+			m_prologue->begin();
+			m_prologue_recorded = true;
+		}
+
+		return m_prologue.get();
 	}
 
 	u64 command_list::submit(const submit_info_t& info)
@@ -236,8 +295,21 @@ namespace mtl
 		auto options = ref(MTL4::CommitOptions::alloc()->init());
 		options->addFeedbackHandler(MTL4::CommitFeedbackHandlerFunction(&on_commit_feedback));
 
-		const MTL4::CommandBuffer* buffers[] = { m_commands };
-		m_queue->commit(buffers, 1, options.get());
+		// The prologue goes first in the same commit: the waits above, the timeline signal below (fence, GC event id of
+		// the renderer's lists) and the commit feedback cover both buffers, and the queue barriers that begin every
+		// encoder of this list order all of its work after the prologue.
+		const MTL4::CommandBuffer* buffers[2] = {};
+		u32 buffer_count = 0;
+
+		if (m_prologue_recorded)
+		{
+			ensure(!m_prologue->m_is_open);
+			buffers[buffer_count++] = m_prologue->m_commands;
+			m_prologue_recorded = false;
+		}
+
+		buffers[buffer_count++] = m_commands;
+		m_queue->commit(buffers, buffer_count, options.get());
 
 		if (info.signal_drawable)
 		{
