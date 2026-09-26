@@ -1039,11 +1039,17 @@ struct atomic_storage<T, 16> : atomic_storage<T, 0>
 	static inline T load(const T& dest)
 	{
 #if defined(ARM_FEATURE_LSE2)
+		// With FEAT_LSE2 an LDP of a 16-byte aligned address is single-copy atomic, but it is not a Load-Acquire.
+		// For seq_cst it must not be performed before an earlier Store-Release (STLR/STLXP/SWPAL... used by the other
+		// atomics) becomes visible: the leading LDAR is ordered after those (RCsc) and the LDP is ordered after the LDAR.
+		// DMB ISHLD then orders the LDP before all later loads and stores (acquire). Same sequence as GCC's libatomic.
+		u64 tmp;
 		u64 data[2];
 		__asm__ volatile("1:\n"
+			"ldar %x[tmp], %[dest]\n"
 			"ldp %x[data0], %x[data1], %[dest]\n"
-			"dmb ish\n"
-			: [data0] "=r"(data[0]), [data1] "=r"(data[1])
+			"dmb ishld\n"
+			: [tmp] "=&r" (tmp), [data0] "=r"(data[0]), [data1] "=r"(data[1])
 			: [dest] "Q"(dest)
 			: "memory");
 		T result;

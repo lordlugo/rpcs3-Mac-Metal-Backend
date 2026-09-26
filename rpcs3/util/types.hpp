@@ -23,7 +23,9 @@
 // See Arm C Language Extensions Documentation
 // Currently there is no feature macro for LSE2 specifically so we define it ourself
 // Unfortunately the __ARM_ARCH integer macro isn't universally defined so we use this hack instead
-#if defined(__ARM_ARCH_8_4__) || defined(__ARM_ARCH_8_5__) || defined(__ARM_ARCH_8_6__) || defined(__ARM_ARCH_9__)
+// Clang doesn't define the __ARM_ARCH_8_x__ macros on AArch64, so name the known targets explicitly: every arm64 Mac
+// (Apple M1 and newer) implements FEAT_LSE2
+#if defined(__ARM_ARCH_8_4__) || defined(__ARM_ARCH_8_5__) || defined(__ARM_ARCH_8_6__) || defined(__ARM_ARCH_9__) || defined(__APPLE__)
 #define ARM_FEATURE_LSE2 1
 #endif
 #endif
