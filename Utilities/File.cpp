@@ -1902,6 +1902,32 @@ void fs::sync()
 #endif
 }
 
+bool fs::sync_path(const std::string& path)
+{
+#ifdef _WIN32
+	return true;
+#else
+	// Directories can be opened read-only and fsync'd too (this persists the entries created in them)
+	const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+
+	if (fd == -1)
+	{
+		g_tls_error = to_error(errno);
+		return false;
+	}
+
+	const bool result = ::fsync(fd) == 0;
+
+	if (!result)
+	{
+		g_tls_error = to_error(errno);
+	}
+
+	::close(fd);
+	return result;
+#endif
+}
+
 [[noreturn]] void fs::xnull(std::source_location loc)
 {
 	fmt::throw_exception("Null object.%s", loc);

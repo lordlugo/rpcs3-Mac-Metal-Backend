@@ -290,6 +290,9 @@ struct lv2_file final : lv2_fs_object
 	// Stream lock
 	atomic_t<u32> lock{0};
 
+	// Serializes reads that use the file position while the mount lock is only held shared (see sys_fs_read)
+	shared_mutex pos_mutex;
+
 	// Some variables for convenience of data restoration
 	struct save_restore_t
 	{

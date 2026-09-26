@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 #include <algorithm>
@@ -56,6 +57,14 @@
 // is at least half the size of the archives that were loaded (a serializer that did not record archive hits would
 // produce a much smaller file); otherwise older files are kept and the caps below eventually reset the directory.
 // Files are only ever deleted at boot (before they are opened) or when the archives were found to be broken.
+//
+// Unchanged preloads: base.txt records, for the newest base file (by session and size), how many pipelines its preload
+// built and an order-independent digest of their keys (a hash of each pipeline's translated shaders and fixed-function
+// state, see new_render_pipeline_state). A later complete preload with the same count and digest recorded exactly the
+// pipelines that file already holds, so it is not rewritten: the session only updates base.txt ("confirmed" = its
+// number), and the next boot supersedes older sessions' files up to that session except the base file itself, as if a
+// new base file had been written. A base confirmed 7 boots in a row is rewritten anyway. A missing, torn or stale
+// base.txt never matches, so the worst case is a rewrite of the base file; it is deleted along with that file.
 
 namespace mtl
 {
@@ -73,6 +82,11 @@ namespace mtl
 		constexpr std::string_view temp_extension = ".tmp";
 		constexpr std::string_view incoming_dir = "incoming/"; // Archives are written here first (with their final name), then moved
 		constexpr std::string_view identity_file_name = "identity.txt";
+		constexpr std::string_view base_record_file_name = "base.txt";
+
+		// A base file confirmed by this many boots in a row is rewritten anyway, which bounds the cost of anything that
+		// changes the binaries without changing the pipeline keys (normally archive_format_version covers that)
+		constexpr u32 max_base_confirmations = 7;
 
 		// Limits for what is opened at boot. Normally one base file plus the deltas of one session remain.
 		constexpr usz max_archive_files = 48;
@@ -105,6 +119,57 @@ namespace mtl
 		{
 			const auto [ptr, ec] = std::from_chars(str.data(), str.data() + str.size(), value);
 			return ec == std::errc{} && ptr == str.data() + str.size();
+		}
+
+		// base.txt: what the newest base file holds (see "File policy")
+		struct base_record
+		{
+			u32 session = 0;       // Session that wrote the base file (index 0)
+			u64 size = 0;          // Its size, which ties the record to that very file
+			u32 count = 0;         // Pipelines its preload recorded...
+			u64 digest = 0;        // ...and the digest of their keys (capture_bundle::key_digest)
+			u32 confirmed = 0;     // Newest session whose complete preload recorded the same pipelines (>= session)
+			u32 confirmations = 0; // Boots in a row that confirmed the file instead of rewriting it
+		};
+
+		std::string format_base_record(const base_record& record)
+		{
+			return fmt::format("base %u %llu %u %016llx %u %u\n", record.session, record.size, record.count, record.digest, record.confirmed, record.confirmations);
+		}
+
+		bool parse_base_record(std::string_view text, base_record& out)
+		{
+			if (!text.ends_with('\n'))
+			{
+				return false;
+			}
+
+			text.remove_suffix(1);
+
+			std::vector<std::string_view> fields;
+			while (!text.empty())
+			{
+				const usz end = std::min(text.find(' '), text.size());
+				fields.push_back(text.substr(0, end));
+				text.remove_prefix(std::min(end + 1, text.size()));
+			}
+
+			const auto parse_u64 = [](std::string_view str, u64& value, int base)
+			{
+				const auto [ptr, ec] = std::from_chars(str.data(), str.data() + str.size(), value, base);
+				return ec == std::errc{} && ptr == str.data() + str.size();
+			};
+
+			base_record record{};
+			if (fields.size() != 7 || fields[0] != "base" || !parse_number(fields[1], record.session) || !parse_u64(fields[2], record.size, 10) ||
+				!parse_number(fields[3], record.count) || !parse_u64(fields[4], record.digest, 16) || !parse_number(fields[5], record.confirmed) ||
+				!parse_number(fields[6], record.confirmations))
+			{
+				return false;
+			}
+
+			out = record;
+			return true;
 		}
 
 		bool parse_archive_name(std::string_view name, archive_file& out)
@@ -191,6 +256,25 @@ namespace mtl
 			MTL4::Compiler* compiler = nullptr;                    // +1, records into `serializer`
 			u32 index = 0;
 			atomic_t<u32> pipeline_count{ 0 };                     // Pipelines successfully built with `compiler`
+			atomic_t<u64> key_digest{ 0 };                         // Sum of their mixed keys (independent of build order)
+			atomic_t<bool> keys_known{ true };                     // False once a pipeline without a key was built
+
+			void add_key(u64 key)
+			{
+				if (!key)
+				{
+					keys_known = false;
+					return;
+				}
+
+				// splitmix64 finalizer, so that summing related keys can't cancel out
+				key ^= key >> 30;
+				key *= 0xbf58476d1ce4e5b9ull;
+				key ^= key >> 27;
+				key *= 0x94d049bb133111ebull;
+				key ^= key >> 31;
+				key_digest += key;
+			}
 
 			capture_bundle() = default;
 			capture_bundle(const capture_bundle&) = delete;
@@ -222,6 +306,7 @@ namespace mtl
 			MTL4::CompilerTaskOptions* m_lookup_options = nullptr; // +1, lookupArchives = m_archives
 			u64 m_archive_bytes = 0;                               // Archive thread only after init
 			atomic_t<bool> m_lookup_enabled{ false };
+			std::optional<base_record> m_base_record;              // Describes the loaded base file (archive thread only after init)
 
 			// Current capturing compiler. Builds hold a reference while they use it.
 			std::mutex m_bundle_lock;
@@ -306,6 +391,7 @@ namespace mtl
 					}
 
 					remove_files(files);
+					remove_entry(record_path());
 
 					if (!fs::write_file(identity_path, fs::rewrite, identity))
 					{
@@ -328,12 +414,29 @@ namespace mtl
 					}
 				}
 
-				if (newest_base)
+				// A later complete preload that recorded the same pipelines as the newest base file supersedes older
+				// files just like a new base file would have (the base file itself is kept)
+				std::optional<base_record> record;
+
+				if (fs::file file(record_path()); file && newest_base)
+				{
+					base_record stored{};
+
+					if (parse_base_record(file.to_string(), stored) && stored.session == newest_base && stored.confirmed >= stored.session &&
+						std::any_of(files.begin(), files.end(), [&](const archive_file& f) { return f.base && f.session == newest_base && f.size == stored.size; }))
+					{
+						record = stored;
+					}
+				}
+
+				const u32 superseding_session = record ? record->confirmed : newest_base;
+
+				if (superseding_session)
 				{
 					std::vector<archive_file> superseded;
 					std::erase_if(files, [&](const archive_file& file)
 					{
-						if (file.session >= newest_base)
+						if (file.session >= superseding_session || (file.base && file.session == newest_base))
 						{
 							return false;
 						}
@@ -356,9 +459,11 @@ namespace mtl
 					rsx_log.warning("Metal: resetting the pipeline archive (%u files, %.1f MiB): earlier archives were never superseded",
 						::size32(files), to_mib(total_size));
 					remove_files(files);
+					record.reset();
 				}
 
-				m_session = newest_session + 1;
+				// Session numbers keep increasing even when the confirming sessions wrote no file
+				m_session = std::max(newest_session, superseding_session) + 1;
 
 				// 3. Open them: base first (most hits), then newest first
 				std::sort(files.begin(), files.end(), [](const archive_file& a, const archive_file& b)
@@ -398,6 +503,16 @@ namespace mtl
 					m_lookup_options = MTL4::CompilerTaskOptions::alloc()->init();
 					m_lookup_options->setLookupArchives(NS::Array::array(objects.data(), objects.size())); // Copied (retained)
 					m_lookup_enabled = true;
+				}
+
+				// The record only matters while the base file it describes is in use
+				if (record && is_base_loaded(*record))
+				{
+					m_base_record = record;
+				}
+				else
+				{
+					remove_entry(record_path());
 				}
 
 				// 4. Start recording
@@ -494,7 +609,7 @@ namespace mtl
 			}
 
 			template <typename T, typename D, typename F>
-			T* build(const D* descriptor, NS::Error** error, F&& compile)
+			T* build(const D* descriptor, NS::Error** error, u64 key, F&& compile)
 			{
 				std::shared_ptr<capture_bundle> bundle;
 				{
@@ -536,6 +651,7 @@ namespace mtl
 				{
 					if (bundle)
 					{
+						bundle->add_key(key);
 						bundle->pipeline_count++;
 						m_last_build_time = static_cast<u64>(clock_type::now().time_since_epoch().count());
 					}
@@ -549,6 +665,31 @@ namespace mtl
 			}
 
 		private:
+			std::string record_path() const
+			{
+				return m_directory + std::string(base_record_file_name);
+			}
+
+			// The base file `record` describes is open and still used for lookups (not discarded)
+			bool is_base_loaded(const base_record& record) const
+			{
+				const std::string name = make_archive_name(record.session, 0, true);
+				return m_lookup_enabled && std::find(m_archive_names.begin(), m_archive_names.end(), name) != m_archive_names.end();
+			}
+
+			bool write_base_record(const base_record& record)
+			{
+				// A torn or stale record never matches (see init), which only costs a rewrite of the base file
+				if (!fs::write_file(record_path(), fs::rewrite, format_base_record(record)))
+				{
+					rsx_log.warning("Metal: cannot write %s (%s)", record_path(), fs::g_tls_error);
+					remove_entry(record_path());
+					return false;
+				}
+
+				return true;
+			}
+
 			std::vector<archive_file> scan_directory()
 			{
 				std::vector<archive_file> files;
@@ -775,6 +916,28 @@ namespace mtl
 					return;
 				}
 
+				// Serializer 0 of a complete preload that recorded exactly the pipelines of the loaded base file (same keys):
+				// rewriting the base (hundreds of MiB for a big title) on every boot would only reproduce it. This session
+				// confirms it instead, which supersedes older files the same way (see "File policy").
+				if (bundle.index == 0 && m_preload_complete && m_base_record && is_base_loaded(*m_base_record) && bundle.keys_known &&
+					count == m_base_record->count && bundle.key_digest == m_base_record->digest && m_base_record->confirmations < max_base_confirmations)
+				{
+					base_record record = *m_base_record;
+					record.confirmed = m_session;
+					record.confirmations++;
+
+					if (write_base_record(record))
+					{
+						m_base_record = record;
+						rsx_log.notice("Metal: the pipeline archive %s already holds the %u pipeline(s) of the preload; not rewriting it",
+							make_archive_name(record.session, 0, true), count);
+						return;
+					}
+
+					// Otherwise the older files would not be superseded: write a new base file as usual
+					m_base_record.reset();
+				}
+
 				mtl::autorelease_scope pool;
 				const auto start = clock_type::now();
 
@@ -829,6 +992,21 @@ namespace mtl
 
 				rsx_log.notice("Metal: saved %u pipeline(s) to the pipeline archive %s (%.1f MiB, %llu ms)", count, name, to_mib(size), elapsed_ms(start));
 
+				if (base)
+				{
+					// Written after the file is in place: a missing or stale record only means the next boot rewrites it
+					m_base_record.reset();
+
+					if (const base_record record{ m_session, size, count, bundle.key_digest, m_session, 0 }; !bundle.keys_known || !write_base_record(record))
+					{
+						remove_entry(record_path());
+					}
+					else
+					{
+						m_base_record = record;
+					}
+				}
+
 				if (supersedes && !base)
 				{
 					rsx_log.warning("Metal: the preload archive (%.1f MiB) is much smaller than the archives it would replace (%.1f MiB); keeping them",
@@ -848,6 +1026,10 @@ namespace mtl
 				rsx_log.notice("Metal: deleted %u pipeline archive file(s)", ::size32(m_archive_names));
 				m_archive_names.clear();
 				m_archive_bytes = 0;
+
+				// The base file it describes is gone (the preload must be written again)
+				m_base_record.reset();
+				remove_entry(record_path());
 			}
 		};
 
@@ -995,11 +1177,11 @@ namespace mtl
 		// Otherwise the Metal objects are released here (last reference)
 	}
 
-	MTL::RenderPipelineState* new_render_pipeline_state(const MTL4::RenderPipelineDescriptor* descriptor, NS::Error** error)
+	MTL::RenderPipelineState* new_render_pipeline_state(const MTL4::RenderPipelineDescriptor* descriptor, NS::Error** error, u64 key)
 	{
 		if (const auto archive = get_archive())
 		{
-			return archive->build<MTL::RenderPipelineState>(descriptor, error,
+			return archive->build<MTL::RenderPipelineState>(descriptor, error, key,
 				[](MTL4::Compiler* compiler, const MTL4::RenderPipelineDescriptor* desc, const MTL4::CompilerTaskOptions* options, NS::Error** err)
 				{
 					return compiler->newRenderPipelineState(desc, options, err);
@@ -1009,11 +1191,11 @@ namespace mtl
 		return g_render_device->compiler()->newRenderPipelineState(descriptor, nullptr, error);
 	}
 
-	MTL::ComputePipelineState* new_compute_pipeline_state(const MTL4::ComputePipelineDescriptor* descriptor, NS::Error** error)
+	MTL::ComputePipelineState* new_compute_pipeline_state(const MTL4::ComputePipelineDescriptor* descriptor, NS::Error** error, u64 key)
 	{
 		if (const auto archive = get_archive())
 		{
-			return archive->build<MTL::ComputePipelineState>(descriptor, error,
+			return archive->build<MTL::ComputePipelineState>(descriptor, error, key,
 				[](MTL4::Compiler* compiler, const MTL4::ComputePipelineDescriptor* desc, const MTL4::CompilerTaskOptions* options, NS::Error** err)
 				{
 					return compiler->newComputePipelineState(desc, options, err);

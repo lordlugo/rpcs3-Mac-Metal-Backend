@@ -4997,6 +4997,12 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 	// Info to load to main JIT instance (true - compiled)
 	std::vector<std::pair<std::string, bool>> link_workload;
 
+	// Object files already loaded from the cache for link_workload (same index, nullptr for compiled ones)
+	std::vector<std::unique_ptr<llvm::MemoryBuffer>> link_objects;
+
+	// Modules whose cached object file has to be checked (to be loaded, or compiled if missing or damaged)
+	std::vector<std::pair<std::string, ppu_module<lv2_obj>>> to_check;
+
 	bool compiled_new = false;
 
 	bool has_mfvscr = false;
@@ -5560,41 +5566,89 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 
 		module_counter++;
 
-		if (!check_only)
+		if (check_only)
 		{
-			link_workload.emplace_back(obj_name, false);
-		}
-
-		// Check object file
-		if (jit_compiler::check(cache_path + obj_name))
-		{
-			if (!is_being_used_in_emulation && !check_only)
+			// Cheap test (the file exists and isn't truncated). The pass that actually uses the module reads,
+			// unzips and validates it fully, and recompiles it if it's damaged.
+			if (!jit_compiler::check(cache_path + obj_name))
 			{
-				ppu_log.success("LLVM: Module exists: %s", obj_name);
-				link_workload.pop_back();
+				return true;
 			}
 
 			continue;
 		}
 
-		if (check_only)
-		{
-			return true;
-		}
-
-		// Remember, used in ppu_initialize(void)
-		compiled_new = true;
-
-		// Adjust information (is_compiled)
-		link_workload.back().second = true;
-
-		// Fill workload list for compilation
-		workload.emplace_back(std::move(obj_name), std::move(part));
+		// Checked below, all at once
+		to_check.emplace_back(std::move(obj_name), std::move(part));
 	}
 
 	if (check_only)
 	{
 		return false;
+	}
+
+	// Read, unzip and validate object files. This used to happen twice per module (once to check it and again to
+	// add it) on this thread; now each file is loaded once, in parallel when the module is going to be linked
+	// (precompilation already runs several files in parallel), and the validated buffer is handed to add().
+	{
+		std::vector<std::unique_ptr<llvm::MemoryBuffer>> objects(to_check.size());
+		std::unique_ptr<u8[]> valid(new u8[to_check.size()]{});
+
+		const usz load_threads = is_being_used_in_emulation ? std::min<usz>(to_check.size(), rpcs3::utils::get_max_threads()) : 1;
+
+		map_workload("PPU Cache Loader "sv, load_threads, to_check.size(), [&](usz i)
+		{
+			if (cpu ? cpu->state.all_of(cpu_flag::exit) : Emu.IsStopped())
+			{
+				return;
+			}
+
+			auto object = jit_compiler::load(cache_path + to_check[i].first);
+			valid[i] = !!object;
+
+			if (is_being_used_in_emulation)
+			{
+				objects[i] = std::move(object);
+			}
+		});
+
+		if (cpu ? cpu->state.all_of(cpu_flag::exit) : Emu.IsStopped())
+		{
+			return compiled_new;
+		}
+
+		// Keep the original module order
+		for (usz i = 0; i < to_check.size(); i++)
+		{
+			auto& [obj_name, part] = to_check[i];
+
+			if (valid[i])
+			{
+				if (is_being_used_in_emulation)
+				{
+					link_workload.emplace_back(obj_name, false);
+					link_objects.emplace_back(std::move(objects[i]));
+				}
+				else
+				{
+					ppu_log.success("LLVM: Module exists: %s", obj_name);
+				}
+
+				continue;
+			}
+
+			// Remember, used in ppu_initialize(void)
+			compiled_new = true;
+
+			// Compiled below (is_compiled)
+			link_workload.emplace_back(obj_name, true);
+			link_objects.emplace_back();
+
+			// Fill workload list for compilation
+			workload.emplace_back(std::move(obj_name), std::move(part));
+		}
+
+		to_check.clear();
 	}
 
 	if (g_progr_ftotal_bits && file_size)
@@ -5789,10 +5843,17 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 				break;
 			}
 
-			if (!failed_to_load && !jits[mod_index / c_modules_per_jit]->add(cache_path + obj_name))
+			if (!failed_to_load)
 			{
-				ppu_log.error("LLVM: Failed to load module %s", obj_name);
-				failed_to_load = true;
+				// Modules loaded above are added from memory, freshly compiled ones are read from the cache
+				auto& jit = *jits[mod_index / c_modules_per_jit];
+				auto& object = link_objects[mod_index];
+
+				if (!(object ? jit.add(std::move(object), cache_path + obj_name) : jit.add(cache_path + obj_name)))
+				{
+					ppu_log.error("LLVM: Failed to load module %s", obj_name);
+					failed_to_load = true;
+				}
 			}
 
 			if (mod_index % increment_link_count_at == (link_workload.size() - 1) % increment_link_count_at)

@@ -6,6 +6,7 @@
 #include "Utilities/Thread.h"
 #include "util/sysinfo.hpp"
 #include "util/asm.hpp"
+#include "util/fnv_hash.hpp"
 
 #include <algorithm>
 
@@ -21,6 +22,43 @@ namespace mtl
 		bool use_fast_math()
 		{
 			return !g_cfg.video.disable_msl_fast_math;
+		}
+
+		// FNV-1a over 64-bit words (then bytes), length first
+		u64 hash_bytes(u64 hash, const void* data, usz size)
+		{
+			const auto* bytes = static_cast<const u8*>(data);
+			hash = rpcs3::hash64(hash, u64{size});
+
+			for (; size >= sizeof(u64); bytes += sizeof(u64), size -= sizeof(u64))
+			{
+				u64 word;
+				std::memcpy(&word, bytes, sizeof(word));
+				hash = rpcs3::hash64(hash, word);
+			}
+
+			for (; size; bytes++, size--)
+			{
+				hash = rpcs3::hash64(hash, *bytes);
+			}
+
+			return hash;
+		}
+
+		// Pipeline key for the pipeline archive (mtl::new_render_pipeline_state): the descriptors built below are a
+		// deterministic function of the translated shaders (MSL, which reflects the binding layout) and `state`
+		// (fast math has separate archives). Never 0, which means "unknown".
+		u64 make_pipeline_key(u64 kind, std::initializer_list<const std::string*> msl, const void* state = nullptr, usz state_size = 0)
+		{
+			u64 hash = rpcs3::hash64(rpcs3::fnv_seed, kind);
+
+			for (const std::string* source : msl)
+			{
+				hash = hash_bytes(hash, source->data(), source->size());
+			}
+
+			hash = hash_bytes(hash, state, state_size);
+			return hash ? hash : 1;
 		}
 
 		// Size in bytes of the vertex fetch formats produced by the translator's stage_in reflection
@@ -120,7 +158,7 @@ namespace mtl
 
 		// Through the pipeline archive (reuses binaries from earlier sessions, records new ones) when it is enabled
 		NS::Error* error = nullptr;
-		MTL::ComputePipelineState* pipeline = mtl::new_compute_pipeline_state(descriptor.get(), &error);
+		MTL::ComputePipelineState* pipeline = mtl::new_compute_pipeline_state(descriptor.get(), &error, make_pipeline_key(2, { &cs.get_msl() }));
 
 		if (!pipeline)
 		{
@@ -232,7 +270,9 @@ namespace mtl
 		// Through the pipeline archive (reuses binaries from earlier sessions, records new ones) when it is enabled.
 		// The descriptor must be a deterministic function of the shaders and `state`: it is the archive lookup key.
 		NS::Error* error = nullptr;
-		MTL::RenderPipelineState* pipeline = mtl::new_render_pipeline_state(descriptor.get(), &error);
+		const std::string no_fragment_shader;
+		const u64 key = make_pipeline_key(1, { &vs.get_msl(), rasterization_enabled ? &fs.get_msl() : &no_fragment_shader }, &state, sizeof(state));
+		MTL::RenderPipelineState* pipeline = mtl::new_render_pipeline_state(descriptor.get(), &error, key);
 
 		if (!pipeline)
 		{

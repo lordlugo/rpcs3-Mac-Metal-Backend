@@ -266,6 +266,10 @@ namespace fs
 	// Synchronize filesystems (TODO)
 	void sync();
 
+	// Flush one file, or a directory's entries, to disk (fsync) instead of every volume like sync().
+	// Unlike file::sync(), a failure is returned rather than fatal. No-op on Windows (like sync()).
+	bool sync_path(const std::string& path);
+
 	class file final
 	{
 		std::unique_ptr<file_base> m_file{};

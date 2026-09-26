@@ -579,10 +579,41 @@ lv2_fs_object::lv2_fs_object(utils::serial& ar, bool)
 {
 }
 
+namespace
+{
+	// Largest amount of data read through the intermediate buffer at once
+	constexpr u64 c_max_read_buffer = 0x10'0000;
+
+	// Intermediate buffer for reads into guest memory that can't be handed to a native API. Each thread reuses its own
+	// instead of allocating (and zero-filling) one per read; it grows on demand up to c_max_read_buffer.
+	std::span<uchar> get_read_buffer(u64 size)
+	{
+		thread_local std::unique_ptr<uchar[]> s_buffer;
+		thread_local u64 s_size = 0;
+
+		if (const u64 wanted = std::min<u64>(size, c_max_read_buffer); s_size < wanted)
+		{
+			// Powers of two from 64 KiB, to limit reallocations
+			const u64 new_size = std::clamp<u64>(std::bit_ceil(wanted), 0x10000, c_max_read_buffer);
+			s_buffer.reset();
+			s_buffer.reset(new uchar[new_size]);
+			s_size = new_size;
+		}
+
+		return {s_buffer.get(), s_size};
+	}
+
+	// Whether the destination can be passed to a native API directly (see lv2_file::op_read)
+	bool can_read_directly(vm::ptr<void> buf, u64 size)
+	{
+		const u64 region = buf.addr() >> 28, region_end = (buf.addr() + size) >> 28;
+		return size < u32{umax} && region == region_end && (region == 0 || region == 0xD) && vm::check_addr(buf.addr(), vm::page_writable, static_cast<u32>(size));
+	}
+}
+
 u64 lv2_file::op_read(const fs::file& file, vm::ptr<void> buf, u64 size, u64 opt_pos)
 {
-	if (u64 region = buf.addr() >> 28, region_end = (buf.addr() + size) >> 28;
-		size < u32{umax} && region == region_end && (region == 0 || region == 0xD) && vm::check_addr(buf.addr(), vm::page_writable, static_cast<u32>(size)))
+	if (can_read_directly(buf, size))
 	{
 		// Optimize reads from safe memory
 		const auto buf_ptr = vm::get_super_ptr(buf.addr());
@@ -590,7 +621,7 @@ u64 lv2_file::op_read(const fs::file& file, vm::ptr<void> buf, u64 size, u64 opt
 	}
 
 	// Copy data from intermediate buffer (avoid passing vm pointer to a native API)
-	std::vector<uchar> local_buf(std::min<u64>(size, 65536));
+	const std::span<uchar> local_buf = get_read_buffer(size);
 
 	u64 result = 0;
 
@@ -1362,25 +1393,64 @@ error_code sys_fs_read(ppu_thread& ppu, u32 fd, vm::ptr<void> buf, u64 nbytes, v
 		lv2_obj::sleep(ppu);
 	}
 
-	std::unique_lock lock(file->mp->mutex);
+	u64 read_bytes = 0;
+	bool failure = false;
 
-	if (!file->file)
+	// Data to copy into guest memory once the locks are released
+	const uchar* staged = nullptr;
+
 	{
-		return CELL_EBADF;
+		// Nothing can write to a read-only mount (e.g. the game disc), so reads there only take the mount lock shared
+		// (as cellFsReadWithOffset does) and several threads can stream from it at once. Everything else that uses a
+		// file's position takes the mount lock exclusively; concurrent reads of the same file serialize on pos_mutex.
+		std::unique_lock wlock(file->mp->mutex, std::defer_lock);
+		std::shared_lock rlock(file->mp->mutex, std::defer_lock);
+		std::unique_lock pos_lock(file->pos_mutex, std::defer_lock);
+
+		if (file->mp.read_only)
+		{
+			rlock.lock();
+			pos_lock.lock();
+		}
+		else
+		{
+			wlock.lock();
+		}
+
+		if (!file->file)
+		{
+			return CELL_EBADF;
+		}
+
+		if (file->lock == 2)
+		{
+			nread.try_write(0);
+			return CELL_EIO;
+		}
+
+		if (nbytes <= c_max_read_buffer && !can_read_directly(buf, nbytes))
+		{
+			// The read fits in the intermediate buffer: copy it into guest memory, which may fault (e.g. on pages watched
+			// by RSX), after the locks are released instead of stalling every other user of the mount meanwhile
+			const std::span<uchar> local_buf = get_read_buffer(nbytes);
+			read_bytes = file->file.read(local_buf.data(), nbytes);
+			staged = local_buf.data();
+		}
+		else
+		{
+			read_bytes = file->op_read(buf, nbytes);
+		}
+
+		failure = !read_bytes && file->file.pos() < file->file.size();
+
+		file->reads_total += read_bytes;
 	}
 
-	if (file->lock == 2)
+	if (staged)
 	{
-		nread.try_write(0);
-		return CELL_EIO;
+		std::memcpy(buf.get_ptr(), staged, read_bytes);
 	}
 
-	const u64 read_bytes = file->op_read(buf, nbytes);
-	const bool failure = !read_bytes && file->file.pos() < file->file.size();
-
-	file->reads_total += read_bytes;
-
-	lock.unlock();
 	ppu.check_state();
 
 	*nread = read_bytes;
@@ -1505,7 +1575,11 @@ error_code sys_fs_close(ppu_thread& ppu, u32 fd)
 			return {CELL_EBADF, fd};
 		}
 
-		if (!(file->mp.read_only && file->mp->flags & lv2_mp_flag::cache) && file->flags & CELL_FS_O_ACCMODE)
+		// Only files written into a gamedata temporary directory (created by cellGameCreateGameData) have to be on disk
+		// here, before cellGameContentPermit renames that directory into place. Syncing every written file stalled the
+		// PPU thread, with the mount mutex held, on each close; other files reach the disk through the host OS as usual,
+		// and sys_fs_rename flushes a file before it replaces another.
+		if (file->mp == &g_mp_sys_dev_hdd0 && file->flags & CELL_FS_O_ACCMODE && std::string_view{file->name.data()}.starts_with("/dev_hdd0/game/_GDATA_"))
 		{
 			// Special: Ensure temporary directory for gamedata writes will remain on disk before final gamedata commitment
 			file->file.sync(); // For cellGameContentPermit atomicity
@@ -2096,6 +2170,14 @@ error_code sys_fs_rename(ppu_thread& ppu, vm::cptr<char> from, vm::cptr<char> to
 	if (mp.read_only || mp.mp->flags & lv2_mp_flag::read_only)
 	{
 		return CELL_EROFS;
+	}
+
+	// Games save by writing a new file and renaming it over the old one: its data must reach the disk before the rename
+	// does, or a power loss or system crash could leave a partial file in place of both versions. sys_fs_close no longer
+	// flushes every written file, so do it here (renames are rare); the cache partition (/dev_hdd1) doesn't need this.
+	if (!(mp->flags & lv2_mp_flag::cache) && fs::is_file(local_from) && !fs::sync_path(local_from))
+	{
+		sys_fs.warning("sys_fs_rename(): failed to flush %s (%s)", from, fs::g_tls_error);
 	}
 
 	// Done in vfs::host::rename

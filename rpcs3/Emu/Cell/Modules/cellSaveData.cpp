@@ -2189,7 +2189,22 @@ static NEVER_INLINE error_code savedata_op(ppu_thread& ppu, u32 operation, u32 v
 
 		// Remove old backup
 		fs::remove_all(old_path);
-		fs::sync();
+
+		// The new savedata must be on disk before the directory swap below. Flush exactly what was written (every file
+		// in the temporary directory, then the directory's entries) instead of fs::sync(), which flushed every mounted
+		// volume and could stall the game for a long time. A failure is logged; the commit goes on as it did before.
+		for (auto&& entry : fs::dir(new_path))
+		{
+			if (!entry.is_directory && !fs::sync_path(new_path + entry.name))
+			{
+				cellSaveData.error("savedata_op(): failed to flush %s%s (%s)", new_path, entry.name, fs::g_tls_error);
+			}
+		}
+
+		if (!fs::sync_path(new_path))
+		{
+			cellSaveData.error("savedata_op(): failed to flush %s (%s)", new_path, fs::g_tls_error);
+		}
 
 		// Backup old savedata
 		if (!vfs::host::rename(dir_path, old_path, &g_mp_sys_dev_hdd0, false))
