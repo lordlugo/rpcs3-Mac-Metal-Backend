@@ -138,6 +138,12 @@ namespace mtl
 		std::string vs_src;
 		std::string fs_src;
 
+		// vs_src/fs_src translated once (GLSL -> SPIR-V -> MSL -> MTLLibrary, on first use) and shared by every pipeline
+		// variant of the pass, so a new target format or sample count only builds a pipeline state. The sources and
+		// program inputs of a pass never change after construction.
+		std::unique_ptr<glsl::shader> m_vertex_shader;
+		std::unique_ptr<glsl::shader> m_fragment_shader;
+
 		overlay_pipeline_config renderpass_config;
 
 		bool initialized = false;
@@ -163,6 +169,7 @@ namespace mtl
 		overlay_pass(const overlay_pass&) = delete;
 		overlay_pass& operator=(const overlay_pass&) = delete;
 
+		// Hash of the state a pipeline actually bakes (no depth/stencil format, topology normalized)
 		u64 get_pipeline_key(const glsl::graphics_pipeline_state& state) const;
 
 		virtual void update_uniforms(mtl::command_list& /*cmd*/, glsl::program* /*program*/) {}

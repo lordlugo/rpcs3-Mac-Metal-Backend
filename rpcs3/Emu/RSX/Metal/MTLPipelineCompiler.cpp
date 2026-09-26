@@ -9,13 +9,48 @@
 #include "util/fnv_hash.hpp"
 
 #include <algorithm>
+#include <deque>
+#include <mutex>
+#include <optional>
 
 namespace mtl
 {
 	// Global list of worker threads
 	static std::unique_ptr<named_thread_group<pipe_compiler>> g_pipe_compilers;
-	static int g_num_pipe_compilers = 0;
-	static atomic_t<int> g_compiler_index{};
+
+	struct pipe_compiler::job_queue
+	{
+		std::mutex mutex;
+		std::deque<pipe_compiler_job> jobs;   // Oldest first, except for jobs moved to the front by prioritize_jobs()
+		atomic_t<u32> pushed = 0;             // Bumped by every push; idle workers wait on it
+		atomic_t<u32> completed = 0;          // Bumped after every finished deferred job (see get_completed_job_count)
+
+		void push(pipe_compiler_job&& job)
+		{
+			{
+				std::lock_guard lock(mutex);
+				jobs.push_back(std::move(job));
+			}
+
+			pushed++;
+			pushed.notify_one();
+		}
+
+		std::optional<pipe_compiler_job> pop()
+		{
+			std::lock_guard lock(mutex);
+			if (jobs.empty())
+			{
+				return std::nullopt;
+			}
+
+			std::optional<pipe_compiler_job> result(std::move(jobs.front()));
+			jobs.pop_front();
+			return result;
+		}
+	};
+
+	pipe_compiler::job_queue pipe_compiler::s_queue;
 
 	namespace
 	{
@@ -229,7 +264,8 @@ namespace mtl
 		// RSX vertex programs always write gl_PointSize ([[point_size]] in MSL). Metal rejects such a vertex function
 		// in a pipeline declared as line/triangle ("Vertex shader writes point size but inputPrimitiveTopology is
 		// MTLPrimitiveTopologyClassTriangle"), so only point pipelines declare their class. Unspecified is Metal's
-		// default and is only required to be explicit for layered rendering, which RSX never uses.
+		// default and is only required to be explicit for layered rendering, which RSX never uses. Keys store the class
+		// as get_pipeline_topology_class() normalizes it, so this never builds a line and a triangle variant.
 		descriptor->setInputPrimitiveTopology(state.topology_class == static_cast<u8>(MTL::PrimitiveTopologyClassPoint)
 			? MTL::PrimitiveTopologyClassPoint
 			: MTL::PrimitiveTopologyClassUnspecified);
@@ -314,30 +350,88 @@ namespace mtl
 
 	void pipe_compiler::operator()()
 	{
+		// Pipeline builds are background work: run below the emulation threads (named threads start at
+		// QOS_CLASS_USER_INTERACTIVE on macOS; -1 is QOS_CLASS_USER_INITIATED, which still gets performance cores). The
+		// Metal compiler service inherits the QoS of the calling thread, so this applies to the MTLLibrary and pipeline
+		// builds as well. A job the RSX thread is blocked on (prioritize_jobs) runs at emulation priority instead: the
+		// RSX thread is idle meanwhile.
+		bool urgent_priority = false;
+		thread_ctrl::set_native_priority(-1);
+
 		while (thread_ctrl::state() != thread_state::aborting)
 		{
-			for (auto&& job : m_work_queue.pop_all())
+			// Sampled before the queue is checked: a job pushed after the check changes it and ends the wait
+			const u32 pushed = s_queue.pushed.load();
+
+			auto job = s_queue.pop();
+			if (!job)
+			{
+				thread_ctrl::wait_on(s_queue.pushed, pushed);
+				continue;
+			}
+
+			if (job->urgent != urgent_priority)
+			{
+				urgent_priority = job->urgent;
+				thread_ctrl::set_native_priority(urgent_priority ? 1 : -1);
+			}
+
 			{
 				// Every job gets its own pool: Metal descriptors, errors and strings are autoreleased
 				mtl::autorelease_scope autorelease;
 
 				std::unique_ptr<glsl::program> compiled;
-				if (job.is_graphics_job)
+				if (job->is_graphics_job)
 				{
-					compiled = int_compile_graphics_pipe(job.graphics_data, job.shaders[0], job.shaders[1], job.inputs[0], job.inputs[1], job.flags);
+					compiled = int_compile_graphics_pipe(job->graphics_data, job->shaders[0], job->shaders[1], job->inputs[0], job->inputs[1], job->flags);
 				}
 				else
 				{
-					compiled = int_compile_compute_pipe(job.shaders[0], job.inputs[0], job.flags);
+					compiled = int_compile_compute_pipe(job->shaders[0], job->inputs[0], job->flags);
 				}
 
-				if (job.callback_func)
+				if (job->callback_func)
 				{
-					job.callback_func(compiled);
+					job->callback_func(compiled);
 				}
 			}
 
-			thread_ctrl::wait_on(m_work_queue);
+			// After the callback: the pipeline (or the failure) is visible to whoever waits for this count to change
+			s_queue.completed++;
+			s_queue.completed.notify_all();
+		}
+	}
+
+	u32 pipe_compiler::get_completed_job_count()
+	{
+		return s_queue.completed.load();
+	}
+
+	void pipe_compiler::wait_for_completed_job(u32 count, u64 timeout_us)
+	{
+		if (!timeout_us)
+		{
+			return;
+		}
+
+		// Plain atomic wait (not thread_ctrl::wait_on): the caller is the RSX thread, whose thread notifications and task
+		// queue would end the wait early; it is bounded by the timeout anyway.
+		s_queue.completed.wait(count, atomic_wait_timeout{ timeout_us * 1000 });
+	}
+
+	void pipe_compiler::prioritize_jobs(const glsl::shader* vs, const glsl::shader* fs)
+	{
+		std::lock_guard lock(s_queue.mutex);
+
+		// Stable, so the queue order is kept among the moved jobs and among the others
+		const auto first_other = std::stable_partition(s_queue.jobs.begin(), s_queue.jobs.end(), [&](const pipe_compiler_job& job)
+		{
+			return job.is_graphics_job && job.shaders[0] == vs && job.shaders[1] == fs;
+		});
+
+		for (auto it = s_queue.jobs.begin(); it != first_other; ++it)
+		{
+			it->urgent = true;
 		}
 	}
 
@@ -384,7 +478,7 @@ namespace mtl
 			return int_compile_compute_pipe(cs, cs_inputs, flags);
 		}
 
-		m_work_queue.push(cs, cs_inputs, flags, callback);
+		s_queue.push(pipe_compiler_job(cs, cs_inputs, flags, std::move(callback)));
 		return {};
 	}
 
@@ -401,7 +495,7 @@ namespace mtl
 			return int_compile_graphics_pipe(create_info, vs, fs, vs_inputs, fs_inputs, flags);
 		}
 
-		m_work_queue.push(create_info, vs, fs, vs_inputs, fs_inputs, flags, callback);
+		s_queue.push(pipe_compiler_job(create_info, vs, fs, vs_inputs, fs_inputs, flags, std::move(callback)));
 		return {};
 	}
 
@@ -409,42 +503,25 @@ namespace mtl
 	{
 		ensure(g_render_device); // "Cannot initialize pipe compiler before creating a logical device"
 
+		// Library/pipeline builds dominate each job and Metal only runs max_compile_tasks of them concurrently
+		const u32 compile_tasks = std::max(1u, g_render_device->caps().max_compile_tasks);
+		const int max_workers = static_cast<int>(compile_tasks);
+
 		if (num_worker_threads <= 0)
 		{
-			// Same heuristic as the VK backend
-			const auto hw_threads = utils::get_thread_count();
+			// Most of a job is spent in the Metal compiler service, which runs up to maximumConcurrentCompilationTaskCount
+			// builds at a time (raised by setShouldMaximizeConcurrentCompilation, see render_device::create): one worker
+			// per task keeps it busy without queueing work inside the service. The workers' own CPU work (GLSL ->
+			// SPIR-V -> MSL) runs below emulation priority (see operator()). At least 2 workers, so that one slow
+			// compile never holds back the others; at most all but two host threads (and 16).
+			const u32 hw_threads = utils::get_thread_count();
+			const u32 cpu_limit = std::min(16u, std::max(2u, hw_threads > 2 ? hw_threads - 2 : 0u));
+			num_worker_threads = static_cast<int>(std::clamp(compile_tasks, 2u, cpu_limit));
 
-			if (hw_threads >= 24)
-			{
-				num_worker_threads = 12;
-			}
-			else if (hw_threads >= 16)
-			{
-				num_worker_threads = 8;
-			}
-			else if (hw_threads > 12)
-			{
-				num_worker_threads = 6;
-			}
-			else if (hw_threads > 8)
-			{
-				num_worker_threads = 4;
-			}
-			else if (hw_threads == 8)
-			{
-				num_worker_threads = 2;
-			}
-			else
-			{
-				num_worker_threads = 1;
-			}
-
-			rsx_log.notice("Async pipeline compiler auto-selected %d worker(s) for %u host thread(s).",
-				num_worker_threads, hw_threads);
+			rsx_log.notice("Async pipeline compiler auto-selected %d worker(s) (Metal concurrent compilation tasks: %u, host threads: %u).",
+				num_worker_threads, compile_tasks, hw_threads);
 		}
 
-		// Library/pipeline builds dominate each job and Metal only runs max_compile_tasks of them concurrently
-		const int max_workers = static_cast<int>(std::max(1u, g_render_device->caps().max_compile_tasks));
 		if (num_worker_threads > max_workers)
 		{
 			rsx_log.notice("Pipeline compiler worker count capped from %d to %d (Metal concurrent compilation limit).",
@@ -456,7 +533,6 @@ namespace mtl
 
 		// Create the thread pool
 		g_pipe_compilers = std::make_unique<named_thread_group<pipe_compiler>>("RSX.W", num_worker_threads);
-		g_num_pipe_compilers = num_worker_threads;
 
 		// Initialize the workers. At least one inline compiler shall exist (doesn't actually run)
 		for (pipe_compiler& compiler : *g_pipe_compilers.get())
@@ -468,14 +544,17 @@ namespace mtl
 	void destroy_pipe_compiler()
 	{
 		g_pipe_compilers.reset();
-		g_num_pipe_compilers = 0;
+
+		// No worker is left: drop what was never started (the callbacks reference the program cache, which goes next)
+		std::lock_guard lock(pipe_compiler::s_queue.mutex);
+		pipe_compiler::s_queue.jobs.clear();
 	}
 
 	pipe_compiler* get_pipe_compiler()
 	{
 		ensure(g_pipe_compilers);
-		int thread_index = g_compiler_index++;
 
-		return g_pipe_compilers.get()->begin() + (thread_index % g_num_pipe_compilers);
+		// Deferred jobs go to the shared queue, so any worker object will do
+		return g_pipe_compilers.get()->begin();
 	}
 }

@@ -247,6 +247,11 @@ private:
 	// budget, instead of being skipped (missing geometry / flicker the first time an effect appears)
 	static constexpr u64 async_compile_wait_budget_us = 8'000;
 	u64 m_async_compile_wait_spent_us = 0;
+
+	// Pipeline telemetry, reported and reset with the presentation statistics (MTLPresent.cpp)
+	u32 m_skipped_draws = 0;      // Draws skipped because their pipeline was still compiling or could not be built
+	u64 m_pipeline_wait_us = 0;   // Time load_program() waited for pipelines that were being compiled
+
 	bool m_wide_lines_warning_logged = false;
 	bool m_depth_bounds_warning_logged = false;
 	bool m_logic_op_warning_logged = false;
