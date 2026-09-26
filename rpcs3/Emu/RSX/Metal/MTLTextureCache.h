@@ -405,6 +405,47 @@ namespace mtl
 				key(key_), data(std::move(data_)) {}
 		};
 
+		// Reusable mip-chain gathers (generate_2d_mipmaps_from_images). Games that sample a mipmapped render target
+		// while drawing into one of its levels (bloom, luminance and reflection chains) get the gather rebuilt on every
+		// draw: the common cache does not keep it while a gathered surface is bound (do_not_cache) and drops it when
+		// one is bound again (notify_surface_changed). Entries keep the gathered image and, per copied section, what
+		// the copy read; a later request with the same copy plan copies again only the levels whose sources changed.
+		struct gather_source_t
+		{
+			copy_region_descriptor region{};
+			MTL::PixelFormat format = MTL::PixelFormatInvalid;
+			u8 samples = 0;
+			u64 content_tag = 0;    // render_target::content_tag when copied; 0: untracked source, copied every time
+			u64 last_use_tag = 0;   // render_target::last_use_tag when copied (extra check, see get_stale_gather_levels)
+		};
+
+		struct gather_entry_t
+		{
+			// Request identity: the common cache's key (address, encoded properties) plus the view's channel remap and
+			// component layout
+			u32 address = 0;
+			u64 properties = 0;
+			u32 remap = 0;
+			MTL::TextureSwizzleChannels component_layout = swizzle_identity;
+
+			std::vector<gather_source_t> sources; // one per deferred_subresource::sections_to_copy entry, same order
+
+			mtl::viewable_image* image = nullptr; // Owned. Released through the GC (dispose_gather_entry)
+			mtl::image_view* view = nullptr;
+			u64 memory_size = 0;
+			u32 refs = 0;             // views handed to the common cache and not yet returned (release_temporary_subresource)
+			bool orphaned = false;    // evicted while handed out: never reused, disposed when the last reference returns
+			u64 last_use = 0;         // m_gather_use_serial of the last request it served
+		};
+
+		// Only touched on the RSX thread, like the common cache's temporary subresource containers
+		std::vector<std::unique_ptr<gather_entry_t>> m_gather_cache;
+		u64 m_gather_use_serial = 0;
+		u64 m_gather_frame_start = 0;  // m_gather_use_serial when the current frame began
+		u64 m_gather_cache_memory = 0;
+		static constexpr usz max_gather_cache_entries = 24;
+		static constexpr u64 max_gather_cache_memory = 256 * 0x100000;
+
 	public:
 		enum texture_create_flags : u32
 		{
@@ -440,6 +481,19 @@ namespace mtl
 		mtl::image* get_template_from_collection_impl(const rsx::simple_array<copy_region_descriptor>& sections_to_transfer) const;
 
 		std::unique_ptr<mtl::viewable_image> find_cached_image(MTL::PixelFormat format, u16 w, u16 h, u16 d, u16 mipmaps, MTL::TextureType type, MTL::TextureUsage usage);
+
+		// Reusable mip-chain gathers (see gather_entry_t)
+		bool gather_reuse_allowed(const deferred_subresource& desc) const;
+		gather_entry_t* find_gather_entry(const deferred_subresource& desc) const;
+		// Levels (bit i: mip level i) whose sources changed since they were copied; ~0 if the entry cannot serve `desc`
+		u64 get_stale_gather_levels(const gather_entry_t& entry, const deferred_subresource& desc) const;
+		mtl::image_view* reuse_gather(mtl::command_list& cmd, const deferred_subresource& desc);
+		void remember_gather(const deferred_subresource& desc, mtl::image_view* view);
+		void record_gather_sources(gather_entry_t& entry, const deferred_subresource& desc, u64 levels) const;
+		void evict_gather_entry(usz index);
+		void dispose_gather_entry(gather_entry_t& entry);
+		bool release_gather_reference(mtl::image_view* view);
+		void trim_gather_cache(bool evict_all);
 
 	protected:
 		// VK: (image_type, view_type). Metal views always have the texture type of their image (Cube, 3D, 2D).
@@ -501,6 +555,10 @@ namespace mtl
 			MTL::TextureType image_type, u32 image_flags, MTL::TextureUsage usage_flags);
 
 		void dispose_reusable_image(std::unique_ptr<mtl::viewable_image>& tex);
+
+		// True when create_temporary_subresource(desc) will return a reused mip-chain gather without recording any
+		// command: none of its sources was written since it was copied. The renderer then needs no pass split for it.
+		bool temporary_subresource_is_current(const deferred_subresource& desc) const;
 
 		bool is_depth_texture(u32 rsx_address, u32 rsx_size) override;
 

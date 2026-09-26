@@ -451,6 +451,457 @@ namespace mtl
 
 		m_cached_images.clear();
 		m_cached_memory_size = 0;
+
+		// The common cache released its references above; nothing can use these images any more
+		for (auto& entry : m_gather_cache)
+		{
+			if (entry->image)
+			{
+				dispose_gather_entry(*entry);
+			}
+		}
+
+		m_gather_cache.clear();
+	}
+
+	// Channel layout of a temporary image copied or gathered from `source`
+	static MTL::TextureSwizzleChannels get_temporary_component_layout(const mtl::image* source, u32 gcm_format)
+	{
+		// This method is almost exclusively used to work on framebuffer resources
+		// Keep the original swizzle layout unless there is data format conversion
+		if (!source || mtl::get_compatible_sampler_format(gcm_format) != source->info.format)
+		{
+			// This is a data cast operation
+			// Use native mapping for the new type
+			// TODO: Also simulate the readback+reupload step (very tricky)
+			const auto remap = get_component_mapping(gcm_format);
+			return MTL::TextureSwizzleChannels::Make(remap[1], remap[2], remap[3], remap[0]);
+		}
+
+		return source->native_component_map;
+	}
+
+	// Clears the subresources (mip level x cube face or 3D slice) of `level_mask` that the copies of `sections` do not
+	// write completely; the copies overwrite the others anyway, and a clear is a render pass per subresource on Metal.
+	// Strict Rendering Mode clears every selected level like before (a copy that fails, e.g. an unsupported scaled copy,
+	// then leaves black texels instead of whatever the pooled image held).
+	static void clear_gather_image(mtl::command_list& cmd, mtl::image* image,
+		const rsx::simple_array<texture_cache::copy_region_descriptor>& sections, u64 level_mask)
+	{
+		image_clear_value clear{};
+		if (image->aspect() & aspect_depth)
+		{
+			clear.depth = 1.f;
+			clear.stencil = 0;
+		}
+
+		const u32 mipmaps = image->mipmaps();
+		const u64 all_levels = (mipmaps >= 64) ? ~0ull : ((1ull << mipmaps) - 1);
+		level_mask &= all_levels;
+
+		if (g_cfg.video.strict_rendering_mode)
+		{
+			if (level_mask == all_levels)
+			{
+				mtl::clear_image(cmd, image, clear);
+				return;
+			}
+
+			for (u32 level = 0; level < mipmaps; ++level)
+			{
+				if (level_mask & (1ull << level))
+				{
+					mtl::clear_image(cmd, image, clear, level, 1);
+				}
+			}
+
+			return;
+		}
+
+		const bool is_3d = (image->type() == MTL::TextureType3D);
+		std::vector<u8> covered;
+
+		for (u32 level = 0; level < mipmaps; ++level)
+		{
+			if (!(level_mask & (1ull << level)))
+			{
+				continue;
+			}
+
+			const u32 level_w = std::max(image->width() >> level, 1u);
+			const u32 level_h = std::max(image->height() >> level, 1u);
+			const u32 slices = is_3d ? std::max(image->depth() >> level, 1u) : image->layers();
+			covered.assign(slices, 0);
+
+			for (const auto& section : sections)
+			{
+				// dst_z is the cube face (array layer) or the 3D slice. Each copy writes (dst_x, dst_y, dst_w, dst_h).
+				if (section.src && section.level == level && section.dst_z < slices &&
+					section.dst_x == 0 && section.dst_y == 0 && section.dst_w >= level_w && section.dst_h >= level_h)
+				{
+					covered[section.dst_z] = 1;
+				}
+			}
+
+			for (u32 slice = 0; slice < slices;)
+			{
+				if (covered[slice])
+				{
+					++slice;
+					continue;
+				}
+
+				u32 end = slice + 1;
+				while (end < slices && !covered[end])
+				{
+					++end;
+				}
+
+				mtl::clear_image(cmd, image, clear, level, 1, slice, end - slice);
+				slice = end;
+			}
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------------------------
+	// Reusable mip-chain gathers
+	// ---------------------------------------------------------------------------------------------------------------
+	//
+	// A gathered level is copied again only when what its copy read may have changed. For each section (in request
+	// order) an entry keeps the full copy descriptor (source pointer, compared only, never dereferenced: requests
+	// carry live pointers, so a matching pointer designates a live object) and, for single-sampled render targets, the
+	// surface's content_tag and last_use_tag when it was copied. content_tag is unique per surface object and replaced
+	// whenever GPU work that may write the surface is recorded (MTLRenderTargets.h), so an equal tag on the same live
+	// object proves that no write was recorded since the copy: the copy's contents are what a new copy would read now.
+	// Sources without such a tag (texture cache images, MSAA surfaces) are copied on every request.
+	//
+	// Ordering needs no extra barrier: copies into a reused image are recorded after the draws that sampled it, and
+	// every compute encoder or render pass waits for all earlier work of the queue (mtl::command_list), so they do not
+	// overtake those reads; a draw sampling a reused image runs in a pass that began after its last copy. The image is
+	// never an attachment of the renderer's passes.
+
+	bool texture_cache::gather_reuse_allowed(const deferred_subresource& desc) const
+	{
+		// Strict Rendering Mode: rebuild on every request, like upstream. A memory load (force_bg_load) reads guest
+		// memory, which has no write tracking here. Section i of a mip gather is level i (levels are tracked in a u64).
+		return !g_cfg.video.strict_rendering_mode &&
+			desc.op == rsx::deferred_request_command::mipmap_gather &&
+			!desc.force_bg_load &&
+			!desc.sections_to_copy.empty() && desc.sections_to_copy.size() <= 64;
+	}
+
+	texture_cache::gather_entry_t* texture_cache::find_gather_entry(const deferred_subresource& desc) const
+	{
+		const u64 properties = desc.encoded_properties();
+		for (const auto& entry : m_gather_cache)
+		{
+			if (!entry->orphaned && entry->address == desc.address && entry->properties == properties &&
+				entry->remap == desc.remap.encoded)
+			{
+				return entry.get();
+			}
+		}
+
+		return nullptr;
+	}
+
+	static bool same_copy_region(const texture_cache::copy_region_descriptor& a, const texture_cache::copy_region_descriptor& b)
+	{
+		return a.src == b.src && a.xform == b.xform && a.base_addr == b.base_addr && a.level == b.level &&
+			a.src_x == b.src_x && a.src_y == b.src_y && a.src_w == b.src_w && a.src_h == b.src_h &&
+			a.dst_x == b.dst_x && a.dst_y == b.dst_y && a.dst_z == b.dst_z && a.dst_w == b.dst_w && a.dst_h == b.dst_h;
+	}
+
+	u64 texture_cache::get_stale_gather_levels(const gather_entry_t& entry, const deferred_subresource& desc) const
+	{
+		constexpr u64 unusable = ~0ull;
+		const auto& sections = desc.sections_to_copy;
+
+		if (!entry.image || sections.size() != entry.sources.size())
+		{
+			return unusable;
+		}
+
+		// The view keeps the component layout it was created with
+		if (!(get_temporary_component_layout(get_template_from_collection_impl(sections), desc.gcm_format) == entry.component_layout))
+		{
+			return unusable;
+		}
+
+		u64 stale = 0;
+		for (usz i = 0; i < sections.size(); ++i)
+		{
+			const auto& section = sections[i];
+			const auto& source = entry.sources[i];
+
+			if (!same_copy_region(section, source.region) || section.level >= 64)
+			{
+				return unusable;
+			}
+
+			if (!section.src)
+			{
+				// Nothing copied
+				continue;
+			}
+
+			// `section.src` is the live pointer of this request (equal to the recorded one)
+			const auto surface = mtl::try_as_rtt(section.src);
+			const bool current = source.content_tag && surface &&
+				surface->content_tag == source.content_tag &&
+				// Redundant with content_tag, which changes on every write; it costs nothing to also require it
+				surface->last_use_tag == source.last_use_tag &&
+				section.src->format() == source.format && section.src->samples() == source.samples;
+
+			if (!current)
+			{
+				stale |= (1ull << section.level);
+			}
+		}
+
+		return stale;
+	}
+
+	void texture_cache::record_gather_sources(gather_entry_t& entry, const deferred_subresource& desc, u64 levels) const
+	{
+		const auto& sections = desc.sections_to_copy;
+		ensure(entry.sources.size() == sections.size());
+
+		for (usz i = 0; i < sections.size(); ++i)
+		{
+			const auto& section = sections[i];
+			if (section.level < 64 && !(levels & (1ull << section.level)))
+			{
+				continue;
+			}
+
+			auto& source = entry.sources[i];
+			source = {};
+			source.region = section;
+
+			if (!section.src)
+			{
+				continue;
+			}
+
+			source.format = section.src->format();
+			source.samples = section.src->samples();
+
+			// Single-sampled render targets only: MSAA surfaces are read through resolve/unresolve steps whose
+			// images this tag does not cover
+			if (const auto surface = mtl::try_as_rtt(section.src); surface && section.src->samples() == 1)
+			{
+				source.content_tag = surface->content_tag;
+				source.last_use_tag = surface->last_use_tag;
+			}
+		}
+	}
+
+	mtl::image_view* texture_cache::reuse_gather(mtl::command_list& cmd, const deferred_subresource& desc)
+	{
+		const auto entry = find_gather_entry(desc);
+		if (!entry)
+		{
+			return nullptr;
+		}
+
+		const u64 stale_levels = get_stale_gather_levels(*entry, desc);
+		if (stale_levels == ~0ull || (stale_levels && entry->refs))
+		{
+			// Another copy plan, or out of date while the common cache still holds the view (its snapshot must not
+			// change under it): build a new image
+			const auto it = std::find_if(m_gather_cache.begin(), m_gather_cache.end(),
+				[entry](const std::unique_ptr<gather_entry_t>& e) { return e.get() == entry; });
+			evict_gather_entry(static_cast<usz>(it - m_gather_cache.begin()));
+			return nullptr;
+		}
+
+		if (stale_levels)
+		{
+			// Copy the levels whose sources changed, all their sections in request order (overlaps resolve like a
+			// full build). The copies end the open render pass, like a full build.
+			rsx::simple_array<copy_region_descriptor> sections;
+			for (const auto& section : desc.sections_to_copy)
+			{
+				if (section.src && (stale_levels & (1ull << section.level)))
+				{
+					sections.push_back(section);
+				}
+			}
+
+			clear_gather_image(cmd, entry->image, desc.sections_to_copy, stale_levels);
+			copy_transfer_regions_impl(cmd, entry->image, sections);
+			record_gather_sources(*entry, desc, stale_levels);
+		}
+
+		entry->refs++;
+		entry->last_use = ++m_gather_use_serial;
+		return entry->view;
+	}
+
+	void texture_cache::remember_gather(const deferred_subresource& desc, mtl::image_view* view)
+	{
+		auto image = dynamic_cast<mtl::viewable_image*>(view->image());
+		if (!image)
+		{
+			return;
+		}
+
+		auto entry = std::make_unique<gather_entry_t>();
+		entry->address = desc.address;
+		entry->properties = desc.encoded_properties();
+		entry->remap = desc.remap.encoded;
+		entry->component_layout = get_temporary_component_layout(get_template_from_collection_impl(desc.sections_to_copy), desc.gcm_format);
+		entry->sources.resize(desc.sections_to_copy.size());
+		record_gather_sources(*entry, desc, ~0ull);
+
+		if (std::none_of(entry->sources.begin(), entry->sources.end(), [](const gather_source_t& source) { return source.content_tag != 0; }))
+		{
+			// Every level would be copied again on each request; leave the image to the usual pool
+			return;
+		}
+
+		// A previous entry for this request could not serve it (reuse_gather() evicted it); drop any leftover
+		for (usz i = m_gather_cache.size(); i-- > 0;)
+		{
+			const auto& other = *m_gather_cache[i];
+			if (!other.orphaned && other.address == entry->address && other.properties == entry->properties && other.remap == entry->remap)
+			{
+				evict_gather_entry(i);
+			}
+		}
+
+		entry->image = image;
+		entry->view = view;
+		entry->memory_size = image->value->allocatedSize();
+		entry->refs = 1; // The view being returned
+		entry->last_use = ++m_gather_use_serial;
+
+		m_gather_cache_memory += entry->memory_size;
+		m_gather_cache.push_back(std::move(entry));
+
+		// Capacity: least recently used entries go first
+		while (true)
+		{
+			usz live = 0;
+			u64 live_memory = 0;
+			usz lru = umax;
+
+			for (usz i = 0; i < m_gather_cache.size(); ++i)
+			{
+				const auto& e = *m_gather_cache[i];
+				if (e.orphaned)
+				{
+					continue;
+				}
+
+				live++;
+				live_memory += e.memory_size;
+
+				if (lru == umax || e.last_use < m_gather_cache[lru]->last_use)
+				{
+					lru = i;
+				}
+			}
+
+			if (live <= max_gather_cache_entries && live_memory <= max_gather_cache_memory)
+			{
+				break;
+			}
+
+			evict_gather_entry(lru);
+		}
+	}
+
+	void texture_cache::evict_gather_entry(usz index)
+	{
+		auto& entry = *m_gather_cache[index];
+		if (entry.refs)
+		{
+			// Still referenced by the common cache or by the draw being prepared: dispose on the last release
+			entry.orphaned = true;
+			return;
+		}
+
+		dispose_gather_entry(entry);
+		m_gather_cache.erase(m_gather_cache.begin() + index);
+	}
+
+	void texture_cache::dispose_gather_entry(gather_entry_t& entry)
+	{
+		ensure(entry.image);
+		m_gather_cache_memory -= entry.memory_size;
+
+		// Back to the image pool once the GPU is done with it (in-flight work may still sample it)
+		auto image = std::unique_ptr<mtl::viewable_image>(entry.image);
+		auto disposable = mtl::disposable_t::make(new cached_image_reference_t(this, image));
+		mtl::get_resource_manager()->dispose(disposable);
+
+		entry.image = nullptr;
+		entry.view = nullptr;
+	}
+
+	bool texture_cache::release_gather_reference(mtl::image_view* view)
+	{
+		for (usz i = 0; i < m_gather_cache.size(); ++i)
+		{
+			auto& entry = *m_gather_cache[i];
+			if (entry.view != view)
+			{
+				continue;
+			}
+
+			ensure(entry.refs > 0);
+			if (--entry.refs == 0 && entry.orphaned)
+			{
+				dispose_gather_entry(entry);
+				m_gather_cache.erase(m_gather_cache.begin() + i);
+			}
+
+			return true;
+		}
+
+		return false;
+	}
+
+	void texture_cache::trim_gather_cache(bool evict_all)
+	{
+		// Frame end: keep what the frame that ended used (validated on the next use like any other reuse)
+		for (usz i = m_gather_cache.size(); i-- > 0;)
+		{
+			const auto& entry = *m_gather_cache[i];
+			if (!entry.orphaned && (evict_all || entry.last_use <= m_gather_frame_start))
+			{
+				evict_gather_entry(i);
+			}
+		}
+
+		m_gather_frame_start = m_gather_use_serial;
+	}
+
+	bool texture_cache::temporary_subresource_is_current(const deferred_subresource& desc) const
+	{
+		if (!gather_reuse_allowed(desc))
+		{
+			return false;
+		}
+
+		if (!desc.do_not_cache)
+		{
+			// The common cache serves the request if it holds it (no staleness check there): not a reused gather
+			const auto properties = desc.encoded_properties();
+			const auto found = m_temporary_subresource_cache.equal_range(desc.address);
+			for (auto it = found.first; it != found.second; ++it)
+			{
+				if (it->second.first.encoded_properties() == properties)
+				{
+					return false;
+				}
+			}
+		}
+
+		const auto entry = find_gather_entry(desc);
+		return entry && get_stale_gather_levels(*entry, desc) == 0;
 	}
 
 	void texture_cache::copy_transfer_regions_impl(mtl::command_list& cmd, mtl::image* dst, const rsx::simple_array<copy_region_descriptor>& sections_to_transfer) const
@@ -494,37 +945,50 @@ namespace mtl
 			}
 		};
 
-		for (const auto& section : sections_to_transfer)
+		// Source window of a section, in source texels
+		struct source_window_t
 		{
-			if (!section.src)
-			{
-				continue;
-			}
+			u16 x, y, w, h;
+			rsx::flags32_t transform;
+			bool typeless;
+		};
 
-			const bool typeless = section.src->aspect() != dst_aspect ||
+		const auto get_source_window = [&](const copy_region_descriptor& section)
+		{
+			source_window_t window{ section.src_x, section.src_y, section.src_w, section.src_h, section.xform, false };
+			window.typeless = section.src->aspect() != dst_aspect ||
 				!formats_are_bitcast_compatible(dst, section.src);
 
-			auto src_image = section.src;
-			auto src_x = section.src_x;
-			auto src_y = section.src_y;
-			auto src_w = section.src_w;
-			auto src_h = section.src_h;
-
-			rsx::flags32_t transform = section.xform;
 			if (section.xform == rsx::surface_transform::coordinate_transform)
 			{
 				// Dimensions were given in 'dst' space. Work out the real source coordinates
 				const auto src_bpp = mtl::get_format_texel_width(section.src->format());
-				src_x = (src_x * dst_bpp) / src_bpp;
-				src_w = utils::aligned_div<u16>(src_w * dst_bpp, src_bpp);
+				window.x = (window.x * dst_bpp) / src_bpp;
+				window.w = utils::aligned_div<u16>(window.w * dst_bpp, src_bpp);
 
-				transform &= ~(rsx::surface_transform::coordinate_transform);
+				window.transform &= ~(rsx::surface_transform::coordinate_transform);
 			}
 
 			if (auto surface = dynamic_cast<mtl::render_target*>(section.src))
 			{
-				surface->transform_samples_to_pixels(src_x, src_w, src_y, src_h);
+				surface->transform_samples_to_pixels(window.x, window.w, window.y, window.h);
 			}
+
+			return window;
+		};
+
+		const auto transfer_section = [&](const copy_region_descriptor& section)
+		{
+			const auto window = get_source_window(section);
+			const bool typeless = window.typeless;
+
+			auto src_image = section.src;
+			auto src_x = window.x;
+			auto src_y = window.y;
+			auto src_w = window.w;
+			auto src_h = window.h;
+
+			rsx::flags32_t transform = window.transform;
 
 			if (typeless) [[unlikely]]
 			{
@@ -542,7 +1006,7 @@ namespace mtl
 
 					const auto src_rect = coord3i{{ src_x, src_y, 0 }, { src_w, src_h, 1 }};
 					mtl::copy_image_typeless(cmd, section.src, dst, src_rect, dst_rect, mip_layers);
-					continue;
+					return;
 				}
 
 				src_image = mtl::get_typeless_helper(dst->format(), dst->format_class(), convert_x + convert_w, src_y + src_h);
@@ -608,6 +1072,117 @@ namespace mtl
 					copy_output_region(section, dst_rect.position.x, dst_rect.position.y, section.dst_w, section.dst_h, _dst);
 				}
 			}
+		};
+
+		// Plain copy: same format, no conversion, no scaling. mtl::copy_image() records it as one blit command.
+		const auto is_plain_copy = [&](const copy_region_descriptor& section)
+		{
+			if (section.src->format() != dst->format() || section.src->samples() != 1 || dst->samples() != 1)
+			{
+				return false;
+			}
+
+			const auto window = get_source_window(section);
+			return !window.typeless && window.transform == rsx::surface_transform::identity &&
+				window.w == section.dst_w && window.h == section.dst_h;
+		};
+
+		// Same command as copy_output_region() -> mtl::copy_image() for a plain copy, with the ordering chosen here
+		const auto record_plain_copy = [&](const copy_region_descriptor& section, bool ordered)
+		{
+			const auto window = get_source_window(section);
+			const bool dst_3d = (dst->type() == MTL::TextureType3D);
+			auto encoder = ordered ? cmd.compute() : cmd.compute_unordered();
+
+			encoder->copyFromTexture(
+				section.src->value, 0, 0, MTL::Origin::Make(window.x, window.y, 0), MTL::Size::Make(window.w, window.h, 1),
+				dst->value, dst_3d ? 0 : static_cast<u8>(section.dst_z), section.level,
+				MTL::Origin::Make(section.dst_x, section.dst_y, dst_3d ? section.dst_z : 0));
+		};
+
+		// Every section writes the rectangle (dst_x, dst_y, dst_w, dst_h) of subresource (level, dst_z) and nothing else
+		// of `dst` (conversions and scaling go through scratch images)
+		const auto destinations_are_disjoint = [&]()
+		{
+			for (usz i = 0; i < sections_to_transfer.size(); ++i)
+			{
+				const auto& a = sections_to_transfer[i];
+				if (!a.src)
+				{
+					continue;
+				}
+
+				for (usz j = i + 1; j < sections_to_transfer.size(); ++j)
+				{
+					const auto& b = sections_to_transfer[j];
+					if (!b.src || a.level != b.level || a.dst_z != b.dst_z)
+					{
+						continue;
+					}
+
+					if (a.dst_x < b.dst_x + b.dst_w && b.dst_x < a.dst_x + a.dst_w &&
+						a.dst_y < b.dst_y + b.dst_h && b.dst_y < a.dst_y + a.dst_h)
+					{
+						return false;
+					}
+				}
+			}
+
+			return true;
+		};
+
+		if (sections_to_transfer.size() > 1 && !g_cfg.video.strict_rendering_mode)
+		{
+			// Gathers mix plain copies (blit commands) with scaled copies (a render pass each) and conversions. Recorded
+			// in order, every plain copy after a scaled one opens a new compute encoder and each one waits for all
+			// earlier work. When no two sections write the same texels the order does not matter: record the plain
+			// copies first as one run, where only the first waits (for the clears and other earlier work) and the
+			// others, which write disjoint regions and only read their sources, run concurrently. Scaled copies and
+			// conversions follow in their original order and order themselves after all earlier work.
+			std::vector<u8> plain(sections_to_transfer.size(), 0);
+			usz plain_count = 0;
+
+			for (usz i = 0; i < sections_to_transfer.size(); ++i)
+			{
+				if (sections_to_transfer[i].src && is_plain_copy(sections_to_transfer[i]))
+				{
+					plain[i] = 1;
+					plain_count++;
+				}
+			}
+
+			if (plain_count && destinations_are_disjoint())
+			{
+				bool first = true;
+				for (usz i = 0; i < sections_to_transfer.size(); ++i)
+				{
+					if (plain[i])
+					{
+						record_plain_copy(sections_to_transfer[i], first);
+						first = false;
+					}
+				}
+
+				for (usz i = 0; i < sections_to_transfer.size(); ++i)
+				{
+					if (sections_to_transfer[i].src && !plain[i])
+					{
+						transfer_section(sections_to_transfer[i]);
+					}
+				}
+
+				return;
+			}
+		}
+
+		for (const auto& section : sections_to_transfer)
+		{
+			if (!section.src)
+			{
+				continue;
+			}
+
+			transfer_section(section);
 		}
 	}
 
@@ -759,21 +1334,7 @@ namespace mtl
 			return nullptr;
 		}
 
-		// This method is almost exclusively used to work on framebuffer resources
-		// Keep the original swizzle layout unless there is data format conversion
-		MTL::TextureSwizzleChannels view_swizzle;
-		if (!source || dst_format != source->info.format)
-		{
-			// This is a data cast operation
-			// Use native mapping for the new type
-			// TODO: Also simulate the readback+reupload step (very tricky)
-			const auto remap = get_component_mapping(gcm_format);
-			view_swizzle = MTL::TextureSwizzleChannels::Make(remap[1], remap[2], remap[3], remap[0]);
-		}
-		else
-		{
-			view_swizzle = source->native_component_map;
-		}
+		const MTL::TextureSwizzleChannels view_swizzle = get_temporary_component_layout(source, gcm_format);
 
 		image->set_debug_name(fmt::format("Temp view, fmt=0x%x", gcm_format));
 		image->set_native_component_layout(view_swizzle);
@@ -815,23 +1376,16 @@ namespace mtl
 		}
 
 		const auto image = result->image();
-		const u32 dst_aspect = mtl::get_format_aspect(image->format());
 
 		if (desc.force_bg_load)
 		{
 			// The memory load covers the whole image, no need to clear it first
 			initialize_subresource_from_memory(cmd, image, desc, rsx::texture_dimension_extended::texture_dimension_cubemap);
 		}
-		else if (!(dst_aspect & aspect_depth))
-		{
-			mtl::clear_image(cmd, image, {});
-		}
 		else
 		{
-			image_clear_value clear{};
-			clear.depth = 1.f;
-			clear.stencil = 0;
-			mtl::clear_image(cmd, image, clear);
+			// Only the (level, face) subresources the copies do not write completely
+			clear_gather_image(cmd, image, sections_to_copy, ~0ull);
 		}
 
 		copy_transfer_regions_impl(cmd, image, sections_to_copy);
@@ -853,23 +1407,16 @@ namespace mtl
 		}
 
 		const auto image = result->image();
-		const u32 dst_aspect = mtl::get_format_aspect(image->format());
 
 		if (desc.force_bg_load)
 		{
 			// The memory load covers the whole image, no need to clear it first
 			initialize_subresource_from_memory(cmd, image, desc, rsx::texture_dimension_extended::texture_dimension_3d);
 		}
-		else if (!(dst_aspect & aspect_depth))
-		{
-			mtl::clear_image(cmd, image, {});
-		}
 		else
 		{
-			image_clear_value clear{};
-			clear.depth = 1.f;
-			clear.stencil = 0;
-			mtl::clear_image(cmd, image, clear);
+			// Only the (level, slice) subresources the copies do not write completely
+			clear_gather_image(cmd, image, sections_to_copy, ~0ull);
 		}
 
 		copy_transfer_regions_impl(cmd, image, sections_to_copy);
@@ -918,6 +1465,18 @@ namespace mtl
 
 	mtl::image_view* texture_cache::generate_2d_mipmaps_from_images(mtl::command_list& cmd, const deferred_subresource& desc)
 	{
+		// Games that sample a mipmapped render target while drawing into one of its levels (bloom, luminance and
+		// reflection chains) request this gather on every draw. Reuse the previous image when possible and copy again
+		// only the levels whose sources were written since (see "Reusable mip-chain gathers").
+		const bool reusable = gather_reuse_allowed(desc);
+		if (reusable)
+		{
+			if (auto view = reuse_gather(cmd, desc))
+			{
+				return view;
+			}
+		}
+
 		const auto& sections_to_copy = desc.sections_to_copy;
 		const auto mipmaps = ::narrow<u8>(sections_to_copy.size());
 		auto _template = get_template_from_collection_impl(sections_to_copy);
@@ -931,7 +1490,6 @@ namespace mtl
 		}
 
 		const auto image = result->image();
-		const u32 dst_aspect = mtl::get_format_aspect(image->format());
 
 		if (desc.force_bg_load)
 		{
@@ -940,50 +1498,28 @@ namespace mtl
 		}
 		else
 		{
-			// Only clear the levels the copies below do not write completely. A clear is a render pass per level on
-			// Metal; games that sample a mipmapped render target while drawing into one of its levels (bloom, luminance
-			// and reflection chains) rebuild this image on every draw.
-			u32 levels_to_clear = (1u << mipmaps) - 1;
-
-			for (const auto& section : sections_to_copy)
-			{
-				if (!section.src || section.level >= mipmaps)
-				{
-					continue;
-				}
-
-				const u32 level_w = std::max(image->width() >> section.level, 1u);
-				const u32 level_h = std::max(image->height() >> section.level, 1u);
-
-				if (section.dst_x == 0 && section.dst_y == 0 && section.dst_z == 0 &&
-					section.dst_w >= level_w && section.dst_h >= level_h)
-				{
-					levels_to_clear &= ~(1u << section.level);
-				}
-			}
-
-			image_clear_value clear{};
-			if (dst_aspect & aspect_depth)
-			{
-				clear.depth = 1.f;
-				clear.stencil = 0;
-			}
-
-			for (u32 level = 0; level < mipmaps; ++level)
-			{
-				if (levels_to_clear & (1u << level))
-				{
-					mtl::clear_image(cmd, image, clear, level, 1);
-				}
-			}
+			// Only the levels the copies below do not write completely
+			clear_gather_image(cmd, image, sections_to_copy, ~0ull);
 		}
 
 		copy_transfer_regions_impl(cmd, image, sections_to_copy);
+
+		if (reusable)
+		{
+			remember_gather(desc, result);
+		}
+
 		return result;
 	}
 
 	void texture_cache::release_temporary_subresource(mtl::image_view* view)
 	{
+		if (release_gather_reference(view))
+		{
+			// Kept by the gather cache
+			return;
+		}
+
 		auto resource = dynamic_cast<mtl::viewable_image*>(view->image());
 		ensure(resource);
 
@@ -1435,6 +1971,19 @@ namespace mtl
 	{
 		auto any_released = baseclass::handle_memory_pressure(severity);
 
+		if (severity > rsx::problem_severity::low && !m_gather_cache.empty())
+		{
+			// Reusable gathers are a convenience: drop them (images still held by the common cache or by the draw
+			// being prepared go when released). Not from inside the cache (gathers are built under this lock).
+			std::unique_lock lock(m_cache_mutex, std::defer_lock);
+			if (lock.try_lock())
+			{
+				const auto memory_before = m_gather_cache_memory;
+				trim_gather_cache(true);
+				any_released |= (m_gather_cache_memory != memory_before);
+			}
+		}
+
 		// TODO: This can cause invalidation of in-flight resources
 		if (severity <= rsx::problem_severity::low || !m_cached_memory_size)
 		{
@@ -1504,6 +2053,9 @@ namespace mtl
 
 		baseclass::on_frame_end();
 		reset_frame_statistics();
+
+		// After the common cache released its temporary subresources: keep the gathers this frame used
+		trim_gather_cache(false);
 	}
 
 	mtl::viewable_image* texture_cache::upload_image_simple(mtl::command_list& cmd, MTL::PixelFormat format, u32 address, u32 width, u32 height, u32 pitch)
@@ -1568,7 +2120,21 @@ namespace mtl
 
 	bool texture_cache::blit(const rsx::blit_src_info& src, const rsx::blit_dst_info& dst, bool interpolate, mtl::surface_cache& m_rtts, mtl::command_list& cmd)
 	{
-		blitter helper;
+		// Transfers into a render target change its contents: copies of it (reusable mip-chain gathers) must see that
+		struct content_tracking_blitter : blitter
+		{
+			void scale_image(mtl::command_list& cmd, mtl::image* src, mtl::image* dst, areai src_area, areai dst_area, bool interpolate, const rsx::typeless_xfer& xfer_info)
+			{
+				blitter::scale_image(cmd, src, dst, src_area, dst_area, interpolate, xfer_info);
+
+				if (auto surface = mtl::try_as_rtt(dst))
+				{
+					surface->on_contents_changed();
+				}
+			}
+		};
+
+		content_tracking_blitter helper;
 		auto reply = upload_scaled_image(src, dst, interpolate, cmd, m_rtts, helper);
 
 		if (reply.succeeded)
@@ -1592,7 +2158,7 @@ namespace mtl
 	u64 texture_cache::get_temporary_memory_in_use() const
 	{
 		// TODO: Technically incorrect, we should have separate metrics for cached evictable resources (this value) and temporary active resources.
-		return m_cached_memory_size;
+		return m_cached_memory_size + m_gather_cache_memory;
 	}
 
 	bool texture_cache::is_overallocated() const

@@ -1060,6 +1060,22 @@ void MTLGSRender::load_texture_env()
 
 void MTLGSRender::mark_attachment_writes(const std::array<bool, 4>& color, bool depth_stencil, bool from_draw)
 {
+	// Copies of the attachments (reusable mip-chain gathers) must see these writes, whether or not the pass is still
+	// open (a flush between subdraws ends it). Every bound attachment counts, whatever the write masks say: a gathered
+	// level that is bound but not written is rare, a missed write would show stale contents.
+	for (const auto& index : m_rtts.m_bound_render_target_ids)
+	{
+		if (auto surface = m_rtts.m_bound_render_targets[index].second)
+		{
+			surface->on_contents_changed();
+		}
+	}
+
+	if (auto surface = m_rtts.m_bound_depth_stencil.second)
+	{
+		surface->on_contents_changed();
+	}
+
 	if (!is_render_pass_open())
 	{
 		return;
@@ -1310,6 +1326,14 @@ mtl::pass_split_reason MTLGSRender::feedback_read_needs_split() const
 
 			if (!desc->image_handle)
 			{
+				if (m_texture_cache.temporary_subresource_is_current(desc->external_subresource_desc))
+				{
+					// A mip-chain gather reused as is: no source was written since its copies, which were recorded
+					// before the open pass began, and it is not an attachment. Nothing to order; if a source gets
+					// written before the bind after all, the copy made then ends the pass.
+					continue;
+				}
+
 				// Composed or copied from the surface when bound: keep the conservative split (the copy is recorded
 				// outside the pass anyway)
 				through_copy = true;

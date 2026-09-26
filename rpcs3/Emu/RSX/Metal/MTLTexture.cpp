@@ -1618,7 +1618,7 @@ namespace mtl
 	// Clears
 	// ---------------------------------------------------------------------------------------------------------------
 
-	void clear_image(mtl::command_list& cmd, mtl::image* image, const image_clear_value& value, u32 base_level, u32 level_count)
+	void clear_image(mtl::command_list& cmd, mtl::image* image, const image_clear_value& value, u32 base_level, u32 level_count, u32 base_slice, u32 slice_count)
 	{
 		const u32 mip_count = image->mipmaps();
 		if (level_count == ~0u)
@@ -1630,6 +1630,14 @@ namespace mtl
 
 		const bool is_3d = image->type() == MTL::TextureType3D;
 		const u32 layer_count = is_3d ? 1 : image->layers();
+
+		// Selected layers (or 3D slices, which shrink with the level) of a level: [first, end)
+		const auto get_slice_range = [&](u32 slices) -> std::pair<u32, u32>
+		{
+			const u32 first = std::min(base_slice, slices);
+			const u32 end = (slice_count >= slices - first) ? slices : (first + slice_count);
+			return { first, end };
+		};
 
 		if (!format_is_renderable(image->format()) || !(image->value->usage() & MTL::TextureUsageRenderTarget))
 		{
@@ -1660,12 +1668,31 @@ namespace mtl
 				const u64 row = u64{ utils::aligned_div(w, u32{ block.block_width }) } * block.bytes_per_block;
 				const u64 image_size = row * utils::aligned_div(h, u32{ block.block_height });
 
-				for (u32 layer = 0; layer < layer_count; ++layer)
+				if (is_3d)
+				{
+					// One copy for the selected slices of the level
+					const auto [first_slice, end_slice] = get_slice_range(d);
+					const u32 count = end_slice - first_slice;
+					if (!count)
+					{
+						continue;
+					}
+
+					auto encoder = first ? cmd.compute() : cmd.compute_unordered();
+					first = false;
+
+					encoder->copyFromBuffer(zero_buf->value(), 0, row, count > 1 ? image_size : 0, MTL::Size::Make(w, h, count),
+						image->value, 0, level, MTL::Origin::Make(0, 0, first_slice));
+					continue;
+				}
+
+				const auto [first_layer, end_layer] = get_slice_range(layer_count);
+				for (u32 layer = first_layer; layer < end_layer; ++layer)
 				{
 					auto encoder = first ? cmd.compute() : cmd.compute_unordered();
 					first = false;
 
-					encoder->copyFromBuffer(zero_buf->value(), 0, row, d > 1 ? image_size : 0, MTL::Size::Make(w, h, d),
+					encoder->copyFromBuffer(zero_buf->value(), 0, row, 0, MTL::Size::Make(w, h, 1),
 						image->value, layer, level, MTL::Origin::Make(0, 0, 0));
 				}
 			}
@@ -1681,8 +1708,9 @@ namespace mtl
 			const u32 w = std::max(image->width() >> level, 1u);
 			const u32 h = std::max(image->height() >> level, 1u);
 			const u32 slices = is_3d ? std::max(image->depth() >> level, 1u) : layer_count;
+			const auto [first_slice, end_slice] = get_slice_range(slices);
 
-			for (u32 slice = 0; slice < slices; ++slice)
+			for (u32 slice = first_slice; slice < end_slice; ++slice)
 			{
 				auto desc = ref(MTL4::RenderPassDescriptor::alloc()->init());
 

@@ -69,6 +69,9 @@ namespace mtl
 	// Set by the renderer around load_texture_env(); texture barriers of the texture cache compare it.
 	extern u64 g_feedback_draw_key;
 
+	// Globally unique, never reused value for render_target::content_tag
+	u64 new_surface_content_tag();
+
 	namespace surface_cache_utils
 	{
 		void dispose(mtl::buffer* buf);
@@ -200,6 +203,19 @@ namespace mtl
 		u64 read_in_pass = 0;           // pass in which draws sampled it while it was bound (feedback reads)
 		u64 read_in_pass_key = 0;       // material key of those readers if they all were one streak writing it, else 0
 
+		// Contents version for consumers that keep copies of this surface (reusable mip-chain gathers of the texture
+		// cache): unique per object from construction (a new surface at a recycled address never matches an old
+		// value), and replaced whenever GPU work that may write the surface is recorded: draws and clears of the
+		// renderer (mark_attachment_writes), memory initialization, inheritance, unspill, unresolve, blit engine
+		// transfers, recycling. last_use_tag cannot serve: it changes once per bind epoch and inheritance may set it to
+		// an older value.
+		u64 content_tag = new_surface_content_tag();
+
+		void on_contents_changed()
+		{
+			content_tag = new_surface_content_tag();
+		}
+
 		// A read by the current draw may use the memory contents (no pass split): not written by the open pass, or
 		// written only by earlier draws of the same feedback streak
 		bool feedback_read_in_pass_allowed(u64 open_pass, u64 draw_key) const
@@ -295,6 +311,7 @@ namespace mtl
 		{
 			surface->reset_surface_counters();
 			surface->last_rw_access_tag = 0;
+			surface->on_contents_changed();
 		}
 
 		static void clone_surface(
@@ -353,6 +370,7 @@ namespace mtl
 			surface->stencil_init_flags = 0;
 			surface->memory_usage_flags = rsx::surface_usage_flags::unknown;
 			surface->raster_type = rsx::surface_raster_type::linear;
+			surface->on_contents_changed();
 		}
 
 		static void invalidate_surface_contents(
@@ -395,6 +413,7 @@ namespace mtl
 			}
 
 			surface->release();
+			surface->on_contents_changed();
 		}
 
 		static void notify_surface_persist(const std::unique_ptr<mtl::render_target>& /*surface*/)
@@ -404,6 +423,7 @@ namespace mtl
 		{
 			surface->state_flags |= rsx::surface_state_flags::erase_bkgnd;
 			surface->add_ref();
+			surface->on_contents_changed();
 		}
 
 		static bool int_surface_matches_properties(
