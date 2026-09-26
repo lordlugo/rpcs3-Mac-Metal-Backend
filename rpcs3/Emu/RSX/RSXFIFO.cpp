@@ -691,10 +691,20 @@ namespace rsx
 			}
 			case FIFO::FIFO_EMPTY:
 			{
+				// Back off after sustained emptiness: yield-storming a core while the
+				// game feeds in bursts starves the producer PPU threads (bursty feeding
+				// reads as micro-stutter). A 50us nap is nothing against a 16ms frame.
+				thread_local u32 fifo_empty_spins = 0;
+
 				if (performance_counters.state == FIFO::state::running)
 				{
 					performance_counters.FIFO_idle_timestamp = get_system_time();
 					performance_counters.state = FIFO::state::empty;
+					fifo_empty_spins = 0;
+				}
+				else if (++fifo_empty_spins > 2000)
+				{
+					thread_ctrl::wait_for(50);
 				}
 				else
 				{

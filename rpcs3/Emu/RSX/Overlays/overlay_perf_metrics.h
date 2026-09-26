@@ -14,7 +14,7 @@ namespace rsx
 			// The detail level does not affect frame graphs apart from their width.
 			// none
 			// minimal - fps
-			// low - fps, total cpu usage
+			// low - fps, total cpu usage, gpu utilization
 			// medium - fps, detailed cpu usage
 			// high - fps, frametime, detailed cpu usage, thread number, rsx load
 			detail_level m_detail{};
@@ -73,6 +73,7 @@ namespace rsx
 			u32 m_spus{0};
 
 			f32 m_cpu_usage{-1.f};
+			f32 m_gpu_usage{-1.f};
 			u32 m_total_threads{0};
 
 			f32 m_ppu_usage{0};

@@ -567,9 +567,9 @@ void Emulator::Init()
 
 	static constexpr fork_defaults_t fork_defaults[] =
 	{
-		{ "metal-fork-defaults-v1", "VSync: Full, Output Scaling: MetalFX", []()
+		{ "metal-fork-defaults-v1", "VSync: Adaptive, Output Scaling: MetalFX", []()
 		{
-			g_cfg.video.vsync.set(vsync_mode::full);
+			g_cfg.video.vsync.set(vsync_mode::adaptive);
 			g_cfg.video.output_scaling.set(output_scaling_mode::fsr);
 		}},
 		{ "metal-fork-defaults-v2", "Multithreaded RSX: On", []()
@@ -600,6 +600,22 @@ void Emulator::Init()
 		{
 			g_cfg.video.write_color_buffers.set(true);
 			g_cfg.video.vk.asynchronous_texture_streaming.set(true);
+		}},
+		{ "metal-fork-defaults-v6", "VSync: Adaptive", []()
+		{
+			// v1 forced Full; move installs still on it to the new default
+			if (g_cfg.video.vsync.get() == vsync_mode::full)
+			{
+				g_cfg.video.vsync.set(vsync_mode::adaptive);
+			}
+		}},
+		{ "metal-fork-defaults-v7", "Time Stretching: On", []()
+		{
+			// Previously off by default; move installs still on it to the new default
+			if (!g_cfg.audio.enable_time_stretching.get())
+			{
+				g_cfg.audio.enable_time_stretching.set(true);
+			}
 		}},
 	};
 

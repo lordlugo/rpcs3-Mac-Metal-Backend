@@ -88,6 +88,13 @@ namespace mtl
 		return stats;
 	}
 
+	u64 peek_gpu_busy_ns()
+	{
+		auto& state = gpu_stats();
+		std::lock_guard lock(state.mutex);
+		return state.busy_ns;
+	}
+
 	void count_feedback_split(pass_split_reason reason)
 	{
 		auto& state = gpu_stats();

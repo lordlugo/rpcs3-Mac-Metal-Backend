@@ -26,6 +26,7 @@
 #include "Utilities/sema.h"
 #include "Utilities/date_time.h"
 #include "util/console.h"
+#include "util/diagnostics.hpp"
 #include "util/asm.hpp"
 #include "Crypto/decrypt_binaries.h"
 #ifdef _WIN32
@@ -701,13 +702,27 @@ int run_rpcs3(int argc, char** argv)
 	auto fatal_listener = std::make_unique<fatal_error_listener>();
 	logs::listener::add(fatal_listener.get());
 
+	// Aggregates errors and warnings for the diagnostics report (refreshed while
+	// running so it survives hangs, rewritten on shutdown for the final state)
+	auto diagnostics_listener = std::make_unique<logs::diagnostics_listener>();
+	diagnostics_listener->set_output_path(fs::get_log_dir() + "RPCS3_diagnostics.log");
+	logs::listener::add(diagnostics_listener.get());
+
 	struct log_listener_shutdown_guard
 	{
+		logs::diagnostics_listener* diag = nullptr;
+
 		~log_listener_shutdown_guard()
 		{
+			// Writable while listeners are still attached; lands next to RPCS3.log
+			if (diag)
+			{
+				diag->write_report(fs::get_log_dir() + "RPCS3_diagnostics.log");
+			}
+
 			logs::listener::shutdown_all();
 		}
-	} log_listener_shutdown;
+	} log_listener_shutdown{diagnostics_listener.get()};
 
 	{
 		// Write RPCS3 version

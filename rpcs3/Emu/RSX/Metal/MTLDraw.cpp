@@ -10,7 +10,7 @@
 
 #include "Emu/RSX/NV47/HW/context_accessors.define.h"
 
-#include <map>
+#include <unordered_map>
 
 namespace mtl
 {
@@ -242,8 +242,19 @@ namespace mtl
 		// render passes that differ only in their depth format share one. nullptr: the build failed (not retried).
 		static std::unordered_map<u64, std::unique_ptr<glsl::program>> g_programs;
 
-		// (render pass key, write mask | colour count << 8) -> pipeline in g_programs: the common lookup
-		static std::map<std::pair<u64, u32>, glsl::program*> g_program_lookup;
+		// (render pass key, write mask | colour count << 8) -> pipeline in g_programs: the common lookup.
+		// Hash map (not std::map): the lookup runs on the clear path, so per-entry tree nodes and O(log n)
+		// pointer chasing are pure overhead for a small render-thread-local table.
+		struct program_lookup_hash
+		{
+			usz operator()(const std::pair<u64, u32>& key) const noexcept
+			{
+				const usz h1 = std::hash<u64>{}(key.first);
+				const usz h2 = std::hash<u32>{}(key.second);
+				return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
+			}
+		};
+		static std::unordered_map<std::pair<u64, u32>, glsl::program*, program_lookup_hash> g_program_lookup;
 
 		// Translated once (GLSL -> SPIR-V -> MSL -> MTLLibrary) and shared by the pipelines: the vertex shader and one
 		// fragment shader per colour attachment count
@@ -557,14 +568,20 @@ void MTLGSRender::update_draw_state()
 	auto encoder = ensure(get_render_encoder());
 	const auto& regs = rsx::method_registers;
 
-	// Wide lines are not supported by Metal (1px lines)
+	// Wide lines are not supported by Metal (1px lines). Streaming games reach new states
+	// long after boot, so report recurrences throttled instead of once per boot.
 	if (regs.current_draw_clause.primitive >= rsx::primitive_type::points &&
 		regs.current_draw_clause.primitive <= rsx::primitive_type::line_strip &&
-		!m_wide_lines_warning_logged &&
 		regs.line_width() * resolution_scaling_config.scale_factor() > 1.f)
 	{
-		m_wide_lines_warning_logged = true;
-		rsx_log.warning("Metal: wide lines are not supported; lines are rendered 1px wide.");
+		const u64 now = get_system_time();
+		if (!m_wide_lines_warning_logged || now - m_wide_lines_warning_time >= 30'000'000)
+		{
+			m_wide_lines_warning_logged = true;
+			m_wide_lines_warning_time = now;
+			rsx_log.warning("Metal: wide lines are not supported; lines are rendered 1px wide (requested width %.2f, %.2f at the current resolution scale).",
+				regs.line_width(), regs.line_width() * resolution_scaling_config.scale_factor());
+		}
 	}
 
 	if (!m_logic_op_warning_logged && regs.logic_op_enabled())
@@ -666,17 +683,20 @@ void MTLGSRender::update_draw_state()
 		return;
 	}
 
-	if (regs.poly_offset_fill_enabled())
+	// Encoder state does not survive a pass split, but the RSX registers usually do not change across
+	// the many passes of a streaming frame: re-emit only on change (cached in m_encoder_state, which is
+	// reset on every pass open in on_render_pass_begin).
+	const f32 bias = regs.poly_offset_fill_enabled() ? regs.poly_offset_bias() : 0.f;
+	const f32 scale = regs.poly_offset_fill_enabled() ? regs.poly_offset_scale() : 0.f;
+	if (!m_encoder_state.depth_bias_valid || m_encoder_state.depth_bias != bias || m_encoder_state.depth_bias_scale != scale)
 	{
 		// offset_bias is the constant factor, multiplied by the implementation factor R
 		// offst_scale is the slope factor, multiplied by the triangle slope factor M
 		// Depth is always 32-bit float on Metal, which behaves like the VK float path.
-		encoder->setDepthBias(regs.poly_offset_bias(), regs.poly_offset_scale(), 0.f);
-	}
-	else
-	{
-		// Zero bias value - disables depth bias
-		encoder->setDepthBias(0.f, 0.f, 0.f);
+		encoder->setDepthBias(bias, scale, 0.f);
+		m_encoder_state.depth_bias = bias;
+		m_encoder_state.depth_bias_scale = scale;
+		m_encoder_state.depth_bias_valid = true;
 	}
 
 	if (m_device->caps().depth_bounds)
@@ -699,12 +719,26 @@ void MTLGSRender::update_draw_state()
 		bounds_min = std::clamp(bounds_min, 0.f, 1.f);
 		bounds_max = std::clamp(bounds_max, 0.f, 1.f);
 
-		encoder->setDepthTestBounds(bounds_min, bounds_max);
+		if (!m_encoder_state.depth_bounds_valid || m_encoder_state.depth_bounds_min != bounds_min || m_encoder_state.depth_bounds_max != bounds_max)
+		{
+			encoder->setDepthTestBounds(bounds_min, bounds_max);
+			m_encoder_state.depth_bounds_min = bounds_min;
+			m_encoder_state.depth_bounds_max = bounds_max;
+			m_encoder_state.depth_bounds_valid = true;
+		}
 	}
-	else if (regs.depth_bounds_test_enabled() && !m_depth_bounds_warning_logged)
+	else if (regs.depth_bounds_test_enabled())
 	{
-		m_depth_bounds_warning_logged = true;
-		rsx_log.warning("Metal: depth bounds test requested but not supported by this GPU (Apple10+ only). Ignored.");
+		// Same throttling rationale as wide lines above: one boot-time line leaves later
+		// occurrences unexplained.
+		const u64 now = get_system_time();
+		if (!m_depth_bounds_warning_logged || now - m_depth_bounds_warning_time >= 30'000'000)
+		{
+			m_depth_bounds_warning_logged = true;
+			m_depth_bounds_warning_time = now;
+			rsx_log.warning("Metal: depth bounds test requested but not supported by this GPU (Apple10+ only). Ignored (bounds %.3f-%.3f).",
+				regs.depth_bounds_min(), regs.depth_bounds_max());
+		}
 	}
 
 	bind_viewport();
@@ -1192,10 +1226,11 @@ void MTLGSRender::mark_attachment_writes(const std::array<bool, 4>& color, bool 
 
 void MTLGSRender::update_feedback_streaks(const std::array<bool, 4>& color, bool depth_stencil)
 {
-	// Called after a draw was recorded, before its writes are marked. A draw that samples and writes an attachment
-	// starts a streak when the attachment had no writes in this pass yet (the read saw current memory), and continues
-	// the streak of its material otherwise (its read was allowed by feedback_read_in_pass_allowed()). Every other
-	// write ends the streak, so a later read by another draw splits the pass and sees all writes.
+	// Called after a draw was recorded, before its writes are marked. The first write of a pass starts the streak
+	// of its material; a later read by a draw of the same material stays in the pass (in-order fragment execution
+	// covers same-material write-then-read exactly as it covers the sampling-writer case). A write by another
+	// material ends the streak, so a later read by anyone else splits the pass and sees all writes. Clears still
+	// end the streak (mark_attachment_writes, from_draw=false): cleared data must be stored before it is sampled.
 	if (!is_render_pass_open())
 	{
 		return;
@@ -1239,11 +1274,7 @@ void MTLGSRender::update_feedback_streaks(const std::array<bool, 4>& color, bool
 
 	auto update = [&](mtl::render_target* surface)
 	{
-		if (!draw_samples_attachment(surface))
-		{
-			surface->feedback_streak_pass = 0;
-		}
-		else if (surface->written_in_pass != pass)
+		if (surface->written_in_pass != pass)
 		{
 			surface->feedback_streak_pass = pass;
 			surface->feedback_streak_key = m_feedback_draw_key;

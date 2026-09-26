@@ -332,7 +332,12 @@ namespace mtl
 		}
 
 		// Create the completion marker for this transfer. It retires with the submission of `cmd`.
-		dma_fence = std::make_unique<mtl::dma_fence_t>(cmd);
+		dma_fence.emplace(cmd);
+
+		rsx_log.trace("[Metal] DMA readback: range 0x%x+0x%x context %u flags %u fmt 0x%x %ux%u.",
+			valid_range.start, valid_range.length(), static_cast<u32>(get_context()),
+			static_cast<u32>(get_memory_read_flags()), static_cast<u32>(src->format()),
+			static_cast<u32>(src_area.width()), static_cast<u32>(src_area.height()));
 
 		// Set cb flag for queued dma operations
 		cmd.set_flag(mtl::command_list::cb_has_dma_transfer);
@@ -982,6 +987,13 @@ namespace mtl
 
 		const auto transfer_section = [&](const copy_region_descriptor& section)
 		{
+			if (!section.src || !section.src_w || !section.src_h || !section.dst_w || !section.dst_h)
+			{
+				// Degenerate sections copy nothing. Recording them would build invalid
+				// (zero-size) descriptors and abort in the Metal driver.
+				return;
+			}
+
 			const auto window = get_source_window(section);
 			const bool typeless = window.typeless;
 
@@ -996,8 +1008,11 @@ namespace mtl
 			if (typeless) [[unlikely]]
 			{
 				const auto src_bpp = mtl::get_format_texel_width(section.src->format());
-				const u16 convert_w = u16(src_w * src_bpp) / dst_bpp;
-				const u16 convert_x = u16(src_x * src_bpp) / dst_bpp;
+				// NOTE: u16(src_w * src_bpp) narrows BEFORE the division (functional cast
+				// binds tighter than /), wrapping mod 65536 once the source byte-width
+				// reaches 64 KiB. Keep full width until the helper request.
+				const u32 convert_w = (static_cast<u32>(src_w) * src_bpp) / dst_bpp;
+				const u32 convert_x = (static_cast<u32>(src_x) * src_bpp) / dst_bpp;
 
 				if (convert_w == section.dst_w && src_h == section.dst_h &&
 					transform == rsx::surface_transform::identity)
@@ -1012,15 +1027,34 @@ namespace mtl
 					return;
 				}
 
-				src_image = mtl::get_typeless_helper(dst->format(), dst->format_class(), convert_x + convert_w, src_y + src_h);
+				// The staged bytes are copied to the helper origin and read back from the
+				// origin, so convert_w x src_h holds the whole section. The old
+				// (convert_x + convert_w) x (src_y + src_h) bounding extent only served
+				// cross-section cache reuse and can exceed the 16384 Metal 2D limit on the
+				// offset alone while the content fits.
+				src_image = mtl::get_typeless_helper(dst->format(), dst->format_class(), convert_w, src_h, "xfer-surfaces");
+
+				if (!src_image || convert_w > 0xFFFFu)
+				{
+					// Diagnostic: split the refused extent into offset vs content. If the
+					// next run shows convert_x/src_y dominating, the content-sized helper
+					// above already fixed it and this means genuine oversize (tiling needed).
+					rsx_log.error("Metal: xfer-surfaces typeless skipped: src fmt 0x%x (bpp %u) window (%u,%u %ux%u) -> dst fmt 0x%x (bpp %u %ux%u), section dst (%u,%u %ux%u), convert_x %u convert_w %u.",
+						static_cast<u32>(section.src->format()), static_cast<u32>(src_bpp),
+						static_cast<u32>(src_x), static_cast<u32>(src_y), static_cast<u32>(src_w), static_cast<u32>(src_h),
+						static_cast<u32>(dst->format()), static_cast<u32>(dst_bpp), dst->width(), dst->height(),
+						static_cast<u32>(section.dst_x), static_cast<u32>(section.dst_y), static_cast<u32>(section.dst_w), static_cast<u32>(section.dst_h),
+						convert_x, convert_w);
+					return;
+				}
 
 				const areai src_rect = coordi{{ src_x, src_y }, { src_w, src_h }};
-				const areai dst_rect = coordi{{ 0, 0 }, { convert_w, src_h }};
+				const areai dst_rect = coordi{{ 0, 0 }, { static_cast<s32>(convert_w), src_h }};
 				mtl::copy_image_typeless(cmd, section.src, src_image, src_rect, dst_rect);
 
 				src_x = 0;
 				src_y = 0;
-				src_w = convert_w;
+				src_w = static_cast<u16>(convert_w);
 			}
 
 			ensure(transform == rsx::surface_transform::identity);
@@ -1039,7 +1073,12 @@ namespace mtl
 					// Metal: scaled blits (sampled draws) cannot target a 3D texture; scale into a 2D helper, then copy the slice
 					const u32 requested_width = dst->width();
 					const u32 requested_height = src_y + src_h + section.dst_h; // Accounts for possible typeless ref on the same helper on src
-					_dst = mtl::get_typeless_helper(src_image->format(), src_image->format_class(), requested_width, requested_height);
+					_dst = mtl::get_typeless_helper(src_image->format(), src_image->format_class(), requested_width, requested_height, "xfer-bitcast");
+				}
+
+				if (!_dst)
+				{
+					return;
 				}
 
 				auto dst_rect = coord3i{ { section.dst_x, section.dst_y, 0 }, { section.dst_w, section.dst_h, 1 } };
@@ -1795,7 +1834,6 @@ namespace mtl
 
 		rsx::flags32_t upload_command_flags = initialize_image_layout | (upload_ahead ? upload_contents_async : upload_contents_inline);
 
-		std::vector<rsx::subresource_layout> tmp;
 		auto p_subresource_layout = &subresource_layout;
 		u32 heap_align = upload_heap_align_default;
 
@@ -1812,6 +1850,8 @@ namespace mtl
 				const auto bpp = rsx::get_format_block_size_in_bytes(gcm_format);
 				const auto [scratch_buf, linear_data_scratch_offset] = mtl::detile_memory_block(cmd, tiled_region, rsx_range, width, height, bpp);
 
+				std::vector<rsx::subresource_layout> tmp;
+				tmp.reserve(1);
 				auto subres = subresource_layout.front();
 				// FIXME: !!EVIL!!
 				subres.data = { scratch_buf, linear_data_scratch_offset };
@@ -1906,6 +1946,13 @@ namespace mtl
 
 	void texture_cache::cleanup_after_dma_transfers(mtl::command_list& cmd)
 	{
+		if (cmd.flags & mtl::command_list::cb_has_dma_transfer)
+		{
+			rsx_log.trace("[Metal] DMA batch: submit flags=0x%x access_hint=%d open_query=%d",
+				cmd.flags, static_cast<int>(cmd.access_hint),
+				!!(cmd.flags & mtl::command_list::cb_has_open_query));
+		}
+
 		bool occlusion_query_active = !!(cmd.flags & mtl::command_list::cb_has_open_query);
 		if (occlusion_query_active)
 		{

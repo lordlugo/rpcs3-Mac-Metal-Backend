@@ -27,9 +27,17 @@ namespace mtl
 			bool operator==(const key_type&) const = default;
 		};
 
+		// Upper bound so the set cannot grow without limit between clears (program_state_cache::clear).
+		// On overflow the set is dropped: at most one rebuild attempt + error line per pipeline per epoch.
+		static constexpr usz max_failure_entries = 2048;
+
 		void add(const key_type& key)
 		{
 			std::lock_guard lock(m_mutex);
+			if (m_keys.size() >= max_failure_entries)
+			{
+				m_keys.clear();
+			}
 			if (m_keys.insert(key).second)
 			{
 				// Once per pipeline: the program cache never rebuilds it (the reason was logged by the builder)
@@ -253,6 +261,33 @@ namespace mtl
 		bool check_pipeline_failed() const
 		{
 			return m_last_pipeline_failed;
+		}
+
+		// Number of entries in each in-memory cache (telemetry for the periodic statistics report; sizes are read
+		// under their own locks, so the three counts may race each other by a pipeline)
+		struct cache_sizes
+		{
+			usz pipelines = 0;
+			usz vertex_programs = 0;
+			usz fragment_programs = 0;
+		};
+
+		cache_sizes get_cache_sizes()
+		{
+			cache_sizes sizes;
+			{
+				reader_lock lock(m_vertex_mutex);
+				sizes.vertex_programs = m_vertex_shader_cache.size();
+			}
+			{
+				reader_lock lock(m_fragment_mutex);
+				sizes.fragment_programs = m_fragment_shader_cache.size();
+			}
+			{
+				reader_lock lock(m_pipeline_mutex);
+				sizes.pipelines = m_storage.size();
+			}
+			return sizes;
 		}
 
 		// Hides program_state_cache::clear

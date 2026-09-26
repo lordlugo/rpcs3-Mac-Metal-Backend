@@ -9,6 +9,7 @@
 
 #include <QWindow>
 #include <QPaintEvent>
+#include <QPointF>
 #include <QTimer>
 
 #include <memory>
@@ -38,6 +39,7 @@ private:
 	Visibility m_visibility = Visibility::Windowed;
 	atomic_t<bool> m_is_closing = false;
 	atomic_t<bool> m_show_mouse = true;
+	QPointF m_last_mouse_pos = QPointF(-1., -1.); // Filters synthetic same-position MouseMove events
 	bool m_disable_mouse = false;
 	bool m_disable_kb_hotkeys = false;
 	bool m_mouse_hide_and_lock = false;

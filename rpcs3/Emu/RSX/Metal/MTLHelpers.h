@@ -152,7 +152,7 @@ namespace mtl
 
 	// Shared 2D scratch image per (format, format class); at least requested_width x requested_height (aligned to 256).
 	// Usage: ShaderRead | RenderTarget (when renderable) so it can be both a copy and a scaled-blit destination.
-	mtl::image* get_typeless_helper(MTL::PixelFormat format, rsx::format_class format_class, u32 requested_width, u32 requested_height);
+	mtl::image* get_typeless_helper(MTL::PixelFormat format, rsx::format_class format_class, u32 requested_width, u32 requested_height, const char* caller = "?");
 
 	// Transparent-black placeholder views for unbound texture slots (types: 2D, 3D, Cube, 2DArray; 1D maps to 2D).
 	mtl::image_view* null_image_view(mtl::command_list& cmd, MTL::TextureType type);

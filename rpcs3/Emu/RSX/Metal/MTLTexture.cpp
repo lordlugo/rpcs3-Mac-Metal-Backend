@@ -1184,6 +1184,8 @@ namespace mtl
 		std::vector<buffer_copy_t> buffer_copies;
 		std::vector<std::pair<mtl::buffer*, u32>> upload_commands;
 		copy_regions.reserve(subresource_layout.size());
+		buffer_copies.reserve(subresource_layout.size());
+		upload_commands.reserve(subresource_layout.size());
 
 		auto& cmd2 = prepare_for_transfer(cmd, dst_image, image_setup_flags);
 
@@ -1324,7 +1326,6 @@ namespace mtl
 					}
 
 					scratch_buf = mtl::get_scratch_buffer(cmd2, scratch_buf_size);
-					buffer_copies.reserve(subresource_layout.size());
 				}
 
 				if (layout.level == 0)
@@ -1557,7 +1558,13 @@ namespace mtl
 				src_area.x1 = 0;
 
 				// Transfer bits from src to typeless src
-				real_src = mtl::get_typeless_helper(format, rsx::classify_format(xfer_info.src_gcm_format), src_area.width(), src_area.height());
+				real_src = mtl::get_typeless_helper(format, rsx::classify_format(xfer_info.src_gcm_format), src_area.width(), src_area.height(), "blit-src");
+
+				if (!real_src)
+				{
+					return;
+				}
+
 				mtl::copy_image_typeless(cmd, src, real_src, old_src_area, src_area);
 			}
 		}
@@ -1590,8 +1597,19 @@ namespace mtl
 					dst_area.y2 += src_area.y2;
 				}
 
-				real_dst = mtl::get_typeless_helper(format, rsx::classify_format(xfer_info.dst_gcm_format), dst_area.width(), required_height);
+				real_dst = mtl::get_typeless_helper(format, rsx::classify_format(xfer_info.dst_gcm_format), dst_area.width(), required_height, "blit-dst");
+
+				if (!real_dst)
+				{
+					return;
+				}
 			}
+		}
+
+		// Helpers refuse degenerate requests (null); the details are in their error log
+		if (!real_src || !real_dst)
+		{
+			return;
 		}
 
 		// Checks
@@ -1603,14 +1621,107 @@ namespace mtl
 
 		if (src_area.x1 < 0 || src_area.x2 > static_cast<s32>(real_src->width()) || src_area.y1 < 0 || src_area.y2 > static_cast<s32>(real_src->height()))
 		{
-			rsx_log.error("Blit request denied because the source region does not fit!");
-			return;
+			// Same rounding-slop clipping as the dst check below, sides swapped.
+			const auto overhang_x1 = std::max(-src_area.x1, 0);
+			const auto overhang_y1 = std::max(-src_area.y1, 0);
+			const auto overhang_x2 = std::max(src_area.x2 - static_cast<s32>(real_src->width()), 0);
+			const auto overhang_y2 = std::max(src_area.y2 - static_cast<s32>(real_src->height()), 0);
+
+			const bool rounding_slop = (overhang_x1 <= 2 && overhang_y1 <= 2 && overhang_x2 <= 2 && overhang_y2 <= 2);
+			const auto clipped = areai
+			{
+				std::max(src_area.x1, 0),
+				std::max(src_area.y1, 0),
+				std::min(src_area.x2, static_cast<s32>(real_src->width())),
+				std::min(src_area.y2, static_cast<s32>(real_src->height()))
+			};
+
+			if (!rounding_slop || clipped.x2 <= clipped.x1 || clipped.y2 <= clipped.y1)
+			{
+				const u32 src_fmt = static_cast<u32>(real_src->format());
+				const u32 src_w = real_src->width();
+				const u32 src_h = real_src->height();
+				const u32 dst_fmt = static_cast<u32>(real_dst->format());
+				const u32 dst_w = real_dst->width();
+				const u32 dst_h = real_dst->height();
+				const u32 src_typeless = xfer_info.src_is_typeless ? 1u : 0u;
+				const u32 dst_typeless = xfer_info.dst_is_typeless ? 1u : 0u;
+				const u32 flip_h = xfer_info.flip_horizontal ? 1u : 0u;
+				const u32 flip_v = xfer_info.flip_vertical ? 1u : 0u;
+				rsx_log.error("Blit request denied: src area (%d,%d %dx%d) does not fit src fmt 0x%x %ux%u (dst area (%d,%d %dx%d) dst fmt 0x%x %ux%u, typeless %u/%u hints %.3f/%.3f flip %u/%u).",
+					src_area.x1, src_area.y1, src_area.width(), src_area.height(),
+					src_fmt, src_w, src_h,
+					dst_area.x1, dst_area.y1, dst_area.width(), dst_area.height(),
+					dst_fmt, dst_w, dst_h,
+					src_typeless, dst_typeless,
+					xfer_info.src_scaling_hint, xfer_info.dst_scaling_hint,
+					flip_h, flip_v);
+				return;
+			}
+
+			// Reproject the clipped edges onto the destination to preserve the mapping
+			const auto remap = [](int c, int s0, int s1, int d0, int d1)
+			{
+				return d0 + ((c - s0) * (d1 - d0)) / (s1 - s0);
+			};
+
+			dst_area = areai
+			{
+				remap(clipped.x1, src_area.x1, src_area.x2, dst_area.x1, dst_area.x2),
+				remap(clipped.y1, src_area.y1, src_area.y2, dst_area.y1, dst_area.y2),
+				remap(clipped.x2, src_area.x1, src_area.x2, dst_area.x1, dst_area.x2),
+				remap(clipped.y2, src_area.y1, src_area.y2, dst_area.y1, dst_area.y2)
+			};
+			src_area = clipped;
 		}
 
 		if (dst_area.x1 < 0 || dst_area.x2 > static_cast<s32>(real_dst->width()) || dst_area.y1 < 0 || dst_area.y2 > static_cast<s32>(real_dst->height()))
 		{
-			rsx_log.error("Blit request denied because the destination region does not fit!");
+			// Rounding slop between the blit engine's clip rect and the surface store's pitch-derived
+			// extents can overhang the target by a pixel or two. Real hardware clips this; dropping the
+			// whole transfer leaves a stale (cleared) surface on screen every frame. Shrink small
+			// overhangs, keep denying genuine misses.
+			const auto overhang_x1 = std::max(-dst_area.x1, 0);
+			const auto overhang_y1 = std::max(-dst_area.y1, 0);
+			const auto overhang_x2 = std::max(dst_area.x2 - static_cast<s32>(real_dst->width()), 0);
+			const auto overhang_y2 = std::max(dst_area.y2 - static_cast<s32>(real_dst->height()), 0);
+
+			const bool rounding_slop = (overhang_x1 <= 2 && overhang_y1 <= 2 && overhang_x2 <= 2 && overhang_y2 <= 2);
+			const auto clipped = areai
+			{
+				std::max(dst_area.x1, 0),
+				std::max(dst_area.y1, 0),
+				std::min(dst_area.x2, static_cast<s32>(real_dst->width())),
+				std::min(dst_area.y2, static_cast<s32>(real_dst->height()))
+			};
+
+			if (!rounding_slop || clipped.x2 <= clipped.x1 || clipped.y2 <= clipped.y1)
+			{
+				rsx_log.error("Blit request denied: dst area (%d,%d %dx%d) does not fit dst fmt 0x%x %ux%u (src area (%d,%d %dx%d) src fmt 0x%x %ux%u, typeless %u/%u hints %.3f/%.3f flip %u/%u).",
+				dst_area.x1, dst_area.y1, dst_area.width(), dst_area.height(),
+				static_cast<u32>(real_dst->format()), real_dst->width(), real_dst->height(),
+				src_area.x1, src_area.y1, src_area.width(), src_area.height(),
+				static_cast<u32>(real_src->format()), real_src->width(), real_src->height(),
+				static_cast<u32>(xfer_info.src_is_typeless), static_cast<u32>(xfer_info.dst_is_typeless),
+				xfer_info.src_scaling_hint, xfer_info.dst_scaling_hint,
+				static_cast<u32>(xfer_info.flip_horizontal), static_cast<u32>(xfer_info.flip_vertical));
 			return;
+			}
+
+			// Reproject the clipped edges onto the source to preserve the mapping (flips apply below)
+			const auto remap = [](int c, int d0, int d1, int s0, int s1)
+			{
+				return s0 + ((c - d0) * (s1 - s0)) / (d1 - d0);
+			};
+
+			src_area = areai
+			{
+				remap(clipped.x1, dst_area.x1, dst_area.x2, src_area.x1, src_area.x2),
+				remap(clipped.y1, dst_area.y1, dst_area.y2, src_area.y1, src_area.y2),
+				remap(clipped.x2, dst_area.x1, dst_area.x2, src_area.x1, src_area.x2),
+				remap(clipped.y2, dst_area.y1, dst_area.y2, src_area.y1, src_area.y2)
+			};
+			dst_area = clipped;
 		}
 
 		if (xfer_info.flip_horizontal)
@@ -1887,8 +1998,20 @@ namespace mtl
 		return tex->get_view(rsx::default_remap_vector.with_encoding(MTL_REMAP_IDENTITY));
 	}
 
-	mtl::image* get_typeless_helper(MTL::PixelFormat format, rsx::format_class format_class, u32 requested_width, u32 requested_height)
+	mtl::image* get_typeless_helper(MTL::PixelFormat format, rsx::format_class format_class, u32 requested_width, u32 requested_height, const char* caller)
 	{
+		if (!requested_width || !requested_height || format == MTL::PixelFormatInvalid ||
+			requested_width > 16384 || requested_height > 16384)
+		{
+			// An invalid helper builds an invalid Metal descriptor and aborts in the driver.
+			// Besides zero sizes, signed window offsets can wrap into huge unsigned dimensions
+			// here (u16/s32 -> u32 conversion of negative origins). 16384 is the maximum 2D
+			// dimension on all Metal devices. Callers skip the transfer on null.
+			rsx_log.error("Metal: refusing typeless helper with invalid dimensions %ux%u (format 0x%x) from %s. Skipping transfer.",
+				requested_width, requested_height, static_cast<u32>(format), caller);
+			return nullptr;
+		}
+
 		auto create_texture = [&]()
 		{
 			u32 new_width = utils::align(requested_width, 256u);
@@ -1924,7 +2047,10 @@ namespace mtl
 			}
 
 			ptr.reset(create_texture());
-			ptr->set_debug_name(fmt::format("Scratch: Format=0x%x", static_cast<u32>(format)));
+			if (debug_labels_enabled())
+			{
+				ptr->set_debug_name(fmt::format("Scratch: Format=0x%x", static_cast<u32>(format)));
+			}
 		}
 
 		return ptr.get();

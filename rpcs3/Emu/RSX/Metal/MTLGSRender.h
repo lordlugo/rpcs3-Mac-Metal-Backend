@@ -240,8 +240,9 @@ private:
 	//Vertex layout
 	rsx::vertex_input_layout m_vertex_layout;
 
-	// One-time diagnostics
+	// Diagnostics (throttled, see load_program)
 	bool m_interpreter_warning_logged = false;
+	u64 m_interpreter_warning_time = 0;
 
 	// No shader interpreter on Metal: a draw whose pipeline is still compiling may wait for it, within a per-frame
 	// budget, instead of being skipped (missing geometry / flicker the first time an effect appears)
@@ -253,7 +254,9 @@ private:
 	u64 m_pipeline_wait_us = 0;   // Time load_program() waited for pipelines that were being compiled
 
 	bool m_wide_lines_warning_logged = false;
+	u64 m_wide_lines_warning_time = 0;
 	bool m_depth_bounds_warning_logged = false;
+	u64 m_depth_bounds_warning_time = 0;
 	bool m_logic_op_warning_logged = false;
 	bool m_flat_shading_warning_logged = false;
 	u64 m_feedback_draw_key = 0; // Material key of the current draw (feedback streaks, see MTLRenderTargets.h)
@@ -280,6 +283,7 @@ private:
 	void present(mtl::frame_context_t *ctx);
 	bool reinitialize_swapchain();
 	void configure_metal_layer();
+	void assert_metal_layer_state();
 
 	// Presentation pacing (MTLPresent.cpp)
 	void update_present_pacing(bool emu_flip);
@@ -389,4 +393,10 @@ protected:
 	bool on_access_violation(u32 address, bool is_writing) override;
 	void on_invalidate_memory_range(const utils::address_range32 &range, rsx::invalidation_cause cause) override;
 	void on_semaphore_acquire_wait() override;
+	f32 get_gpu_utilization_pct() override;
+
+	// Rolling GPU utilization state (deltas of mtl::peek_gpu_busy_ns over wall time)
+	u64 m_gpu_util_last_busy_ns = 0;
+	u64 m_gpu_util_last_time_us = 0;
+	f32 m_gpu_util_cached_pct = -1.f;
 };

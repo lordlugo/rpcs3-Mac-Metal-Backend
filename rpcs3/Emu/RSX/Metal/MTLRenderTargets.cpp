@@ -336,7 +336,15 @@ namespace mtl
 			const areai src_rect = { 0, 0, static_cast<int>(source->width()), static_cast<int>(source->height()) };
 			const areai dst_rect = { 0, 0, surface->get_surface_width<rsx::surface_metrics::samples, int>(), surface->get_surface_height<rsx::surface_metrics::samples, int>() };
 
-			auto scratch = mtl::get_typeless_helper(source->format(), source->format_class(), dst_rect.x2, dst_rect.y2);
+			auto scratch = mtl::get_typeless_helper(source->format(), source->format_class(), dst_rect.x2, dst_rect.y2, "rtt-resolve");
+
+			if (!scratch)
+			{
+				rsx_log.error("Metal: rtt-resolve typeless helper for %ux%u (fmt 0x%x) refused. Skipping scaled RTT writeback; guest memory keeps stale contents.",
+					static_cast<u32>(dst_rect.x2), static_cast<u32>(dst_rect.y2), static_cast<u32>(source->format()));
+				return;
+			}
+
 			mtl::copy_scaled_image(cmd, source, scratch, src_rect, dst_rect, {}, true, false);
 
 			source = scratch;
@@ -1011,7 +1019,12 @@ namespace mtl
 			}
 			else
 			{
-				content = mtl::get_typeless_helper(format(), format_class(), subres.width_in_block, subres.height_in_block);
+				content = mtl::get_typeless_helper(format(), format_class(), subres.width_in_block, subres.height_in_block, "rtt-upload");
+			}
+
+			if (!content)
+			{
+				return;
 			}
 
 			// Load Cell data into temp buffer

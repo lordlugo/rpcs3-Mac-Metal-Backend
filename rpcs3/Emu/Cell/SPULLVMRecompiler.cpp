@@ -1728,7 +1728,7 @@ public:
 		}
 #endif
 
-		spu_log.notice("Building function 0x%x... (size %u, %s)", func.entry_point, func.data.size(), m_hash);
+		spu_log.trace("Building function 0x%x... (size %u, %s)", func.entry_point, func.data.size(), m_hash);
 
 		m_pos = func.lower_bound;
 		m_base = func.entry_point;

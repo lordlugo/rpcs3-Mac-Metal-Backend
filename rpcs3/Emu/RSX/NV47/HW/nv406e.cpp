@@ -55,6 +55,7 @@ namespace rsx
 
 			u64 start = get_system_time();
 			u64 last_check_val = start;
+			const bool is_flip_sema = (addr == RSX(ctx)->label_addr + 0x10);
 
 			while (sema != arg)
 			{
@@ -95,8 +96,18 @@ namespace rsx
 
 				RSX(ctx)->on_semaphore_acquire_wait();
 
-				// Wait until the value changes or until 100us pass.
-				utils::spin_on_cacheline_once(atomic_sema, sema, 100);
+				if (is_flip_sema)
+				{
+					// The flip-label producer is frequently another thread (PPU flip/vblank
+					// handling) or deferred present work: yield the RSX thread instead of
+					// hot-spinning the cacheline so the producer is scheduled sooner.
+					std::this_thread::yield();
+				}
+				else
+				{
+					// Wait until the value changes or until 100us pass.
+					utils::spin_on_cacheline_once(atomic_sema, sema, 100);
+				}
 			}
 
 			RSX(ctx)->fifo_wake_delay();

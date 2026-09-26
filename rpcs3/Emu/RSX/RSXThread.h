@@ -487,6 +487,9 @@ namespace rsx
 		// Get RSX approximate load in %
 		u32 get_load();
 
+		// Get GPU utilization in % (-1 when the backend does not report it)
+		virtual f32 get_gpu_utilization_pct();
+
 		// Get stats object
 		frame_statistics_t& get_stats() { return m_frame_stats; }
 

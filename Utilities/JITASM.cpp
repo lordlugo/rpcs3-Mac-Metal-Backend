@@ -16,6 +16,8 @@
 
 #if defined(__APPLE__)
 #include <mutex>
+#include <sys/mman.h>
+#include <cstring>
 #endif
 
 LOG_CHANNEL(jit_log, "JIT");
@@ -333,11 +335,24 @@ void jit_runtime::finalize() noexcept
 	utils::memory_reset(get_jit_memory(), 0x80000000, true);
 	utils::memory_protect(get_jit_memory(), 0x40000000, utils::protection::wx);
 #else
-	utils::memory_decommit(get_jit_memory(), 0x80000000, true);
+	// Cannot decommit on Apple ARM64: the code subrange contains WX JIT pages, which can neither be mprotect()ed
+	// (EACCES) nor replaced by a JIT mapping (MAP_FIXED|MAP_JIT is EINVAL), and a plain replacement would break
+	// future executable commits. Release the pages in place instead, preserving the mapping and its protections.
+	// Stale bytes past the reset allocation counters are never executed (see add_jit_memory bounds).
+#ifdef MADV_ZERO
+	::madvise(get_jit_memory(), 0x80000000, MADV_ZERO); // Zeroes resident pages without touching the others (macOS 14+)
+	::madvise(get_jit_memory(), 0x80000000, MADV_FREE_REUSABLE);
+#else
+	std::memset(get_jit_memory(), 0, 0x80000000);
+	::madvise(get_jit_memory(), 0x80000000, MADV_FREE_REUSABLE);
+#endif
 #endif
 
-	s_code_pos = 0;
-	s_data_pos = 0;
+	// Reset allocation positions but keep the committed high-water marks (upper 32 bits): the mapping and its
+	// protections are preserved above, so previously committed pages stay committed - recommitting them (WX->WX)
+	// is rejected on Apple ARM64. Also clears a sticky out-of-memory flag (bit 30).
+	s_code_pos.atomic_op([](u64& ctr) { ctr &= 0xffffffff00000000ull; });
+	s_data_pos.atomic_op([](u64& ctr) { ctr &= 0xffffffff00000000ull; });
 
 	// Restore code/data snapshot
 	std::memcpy(alloc(s_code_init.size(), 1, true), s_code_init.data(), s_code_init.size());

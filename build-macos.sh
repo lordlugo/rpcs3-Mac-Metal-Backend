@@ -114,9 +114,10 @@ done
 # ---------------------------------------------------------------------------------------------------------------------
 cd "$ROOT"
 if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    echo "==> Updating git submodules"
-    # shellcheck disable=SC2046
-    git submodule -q update --init --depth=1 --jobs=8 $(awk '/path/ && !/llvm/ && !/opencv/ && !/libsdl-org/ && !/feralinteractive/ && !/curl/ && !/zlib/ && !/VulkanMemoryAllocator/ && !/FAudio/ { print $3 }' .gitmodules)
+    # NOTE: submodule update is intentionally disabled in this workspace (submodule git metadata was damaged and a
+    # blind update emptied the working trees). Contents are restored/managed manually; the required-files check below
+    # enforces presence. Re-enable once .git/modules is repaired.
+    echo "warning: skipping git submodule update (disabled, see comment in build-macos.sh)" >&2
 else
     echo "warning: not a git checkout, assuming all required submodules are already present" >&2
 fi

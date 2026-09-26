@@ -384,7 +384,7 @@ namespace mtl
 	}
 
 	void blit_pass::run(mtl::command_list& cmd, const overlay_target& target, const areai& dst_area,
-		const std::vector<mtl::image_view*>& src, const areai& src_area, bool linear_filter)
+		std::span<mtl::image_view* const> src, const areai& src_area, bool linear_filter)
 	{
 		ensure(!src.empty() && src[0]);
 
@@ -450,8 +450,9 @@ namespace mtl
 	{
 		ensure(src && dst);
 
-		// Raw copy semantics (vkCmdBlitImage ignores the native component layout)
-		std::vector<mtl::image_view*> views = { src->get_identity_view() };
+		// Raw copy semantics (vkCmdBlitImage ignores the native component layout).
+		// Stack array (no heap allocation): blit_pass::run takes the views as a span.
+		mtl::image_view* views[] = { src->get_identity_view() };
 
 		// Letterbox bars: black from the load action of this pass (no separate full-size clear pass). The blit draws
 		// nothing (and opens no pass) for an empty or off-target area: clear on its own then.

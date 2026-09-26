@@ -68,6 +68,7 @@ target_sources(rpcs3_emu PRIVATE
     ../util/media_utils.cpp
     ../util/video_provider.cpp
     ../util/logs.cpp
+    ../util/diagnostics.cpp
     ../util/yaml.cpp
     ../util/vm_native.cpp
     ../util/dyn_lib.cpp

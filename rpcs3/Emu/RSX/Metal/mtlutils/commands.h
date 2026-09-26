@@ -45,6 +45,7 @@ namespace mtl
 	};
 
 	gpu_stats_t get_gpu_stats_and_reset();
+	u64 peek_gpu_busy_ns(); // Non-destructive read of accumulated GPU busy time (does not disturb the telemetry reset)
 	void count_feedback_split(pass_split_reason reason = pass_split_reason::read_after_write);
 	void count_feedback_read_in_pass();
 	void count_draw_render_pass();
@@ -88,6 +89,19 @@ namespace mtl
 			buffers_known = 0;
 			textures_known = 0;
 			samplers_known = 0;
+		}
+
+		// Non-destructive read: what address the table holds for a buffer slot (false if never written)
+		bool peek_buffer(u32 index, MTL::GPUAddress& address) const
+		{
+			const u32 bit = u32{1} << index;
+			if (!(buffers_known & bit))
+			{
+				return false;
+			}
+
+			address = buffers[index];
+			return true;
 		}
 
 	private:

@@ -281,6 +281,7 @@ namespace mtl
 				// bind() visits every slot of the stage on each draw: iterate a contiguous copy, not the hash map
 				auto& table_slots = m_table_slots[stage];
 				table_slots.clear();
+				table_slots.reserve(m_layouts[stage].slots.size());
 				for (const auto& [location, slot] : m_layouts[stage].slots)
 				{
 					table_slots.push_back(slot);
@@ -385,6 +386,12 @@ namespace mtl
 				}
 
 				auto& bindings = m_bindings[stage];
+				if (bindings.buffers[slot.buffer_index] == address &&
+					bindings.buffer_sizes[slot.buffer_index] == range)
+				{
+					return;
+				}
+
 				bindings.buffers[slot.buffer_index] = address;
 				bindings.buffer_sizes[slot.buffer_index] = range;
 				bindings.dirty = true;
@@ -405,6 +412,12 @@ namespace mtl
 				}
 
 				auto& bindings = m_bindings[stage];
+				if (bindings.textures[slot.texture_index]._impl == texture_id._impl &&
+					(slot.sampler_index == umax || bindings.samplers[slot.sampler_index]._impl == sampler_id._impl))
+				{
+					return;
+				}
+
 				bindings.textures[slot.texture_index] = texture_id;
 
 				if (slot.sampler_index != umax)
@@ -429,6 +442,11 @@ namespace mtl
 				}
 
 				auto& bindings = m_bindings[stage];
+				if (bindings.textures[slot.texture_index]._impl == texture_id._impl)
+				{
+					return;
+				}
+
 				bindings.textures[slot.texture_index] = texture_id;
 				bindings.dirty = true;
 			});
@@ -488,6 +506,8 @@ namespace mtl
 			ensure(stage_index < binding_set_index_max_enum);
 			ensure(m_layouts[stage_index].buffer_count < max_buffer_slots, "No buffer slot left for the buffer-size table");
 			m_bindings[stage_index].needs_buffer_sizes = true;
+			// The size-table upload is gated on dirty (see write_table); make sure enabling it forces one upload
+			m_bindings[stage_index].dirty = true;
 		}
 
 		void program::bind(mtl::command_list& cmd, mtl::data_heap& scratch)
@@ -552,21 +572,36 @@ namespace mtl
 					}
 				}
 
-				// Fresh scratch allocations: these (almost) always change
-				if (layout.push_constant_buffer_index != umax)
+				// Scratch uploads can be skipped when neither the bytes changed (bindings.dirty) nor the
+				// shared table moved on: the table still holds our last upload then, and re-uploading an
+				// identical block only burns scratch-ring space and a memcpy on every draw. The shadow peek
+				// covers program interleaving (another program's bind overwrote the slot) and fresh command
+				// lists (shadow invalidated on begin); scratch addresses stay valid while the list is open.
+				MTL::GPUAddress table_addr = 0;
+				const bool push_in_table = layout.push_constant_buffer_index != umax &&
+					contents.peek_buffer(layout.push_constant_buffer_index, table_addr) &&
+					table_addr == bindings.last_push_constants_addr && table_addr != 0;
+
+				if (layout.push_constant_buffer_index != umax && (bindings.dirty || !push_in_table))
 				{
 					const usz length = bindings.push_constants.size();
 					const auto heap_offset = scratch.alloc<256>(length);
 					std::memcpy(scratch.map(heap_offset, length), bindings.push_constants.data(), length);
 
 					const MTL::GPUAddress address = scratch.gpu_address(heap_offset);
+					bindings.last_push_constants_addr = address;
 					if (contents.update_buffer(layout.push_constant_buffer_index, address))
 					{
 						table->setAddress(address, layout.push_constant_buffer_index);
 					}
 				}
 
-				if (bindings.needs_buffer_sizes)
+				table_addr = 0;
+				const bool sizes_in_table = bindings.needs_buffer_sizes &&
+					contents.peek_buffer(layout.buffer_count, table_addr) &&
+					table_addr == bindings.last_buffer_sizes_addr && table_addr != 0;
+
+				if (bindings.needs_buffer_sizes && (bindings.dirty || !sizes_in_table))
 				{
 					// spvBufferSizeConstants: one uint per Metal buffer index of this stage
 					const usz length = sizeof(u32) * std::max(layout.buffer_count, 1u);
@@ -574,6 +609,7 @@ namespace mtl
 					std::memcpy(scratch.map(heap_offset, length), bindings.buffer_sizes.data(), length);
 
 					const MTL::GPUAddress address = scratch.gpu_address(heap_offset);
+					bindings.last_buffer_sizes_addr = address;
 					if (contents.update_buffer(layout.buffer_count, address))
 					{
 						table->setAddress(address, layout.buffer_count);

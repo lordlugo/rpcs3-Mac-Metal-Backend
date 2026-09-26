@@ -396,7 +396,7 @@ public:
 			m_storage[key] = std::move(__null_pipeline_handle);
 		}
 
-		rsx_log.notice("Add program (vp id = %d, fp id = %d)", vertex_program.id, fragment_program.id);
+		rsx_log.trace("Add program (vp id = %d, fp id = %d)", vertex_program.id, fragment_program.id);
 
 		std::function<pipeline_type* (pipeline_storage_type&)> callback;
 

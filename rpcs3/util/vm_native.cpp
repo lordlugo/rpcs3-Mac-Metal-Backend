@@ -349,14 +349,15 @@ namespace utils
 #if defined(__APPLE__) && defined(ARCH_ARM64)
 		if (can_be_jit)
 		{
-			// macOS rejects MAP_FIXED together with MAP_JIT, so a JIT range cannot be replaced in place. Unmapping it and
-			// mapping again at the same address (the old approach) races with every other thread that maps memory: with
-			// several PPU/SPU compile threads each dropping a JIT memory manager, another thread's mmap regularly took the
-			// freed range first and this failed ("Verification failed" in memory_decommit). Keep the mapping instead:
-			// make it inaccessible and hand its pages back to the system. The contents are not zeroed; JIT users always
-			// write memory before using it.
-			ensure(::mprotect(pointer, size, PROT_NONE) != -1);
-			::madvise(pointer, size, MADV_FREE_REUSABLE);
+			// Apple Silicon: neither mprotect() nor munmap+mmap can be used here. Once a MAP_JIT page has been committed
+			// writable+executable (LLVM code sections, asmjit code), every mprotect() on it fails with EACCES - even to
+			// PROT_NONE, even with JIT writes disabled. And MAP_FIXED cannot be combined with MAP_JIT (EINVAL), so a JIT
+			// range cannot be replaced by a JIT mapping.
+			// Replace it atomically with a fresh PROT_NONE anonymous mapping instead: a single MAP_FIXED mmap has no
+			// unmapped window for other mapping threads to steal (unlike a munmap+mmap pair), it zeroes the range and
+			// returns its pages. The replacement is not a JIT mapping, so a range decommitted this way must be
+			// re-reserved before it can hold executable code again - never recommitted (see jit_runtime::finalize).
+			ensure(::mmap(pointer, size, PROT_NONE, MAP_FIXED | MAP_ANON | MAP_PRIVATE | c_map_noreserve, -1, 0) != reinterpret_cast<void*>(uptr{umax}));
 		}
 		else
 		{
@@ -393,13 +394,11 @@ namespace utils
 #if defined(__APPLE__) && defined(ARCH_ARM64)
 		if (can_be_jit)
 		{
-			// See memory_decommit: MAP_FIXED cannot be combined with MAP_JIT and unmap + map again races with other
-			// threads. Keep the mapping, zero and drop its pages, and set the new protection.
-#ifdef MADV_ZERO
-			::madvise(pointer, size, MADV_ZERO); // Zeroes resident pages without touching the others (macOS 14+)
-#endif
-			::madvise(pointer, size, MADV_FREE_REUSABLE);
-			ensure(::mprotect(pointer, size, +prot) != -1);
+			// See memory_decommit: mprotect() cannot transition WX JIT pages, and MAP_FIXED|MAP_JIT is rejected.
+			// Atomically replace the range, then commit the requested protection. The replacement is not a JIT
+			// mapping, so executable protections cannot be recommitted here (no such callers on this platform).
+			ensure(::mmap(pointer, size, PROT_NONE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0) != reinterpret_cast<void*>(uptr{umax}));
+			memory_commit(pointer, size, prot);
 		}
 		else
 		{

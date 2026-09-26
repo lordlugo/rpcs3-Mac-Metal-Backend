@@ -42,6 +42,7 @@
 
 !/bin
 /bin/*
+.DS_Store
 
 # Audio DLLs
 !/bin/soft_oal.dll

@@ -91,6 +91,16 @@ namespace mtl
 		bool stencil_reference_valid = false;
 		u32 stencil_reference_front = 0;
 		u32 stencil_reference_back = 0;
+
+		bool depth_bias_valid = false;
+		f32 depth_bias = 0.f;
+		f32 depth_bias_scale = 0.f;
+		bool depth_bounds_valid = false;
+		f32 depth_bounds_min = 0.f;
+		f32 depth_bounds_max = 1.f;
+		bool viewport_valid = false;
+		MTL::Viewport viewport{};
+		MTL::ScissorRect scissor{};
 	};
 
 	struct vertex_upload_info

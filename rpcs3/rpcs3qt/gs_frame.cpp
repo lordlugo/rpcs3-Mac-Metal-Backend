@@ -28,6 +28,7 @@
 #include <QDateTime>
 #include <QKeyEvent>
 #include <QMessageBox>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QScreen>
 
@@ -1194,6 +1195,14 @@ void gs_frame::handle_cursor(Visibility visibility, bool visibility_changed, boo
 		m_mousehide_timer.stop();
 	}
 
+	if (visibility_changed && visibility == Visibility::FullScreen)
+	{
+		// The system resets the cursor when the window enters fullscreen (new Space on macOS):
+		// the cached state can already match while the visible cursor is back, so force the
+		// re-application below by invalidating the cache.
+		m_show_mouse = true;
+	}
+
 	// Update the cursor visibility
 	update_cursor();
 }
@@ -1258,8 +1267,14 @@ bool gs_frame::event(QEvent* ev)
 	}
 	else if (ev->type() == QEvent::MouseMove && (!m_show_mouse || m_mousehide_timer.isActive()))
 	{
-		// This will make the cursor visible again if it was hidden by the mouse idle timeout
-		handle_cursor(visibility(), false, false, true);
+		// This will make the cursor visible again if it was hidden by the mouse idle timeout.
+		// Synthetic same-position moves (window activation, display changes) must not restart
+		// the idle timer, or the cursor would reappear by itself.
+		if (const auto* mouse_ev = static_cast<QMouseEvent*>(ev); mouse_ev->position() != m_last_mouse_pos)
+		{
+			m_last_mouse_pos = mouse_ev->position();
+			handle_cursor(visibility(), false, false, true);
+		}
 	}
 
 	// Handle events for mouse-based gyro emulation.

@@ -3426,6 +3426,12 @@ namespace rsx
 		return performance_counters.approximate_load;
 	}
 
+	f32 thread::get_gpu_utilization_pct()
+	{
+		// Base backend: GPU utilization is not reported
+		return -1.f;
+	}
+
 	void thread::on_frame_end(u32 buffer, bool forced)
 	{
 		bool pause_emulator = false;

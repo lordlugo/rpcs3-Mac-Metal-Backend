@@ -126,11 +126,11 @@ namespace mtl
 		u32 invocations_x, invocations_y;
 		if (num_invocations > max_invocations_x)
 		{
-			// Split the 1D job into 2 dimensions (kernels linearize gl_GlobalInvocationID themselves)
+			// Split the 1D job into 2 dimensions (kernels linearize gl_GlobalInvocationID themselves).
+			// Round y up so x*y always covers the whole job: every kernel bounds-checks its linear index,
+			// so the extra threadgroups (fewer than x) are no-ops, while rounding down could silently drop tail work.
 			invocations_x = static_cast<u32>(floor(std::sqrt(num_invocations)));
-			invocations_y = invocations_x;
-
-			if (num_invocations % invocations_x) invocations_y++;
+			invocations_y = utils::aligned_div(num_invocations, invocations_x);
 		}
 		else
 		{

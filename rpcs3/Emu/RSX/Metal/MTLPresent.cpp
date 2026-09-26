@@ -62,7 +62,7 @@ namespace
 	}
 }
 
-void MTLGSRender::configure_metal_layer()
+void MTLGSRender::assert_metal_layer_state()
 {
 	if (!m_metal_layer)
 	{
@@ -106,6 +106,16 @@ void MTLGSRender::configure_metal_layer()
 			m_metal_layer->setDrawableSize(wanted);
 		}
 	}
+}
+
+void MTLGSRender::configure_metal_layer()
+{
+	if (!m_metal_layer)
+	{
+		return;
+	}
+
+	assert_metal_layer_state();
 
 	// contentsScale (the window's backing scale factor, the same source as the client size) and opaque are applied on
 	// the main thread, together with sampling the screen's refresh properties. Never blocks.
@@ -187,6 +197,11 @@ void MTLGSRender::update_present_pacing(bool emu_flip)
 			rsx_log.notice("Metal: display refresh %.2f Hz (%s refresh, interval %.2f-%.2f ms, granularity %.2f ms), %s window, backing scale %.1f",
 				1. / refresh_interval, variable_refresh ? "variable" : "fixed", props.min_refresh_interval * 1000., props.max_refresh_interval * 1000.,
 				props.update_granularity * 1000., props.fullscreen ? "fullscreen" : "windowed", props.backing_scale);
+
+			// A display transition (fullscreen toggle, other screen, mode change) may have disturbed the layer
+			// behind the renderer's back. Reassert the presentation state while sizes are stable, when no resize
+			// would do it.
+			assert_metal_layer_state();
 		}
 
 		pacing.refresh_interval = refresh_interval;
@@ -386,12 +401,13 @@ void MTLGSRender::present_drawable(mtl::frame_context_t* ctx)
 		{
 			const f64 busy_ms = gpu.busy_ns / 1'000'000.;
 			const auto per_frame = [frames](u64 count) { return static_cast<f64>(count) / frames; };
+			const auto program_cache_sizes = m_prog_buffer->get_cache_sizes();
 			const auto& reasons = gpu.splits_by_reason;
 			// Skipped draws / pipeline waits: shader compilation stutter (no shader interpreter on Metal)
 			rsx_log.notice("Metal: GPU busy %.2f ms per frame (%.0f%% of the time), %.1f render passes (%.1f for draws) and %.1f feedback splits per frame "
 				"(read after write %.1f, through a copy %.1f, write after read %.1f, depth compare %.1f, vertex read %.1f; %.1f feedback reads kept in the pass), "
 				"%.1f image uploads from memory per frame (%.1f ahead of the render pass, %.1f ended one). "
-				"Pipelines: %.1f draws skipped and %.2f ms waited per frame",
+				"Pipelines: %.1f draws skipped and %.2f ms waited per frame (program cache: %llu pipelines, %llu vertex and %llu fragment programs)",
 				busy_ms / frames, 100. * busy_ms / window_ms, per_frame(gpu.render_passes), per_frame(gpu.draw_render_passes), per_frame(gpu.feedback_splits),
 				per_frame(reasons[static_cast<u32>(mtl::pass_split_reason::read_after_write)]),
 				per_frame(reasons[static_cast<u32>(mtl::pass_split_reason::read_through_copy)]),
@@ -400,7 +416,10 @@ void MTLGSRender::present_drawable(mtl::frame_context_t* ctx)
 				per_frame(reasons[static_cast<u32>(mtl::pass_split_reason::vertex_read)]),
 				per_frame(gpu.feedback_reads_in_pass),
 				per_frame(gpu.uploads_ahead + gpu.uploads_inline), per_frame(gpu.uploads_ahead), per_frame(gpu.uploads_inline_split),
-				per_frame(m_skipped_draws), per_frame(m_pipeline_wait_us) / 1000.);
+				per_frame(m_skipped_draws), per_frame(m_pipeline_wait_us) / 1000.,
+				static_cast<unsigned long long>(program_cache_sizes.pipelines),
+				static_cast<unsigned long long>(program_cache_sizes.vertex_programs),
+				static_cast<unsigned long long>(program_cache_sizes.fragment_programs));
 		}
 
 		m_skipped_draws = 0;

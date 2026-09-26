@@ -514,7 +514,7 @@ namespace mtl
 		return slot.get();
 	}
 
-	glsl::program* overlay_pass::load_program(mtl::command_list& cmd, const overlay_target& target, const std::vector<mtl::image_view*>& src)
+	glsl::program* overlay_pass::load_program(mtl::command_list& cmd, const overlay_target& target, std::span<mtl::image_view* const> src)
 	{
 		// Complete the pipeline description with the target attachments
 		auto state = renderpass_config.state;
@@ -685,7 +685,7 @@ namespace mtl
 		cmd.end_render_pass();
 	}
 
-	void overlay_pass::draw(mtl::command_list& cmd, const areau& viewport, const overlay_target& target, const std::vector<mtl::image_view*>& src)
+	void overlay_pass::draw(mtl::command_list& cmd, const areau& viewport, const overlay_target& target, std::span<mtl::image_view* const> src)
 	{
 		ensure(cmd.is_render_pass_open());
 
@@ -741,7 +741,7 @@ namespace mtl
 		encoder->setScissorRect(clamp_scissor(target, x, y, w, h));
 	}
 
-	void overlay_pass::run(mtl::command_list& cmd, const areau& viewport, const overlay_target& target, const std::vector<mtl::image_view*>& src)
+	void overlay_pass::run(mtl::command_list& cmd, const areau& viewport, const overlay_target& target, std::span<mtl::image_view* const> src)
 	{
 		if (!begin_pass(cmd, target, viewport))
 		{
@@ -752,14 +752,14 @@ namespace mtl
 		end_pass(cmd);
 	}
 
-	void overlay_pass::run(mtl::command_list& cmd, const areau& viewport, mtl::image* target, const std::vector<mtl::image_view*>& src)
+	void overlay_pass::run(mtl::command_list& cmd, const areau& viewport, mtl::image* target, std::span<mtl::image_view* const> src)
 	{
 		run(cmd, viewport, overlay_target(target), src);
 	}
 
 	void overlay_pass::run(mtl::command_list& cmd, const areau& viewport, mtl::image* target, mtl::image_view* src)
 	{
-		std::vector<mtl::image_view*> views = { src };
+		mtl::image_view* views[] = { src };
 		run(cmd, viewport, overlay_target(target), views);
 	}
 

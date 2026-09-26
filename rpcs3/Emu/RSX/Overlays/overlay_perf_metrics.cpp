@@ -559,6 +559,8 @@ namespace rsx
 						if (m_detail == detail_level::low) // otherwise already acquired in medium
 							m_cpu_usage = static_cast<f32>(m_cpu_stats.get_usage());
 
+						m_gpu_usage = rsx_thread.get_gpu_utilization_pct();
+
 						[[fallthrough]];
 					}
 					case detail_level::minimal:
@@ -595,8 +597,12 @@ namespace rsx
 				case detail_level::low:
 				{
 					fmt::append(perf_text, "FPS : %05.2f\n"
-					                         "CPU : %04.1f %%",
+					                         "CPU : %04.1f %%\n",
 					    m_fps, m_cpu_usage);
+					if (m_gpu_usage < 0.f)
+						fmt::append(perf_text, "GPU : n/a");
+					else
+						fmt::append(perf_text, "GPU : %04.1f %%", m_gpu_usage);
 					break;
 				}
 				case detail_level::medium:

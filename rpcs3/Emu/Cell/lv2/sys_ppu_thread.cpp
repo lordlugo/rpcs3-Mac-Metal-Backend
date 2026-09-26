@@ -174,6 +174,11 @@ s32 sys_ppu_thread_yield(ppu_thread& ppu)
 	{
 		// Do other work in the meantime
 		lv2_obj::notify_all();
+
+		// Throttle failed-yield spins: CELL_CANCEL only means no same-prio peer
+		// is runnable, so a sub-microsecond pause is guest-invisible, slows the
+		// syscall re-issue rate, and lets the waited-on producer reach the CPU.
+		busy_wait(500);
 	}
 
 	// Return 0 on successful context switch, 1 otherwise

@@ -949,7 +949,7 @@ void spu_cache::initialize(bool build_existing_cache)
 			total_funcs = build_existing_cache ? ::narrow<u32>(add_count) : 0;
 		}
 
-		worker_count = std::min<u32>(rpcs3::utils::get_max_threads(), ::narrow<u32>(add_count));
+		worker_count = std::min<u32>(rpcs3::utils::get_max_threads() > 1 ? rpcs3::utils::get_max_threads() - 1 : 1, ::narrow<u32>(add_count));
 	}
 
 	atomic_t<u32> pending_progress = 0;
@@ -1043,26 +1043,30 @@ void spu_cache::initialize(bool build_existing_cache)
 			const u32 start = func.lower_bound;
 			const u32 size0 = ::size32(func.data);
 
-			be_t<u64> hash_start;
-			{
-				sha1_context ctx;
-				u8 output[20];
-
-				sha1_starts(&ctx);
-				sha1_update(&ctx, reinterpret_cast<const u8*>(func.data.data()), func.data.size() * 4);
-				sha1_finish(&ctx, output);
-				std::memcpy(&hash_start, output, sizeof(hash_start));
-			}
-
-			// Check hash against allowed bounds
+			// Check hash against allowed bounds (skip the SHA1 when bounds are at defaults: every hash passes)
 			const bool inverse_bounds = g_cfg.core.spu_llvm_lower_bound > g_cfg.core.spu_llvm_upper_bound;
+			const bool bounds_are_default = !inverse_bounds && g_cfg.core.spu_llvm_lower_bound == 0 && g_cfg.core.spu_llvm_upper_bound.get() == umax;
 
-			if ((!inverse_bounds && (hash_start < g_cfg.core.spu_llvm_lower_bound || hash_start > g_cfg.core.spu_llvm_upper_bound)) ||
-				(inverse_bounds && (hash_start < g_cfg.core.spu_llvm_lower_bound && hash_start > g_cfg.core.spu_llvm_upper_bound)))
+			if (!bounds_are_default)
 			{
-				spu_log.error("[Debug] Skipped function %s", fmt::base57(hash_start));
-				result++;
-				continue;
+				be_t<u64> hash_start;
+				{
+					sha1_context ctx;
+					u8 output[20];
+
+					sha1_starts(&ctx);
+					sha1_update(&ctx, reinterpret_cast<const u8*>(func.data.data()), func.data.size() * 4);
+					sha1_finish(&ctx, output);
+					std::memcpy(&hash_start, output, sizeof(hash_start));
+				}
+
+				if ((!inverse_bounds && (hash_start < g_cfg.core.spu_llvm_lower_bound || hash_start > g_cfg.core.spu_llvm_upper_bound)) ||
+					(inverse_bounds && (hash_start < g_cfg.core.spu_llvm_lower_bound && hash_start > g_cfg.core.spu_llvm_upper_bound)))
+				{
+					spu_log.error("[Debug] Skipped function %s", fmt::base57(hash_start));
+					result++;
+					continue;
+				}
 			}
 
 			// Initialize LS with function data only

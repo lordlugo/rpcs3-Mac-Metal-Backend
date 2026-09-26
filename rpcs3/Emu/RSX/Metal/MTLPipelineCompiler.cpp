@@ -513,9 +513,11 @@ namespace mtl
 			// builds at a time (raised by setShouldMaximizeConcurrentCompilation, see render_device::create): one worker
 			// per task keeps it busy without queueing work inside the service. The workers' own CPU work (GLSL ->
 			// SPIR-V -> MSL) runs below emulation priority (see operator()). At least 2 workers, so that one slow
-			// compile never holds back the others; at most all but two host threads (and 16).
+			// compile never holds back the others; at most all but one host thread (and 16).
+			// Below-emulation-priority workers only consume otherwise idle cores, so the extra
+			// worker drains streaming compile bursts faster instead of skipping draws.
 			const u32 hw_threads = utils::get_thread_count();
-			const u32 cpu_limit = std::min(16u, std::max(2u, hw_threads > 2 ? hw_threads - 2 : 0u));
+			const u32 cpu_limit = std::min(16u, std::max(2u, hw_threads > 1 ? hw_threads - 1 : 1u));
 			num_worker_threads = static_cast<int>(std::clamp(compile_tasks, 2u, cpu_limit));
 
 			rsx_log.notice("Async pipeline compiler auto-selected %d worker(s) (Metal concurrent compilation tasks: %u, host threads: %u).",

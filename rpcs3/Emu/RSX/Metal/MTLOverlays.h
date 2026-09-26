@@ -29,6 +29,7 @@
 #include "Emu/IdManager.h"
 
 #include <array>
+#include <span>
 #include <unordered_map>
 
 namespace rsx
@@ -192,7 +193,7 @@ namespace mtl
 
 		// Returns nullptr (logged once, cached) if the pipeline cannot be built; the draw is then skipped
 		glsl::program* build_pipeline(u64 storage_key, const glsl::graphics_pipeline_state& state);
-		glsl::program* load_program(mtl::command_list& cmd, const overlay_target& target, const std::vector<mtl::image_view*>& src);
+		glsl::program* load_program(mtl::command_list& cmd, const overlay_target& target, std::span<mtl::image_view* const> src);
 
 		virtual void create(const mtl::render_device& dev);
 		virtual void destroy();
@@ -206,7 +207,7 @@ namespace mtl
 		// block-compressed format); the caller must then skip draw()/end_pass().
 		bool begin_pass(mtl::command_list& cmd, const overlay_target& target, const areau& viewport);
 		void end_pass(mtl::command_list& cmd);
-		void draw(mtl::command_list& cmd, const areau& viewport, const overlay_target& target, const std::vector<mtl::image_view*>& src);
+		void draw(mtl::command_list& cmd, const areau& viewport, const overlay_target& target, std::span<mtl::image_view* const> src);
 
 		// Hook to change attachment load/clear actions of the pass descriptor (called by begin_pass)
 		virtual void configure_attachments(MTL4::RenderPassDescriptor* /*desc*/, const overlay_target& /*target*/, bool /*covers_target*/) {}
@@ -216,8 +217,8 @@ namespace mtl
 		virtual void set_up_viewport(mtl::command_list& cmd, const overlay_target& target, u32 x, u32 y, u32 w, u32 h);
 
 		// Opens a render pass on `target`, draws once and closes the pass.
-		void run(mtl::command_list& cmd, const areau& viewport, const overlay_target& target, const std::vector<mtl::image_view*>& src);
-		void run(mtl::command_list& cmd, const areau& viewport, mtl::image* target, const std::vector<mtl::image_view*>& src);
+		void run(mtl::command_list& cmd, const areau& viewport, const overlay_target& target, std::span<mtl::image_view* const> src);
+		void run(mtl::command_list& cmd, const areau& viewport, mtl::image* target, std::span<mtl::image_view* const> src);
 		void run(mtl::command_list& cmd, const areau& viewport, mtl::image* target, mtl::image_view* src);
 	};
 
@@ -385,7 +386,7 @@ namespace mtl
 		// target level). Either area may be mirrored (x1 > x2 or y1 > y2). src holds one view, or {depth, stencil}
 		// views for depth_stencil_blit_pass. Views must be single-sampled 2D views.
 		void run(mtl::command_list& cmd, const overlay_target& target, const areai& dst_area,
-			const std::vector<mtl::image_view*>& src, const areai& src_area, bool linear_filter);
+			std::span<mtl::image_view* const> src, const areai& src_area, bool linear_filter);
 	};
 
 	// Integer color destinations (e.g. R16Uint / R32Uint typeless helpers). Source must have the same integer-ness.

@@ -903,6 +903,37 @@ void MTLGSRender::on_semaphore_acquire_wait()
 	{
 		do_local_task(rsx::FIFO::state::lock_wait);
 	}
+
+	// Non-blocking: recycle frames whose present lists already completed, freeing
+	// drawable supply (nextDrawable back-pressure) that gates the flip-label producer.
+	check_present_status();
+}
+
+f32 MTLGSRender::get_gpu_utilization_pct()
+{
+	const u64 now_us = get_system_time();
+	const u64 busy_ns = mtl::peek_gpu_busy_ns();
+
+	if (!m_gpu_util_last_time_us || now_us <= m_gpu_util_last_time_us)
+	{
+		m_gpu_util_last_time_us = now_us;
+		m_gpu_util_last_busy_ns = busy_ns;
+		return m_gpu_util_cached_pct;
+	}
+
+	const u64 dt_ns = (now_us - m_gpu_util_last_time_us) * 1000;
+	// The periodic telemetry resets the accumulator; a backwards counter means "busy since the reset"
+	const u64 dbusy_ns = (busy_ns >= m_gpu_util_last_busy_ns) ? (busy_ns - m_gpu_util_last_busy_ns) : busy_ns;
+
+	m_gpu_util_last_time_us = now_us;
+	m_gpu_util_last_busy_ns = busy_ns;
+
+	if (dt_ns)
+	{
+		m_gpu_util_cached_pct = std::clamp(static_cast<f32>(100. * static_cast<f64>(dbusy_ns) / static_cast<f64>(dt_ns)), 0.f, 100.f);
+	}
+
+	return m_gpu_util_cached_pct;
 }
 
 bool MTLGSRender::on_vram_exhausted(rsx::problem_severity severity)
@@ -1104,7 +1135,19 @@ void MTLGSRender::bind_viewport()
 	}
 
 	auto encoder = ensure(get_render_encoder());
-	encoder->setViewport(m_viewport);
+
+	// Same change-gating as the other dynamic state above: a new encoder per pass split starts blank,
+	// but identical registers re-emit nothing (m_encoder_state resets in on_render_pass_begin).
+	const auto& cached_vp = m_encoder_state.viewport;
+	if (!m_encoder_state.viewport_valid ||
+		cached_vp.originX != m_viewport.originX || cached_vp.originY != m_viewport.originY ||
+		cached_vp.width != m_viewport.width || cached_vp.height != m_viewport.height ||
+		cached_vp.znear != m_viewport.znear || cached_vp.zfar != m_viewport.zfar)
+	{
+		encoder->setViewport(m_viewport);
+		m_encoder_state.viewport = m_viewport;
+		m_encoder_state.viewport_valid = true;
+	}
 
 	MTL::ScissorRect scissor = get_clamped_scissor();
 	if (!scissor.width || !scissor.height)
@@ -1113,7 +1156,15 @@ void MTLGSRender::bind_viewport()
 		scissor = { 0, 0, 1, 1 };
 	}
 
-	encoder->setScissorRect(scissor);
+	const auto& cached_sc = m_encoder_state.scissor;
+	if (!m_encoder_state.viewport_valid ||
+		cached_sc.x != scissor.x || cached_sc.y != scissor.y ||
+		cached_sc.width != scissor.width || cached_sc.height != scissor.height)
+	{
+		encoder->setScissorRect(scissor);
+		m_encoder_state.scissor = scissor;
+		m_encoder_state.viewport_valid = true;
+	}
 }
 
 MTL::ScissorRect MTLGSRender::get_clamped_scissor() const
@@ -1141,6 +1192,7 @@ void MTLGSRender::on_init_thread()
 
 	// There is no shader interpreter on Metal, so the pipeline cache is always preloaded (every shader mode behaves
 	// like the async recompiler).
+	const u64 preload_start_us = get_system_time();
 	{
 		mtl::autorelease_scope pool;
 
@@ -1158,6 +1210,9 @@ void MTLGSRender::on_init_thread()
 			m_shaders_cache->load(&dlg);
 		}
 	}
+
+	const u64 preload_us = get_system_time() - preload_start_us;
+	rsx_log.notice("Metal: shader cache preload took %.1f ms", preload_us / 1000.);
 
 	// Saves every pipeline built so far to the pipeline archive (background thread)
 	mtl::on_pipeline_cache_preloaded();
@@ -1533,11 +1588,17 @@ bool MTLGSRender::load_program()
 	}
 
 	if (!m_program &&
-		(shadermode == shader_mode::async_with_interpreter || shadermode == shader_mode::interpreter_only) &&
-		!m_interpreter_warning_logged)
+		(shadermode == shader_mode::async_with_interpreter || shadermode == shader_mode::interpreter_only))
 	{
-		m_interpreter_warning_logged = true;
-		rsx_log.warning("Metal: shader interpreter unavailable, skipping draws until pipelines finish compiling.");
+		// Streaming games hit uncompiled pipelines in bursts long after boot; a single boot-time
+		// warning leaves later flicker unexplained. Explain again at most once per 30 s.
+		const u64 now = get_system_time();
+		if (!m_interpreter_warning_logged || now - m_interpreter_warning_time >= 30'000'000)
+		{
+			m_interpreter_warning_logged = true;
+			m_interpreter_warning_time = now;
+			rsx_log.warning("Metal: shader interpreter unavailable, skipping draws until pipelines finish compiling.");
+		}
 	}
 
 	if (m_program)

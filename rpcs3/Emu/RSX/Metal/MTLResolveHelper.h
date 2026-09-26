@@ -164,13 +164,16 @@ namespace mtl
 		void run(mtl::command_list& cmd, mtl::viewable_image* msaa_image, mtl::viewable_image* resolve_image)
 		{
 			update_sample_configuration(msaa_image);
-			auto depth_view = msaa_image->get_identity_view(aspect_depth);
-			auto stencil_view = msaa_image->get_identity_view(aspect_stencil);
+			mtl::image_view* views[] =
+			{
+				msaa_image->get_identity_view(aspect_depth),
+				msaa_image->get_identity_view(aspect_stencil)
+			};
 
 			overlay_pass::run(
 				cmd,
 				{ 0, 0, resolve_image->width(), resolve_image->height() },
-				resolve_image, { depth_view, stencil_view });
+				resolve_image, std::span<mtl::image_view* const>{ views });
 		}
 	};
 
@@ -196,13 +199,16 @@ namespace mtl
 		{
 			update_sample_configuration(msaa_image);
 
-			auto depth_view = resolve_image->get_identity_view(aspect_depth);
-			auto stencil_view = resolve_image->get_identity_view(aspect_stencil);
+			mtl::image_view* views[] =
+			{
+				resolve_image->get_identity_view(aspect_depth),
+				resolve_image->get_identity_view(aspect_stencil)
+			};
 
 			overlay_pass::run(
 				cmd,
 				{ 0, 0, msaa_image->width(), msaa_image->height() },
-				msaa_image, { depth_view, stencil_view });
+				msaa_image, std::span<mtl::image_view* const>{ views });
 		}
 	};
 

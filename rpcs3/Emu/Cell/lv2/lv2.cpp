@@ -61,6 +61,7 @@
 #include "util/sysinfo.hpp"
 #include "util/init_mutex.hpp"
 #include "util/cctype.hpp"
+#include "util/asm.hpp"
 
 #if defined(ARCH_X64)
 #ifdef _MSC_VER
@@ -2266,8 +2267,10 @@ bool lv2_obj::wait_timeout(u64 usec, ppu_thread* cpu, bool scale, bool is_usleep
 #endif
 			else
 			{
-				// Try yielding. May cause long wake latency but helps weaker CPUs a lot by alleviating resource pressure
-				std::this_thread::yield();
+				// Pause instead of yielding: the poll loop and wake deadline below are
+				// unchanged, but each turn no longer costs a scheduler-yield syscall
+				// and is HT/sibling-thread friendly (helps weaker CPUs more).
+				busy_wait(300);
 			}
 		}
 

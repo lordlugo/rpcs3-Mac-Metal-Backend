@@ -27,6 +27,7 @@
 
 #include <deque>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #ifndef GENERAL_WAIT_TIMEOUT
@@ -82,8 +83,8 @@ namespace mtl
 
 		std::unique_ptr<mtl::viewable_image> managed_texture = nullptr;
 
-		// DMA relevant data
-		std::unique_ptr<mtl::dma_fence_t> dma_fence;
+		// DMA relevant data (optional: avoids a heap allocation per DMA readback; 2 pointers + u64 inline)
+		std::optional<mtl::dma_fence_t> dma_fence;
 		const mtl::render_device* m_device = nullptr;
 		mtl::viewable_image* vram_texture = nullptr;
 
@@ -287,15 +288,28 @@ namespace mtl
 			if (transfer_width != locked_resource->width() || transfer_height != locked_resource->height())
 			{
 				// TODO: Synchronize access to typeles textures
-				target = mtl::get_typeless_helper(vram_texture->format(), vram_texture->format_class(), transfer_width, transfer_height);
+				target = mtl::get_typeless_helper(vram_texture->format(), vram_texture->format_class(), transfer_width, transfer_height, "readback-scale");
 
-				// Allow bilinear filtering on color textures where compatibility is likely
-				const bool linear_filter = (target->aspect() == aspect_color);
+				if (!target)
+				{
+					// Helper refused (dimensions logged at its call site); fall back to the
+					// unscaled resource instead of dereferencing null below.
+					rsx_log.warning("Metal: readback-scale helper for %ux%u refused, reading back unscaled %ux%u.",
+						transfer_width, transfer_height, locked_resource->width(), locked_resource->height());
+					target = locked_resource;
+					transfer_width = locked_resource->width();
+					transfer_height = locked_resource->height();
+				}
+				else
+				{
+					// Allow bilinear filtering on color textures where compatibility is likely
+					const bool linear_filter = (target->aspect() == aspect_color);
 
-				mtl::copy_scaled_image(cmd, locked_resource, target,
-					areai{ 0, 0, static_cast<s32>(locked_resource->width()), static_cast<s32>(locked_resource->height()) },
-					areai{ 0, 0, static_cast<s32>(transfer_width), static_cast<s32>(transfer_height) },
-					{}, true, linear_filter);
+					mtl::copy_scaled_image(cmd, locked_resource, target,
+						areai{ 0, 0, static_cast<s32>(locked_resource->width()), static_cast<s32>(locked_resource->height()) },
+						areai{ 0, 0, static_cast<s32>(transfer_width), static_cast<s32>(transfer_height) },
+						{}, true, linear_filter);
+				}
 			}
 
 			const auto internal_bpp = mtl::get_format_texel_width(vram_texture->format());

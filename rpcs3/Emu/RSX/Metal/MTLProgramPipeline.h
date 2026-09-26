@@ -259,6 +259,10 @@ namespace mtl
 				std::array<MTL::ResourceID, 16> samplers{};
 				std::vector<u8> push_constants;
 				bool dirty = true;
+				// Scratch addresses of our last uploads (0 = none): lets write_table skip re-uploading
+				// when the shared table still holds our bytes (see the shadow peek below)
+				MTL::GPUAddress last_push_constants_addr = 0;
+				MTL::GPUAddress last_buffer_sizes_addr = 0;
 
 				std::array<u32, 31> buffer_sizes{};     // Bound ranges, uploaded when the stage needs a buffer-size table
 				bool needs_buffer_sizes = false;
