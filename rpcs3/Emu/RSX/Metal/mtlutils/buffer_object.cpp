@@ -26,6 +26,8 @@ namespace mtl
 			fmt::throw_exception("Metal: failed to allocate buffer of %llu bytes", size);
 		}
 
+		m_gpu_address = m_buffer->gpuAddress();
+
 		if (!label.empty())
 		{
 			autorelease_scope pool;
@@ -46,6 +48,8 @@ namespace mtl
 		{
 			fmt::throw_exception("Metal: newBufferWithBytesNoCopy failed (ptr=%p, size=0x%llx)", host_pointer, size);
 		}
+
+		m_gpu_address = m_buffer->gpuAddress();
 
 		if (!label.empty())
 		{
@@ -130,6 +134,8 @@ namespace mtl
 		{
 			fmt::throw_exception("Metal: failed to create texel buffer view (fmt=%d, offset=%llu, size=%llu)", static_cast<int>(format), offset, size);
 		}
+
+		resource_id = value->gpuResourceID();
 		(void)dev;
 	}
 

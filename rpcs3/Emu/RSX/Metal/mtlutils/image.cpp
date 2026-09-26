@@ -2,9 +2,30 @@
 #include "image.h"
 #include "buffer_object.h"
 #include "garbage_collector.h"
+#include "Emu/system_config.h"
+
+#include <cstdlib>
 
 namespace mtl
 {
+	bool debug_labels_enabled()
+	{
+		static const bool s_env_enabled = []()
+		{
+			for (const char* name : { "RPCS3_METAL_DEBUG_LABELS", "MTL_CAPTURE_ENABLED", "MTL_DEBUG_LAYER" })
+			{
+				if (const char* value = ::getenv(name); value && value[0] && value[0] != '0')
+				{
+					return true;
+				}
+			}
+
+			return false;
+		}();
+
+		return s_env_enabled || g_cfg.video.debug_output;
+	}
+
 	bool is_depth_format(MTL::PixelFormat format)
 	{
 		switch (format)
@@ -146,7 +167,9 @@ namespace mtl
 	void image::set_debug_name(const std::string& name)
 	{
 		m_debug_name = name;
-		if (value)
+
+		// A label is an NSString plus a setLabel message; only worth it when a debugging tool shows it
+		if (value && debug_labels_enabled())
 		{
 			autorelease_scope pool;
 			value->setLabel(ns_str(name));
@@ -216,6 +239,8 @@ namespace mtl
 		{
 			fmt::throw_exception("Metal: failed to create texture view (fmt=%d type=%d)", static_cast<int>(view_format), static_cast<int>(info.type));
 		}
+
+		resource_id = value->gpuResourceID();
 	}
 
 	image_view::~image_view()
@@ -314,6 +339,30 @@ namespace mtl
 		identity.control_map = { CELL_GCM_TEXTURE_REMAP_REMAP, CELL_GCM_TEXTURE_REMAP_REMAP, CELL_GCM_TEXTURE_REMAP_REMAP, CELL_GCM_TEXTURE_REMAP_REMAP };
 		identity.channel_map = { 0, 1, 2, 3 };
 		return get_view(identity, aspect_mask);
+	}
+
+	image_view* viewable_image::get_subresource_view(u32 level, u32 layer, u32 aspect)
+	{
+		// get_view() keys use bits 0-34 (remap encoding | aspect_mask << 32); bit 63 tags subresource views
+		ensure(level < (1u << 16) && aspect < (1u << 7));
+		const u64 storage_key = (1ull << 63) | (static_cast<u64>(aspect) << 56) | (static_cast<u64>(level) << 32) | layer;
+		if (auto found = views.find(storage_key); found != views.end())
+		{
+			return found->second.get();
+		}
+
+		image_view_info view_info{};
+		view_info.type = MTL::TextureType2D;
+		view_info.base_level = level;
+		view_info.level_count = 1;
+		view_info.base_layer = layer;
+		view_info.layer_count = 1;
+		view_info.aspect = aspect;
+
+		auto view = std::make_unique<mtl::image_view>(this, view_info);
+		auto result = view.get();
+		views.emplace(storage_key, std::move(view));
+		return result;
 	}
 
 	void viewable_image::set_native_component_layout(const MTL::TextureSwizzleChannels& new_layout)

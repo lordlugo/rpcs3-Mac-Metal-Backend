@@ -62,7 +62,10 @@ namespace mtl
 		sampler(const sampler&) = delete;
 		sampler& operator=(const sampler&) = delete;
 
-		MTL::ResourceID resource_id() const { return value->gpuResourceID(); }
+		MTL::ResourceID resource_id() const { return m_resource_id; }
+
+	private:
+		MTL::ResourceID m_resource_id{}; // Fixed for the sampler's lifetime; cached because draws bind samplers by ID
 	};
 
 	struct cached_sampler_object_t : public mtl::sampler, public rsx::ref_counted

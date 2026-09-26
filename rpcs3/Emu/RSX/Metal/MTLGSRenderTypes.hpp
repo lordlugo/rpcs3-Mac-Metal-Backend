@@ -70,12 +70,27 @@ namespace mtl
 		u64 depth_stencil_key = 0;        // Packed MTLDepthStencilDescriptor contents (incl. stencil masks)
 	};
 
-	// Encoder state last applied to the renderer's main pass (invalidated whenever a pass is opened)
+	// Encoder state last applied to the renderer's main pass (invalidated whenever a pass is opened). Encoder state
+	// lasts for the whole pass, so update_draw_state() only sends what changed; anything else that sets one of these on
+	// the main pass (in-pass clears) must update or invalidate it.
 	struct encoder_state
 	{
 		u64 pass_id = umax;
 		const MTL::RenderPipelineState* pipeline = nullptr;
 		const MTL::DepthStencilState* depth_stencil = nullptr;
+
+		bool rasterizer_valid = false; // cull_mode .. fill_mode below are set on the encoder
+		MTL::CullMode cull_mode = MTL::CullModeNone;
+		MTL::Winding front_face = MTL::WindingClockwise;
+		MTL::DepthClipMode depth_clip_mode = MTL::DepthClipModeClip;
+		MTL::TriangleFillMode fill_mode = MTL::TriangleFillModeFill;
+
+		bool blend_color_valid = false;
+		std::array<f32, 4> blend_color{};
+
+		bool stencil_reference_valid = false;
+		u32 stencil_reference_front = 0;
+		u32 stencil_reference_back = 0;
 	};
 
 	struct vertex_upload_info

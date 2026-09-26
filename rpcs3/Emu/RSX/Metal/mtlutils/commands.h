@@ -45,6 +45,69 @@ namespace mtl
 	void count_feedback_read_in_pass();
 	void count_draw_render_pass();
 
+	// Contents of one argument table as last written through update_*(). Metal takes a snapshot of a table's bindings
+	// when a draw/dispatch is encoded; the table itself is a plain object whose contents persist across encoders and
+	// command buffers. So when every write goes through here (glsl::program::bind() is the only writer), a slot whose
+	// value already matches needs no write. A table holds values (GPU addresses, resource IDs), not objects, so an equal
+	// value means identical GPU-visible state even if the object behind it was recreated.
+	struct argument_table_shadow
+	{
+		static constexpr u32 max_textures = 64; // Table size, see command_list::create()
+
+		std::array<MTL::GPUAddress, gpu_capabilities::max_buffers_per_stage> buffers{};
+		std::array<u64, max_textures> textures{};                                 // MTL::ResourceID::_impl
+		std::array<u64, gpu_capabilities::max_samplers_per_stage> samplers{};     // MTL::ResourceID::_impl
+		u32 buffers_known = 0;   // Bit i: buffers[i] is what the table holds
+		u64 textures_known = 0;
+		u32 samplers_known = 0;
+
+		// Each returns true, and records the value, if the table does not hold it yet (the caller writes it then)
+		bool update_buffer(u32 index, MTL::GPUAddress address)
+		{
+			return update(buffers[index], buffers_known, u32{1} << index, address);
+		}
+
+		bool update_texture(u32 index, MTL::ResourceID id)
+		{
+			return update(textures[index], textures_known, u64{1} << index, id._impl);
+		}
+
+		bool update_sampler(u32 index, MTL::ResourceID id)
+		{
+			return update(samplers[index], samplers_known, u32{1} << index, id._impl);
+		}
+
+		// Every slot unknown: the next bind writes all the slots it uses
+		void invalidate()
+		{
+			buffers_known = 0;
+			textures_known = 0;
+			samplers_known = 0;
+		}
+
+	private:
+		template <typename M>
+		static bool update(u64& slot, M& known, M bit, u64 value)
+		{
+			if ((known & bit) && slot == value)
+			{
+				return false;
+			}
+
+			slot = value;
+			known |= bit;
+			return true;
+		}
+	};
+
+	// State glsl::program::bind() (the only code setting pipeline states and argument tables) set on the open render
+	// encoder. Encoder state lasts until the encoder ends; reset whenever a render pass begins.
+	struct render_encoder_bindings
+	{
+		u64 program_uid = 0;  // glsl::program whose pipeline state is set (0: none)
+		u32 tables_set = 0;   // Bit (1 << argument_table_slot): that table is set for its stage
+	};
+
 	struct submit_info_t
 	{
 		// Optional GPU-side waits before this batch executes
@@ -115,6 +178,8 @@ namespace mtl
 		bool m_pass_orders_vertex = false;       // the open render pass was begun that way
 
 		std::array<MTL4::ArgumentTable*, table_count> m_argument_tables{};
+		std::array<argument_table_shadow, table_count> m_argument_table_shadows{};
+		render_encoder_bindings m_render_bindings{};
 
 		bool m_is_open = false;
 		bool m_is_pending = false;
@@ -174,6 +239,10 @@ namespace mtl
 
 		// --- Argument tables (one per stage slot, reused across encoders; contents captured at draw/dispatch) ---
 		MTL4::ArgumentTable* argument_table(argument_table_slot slot) const { return m_argument_tables[slot]; }
+		// What the table of `slot` holds. Whoever writes a table directly must update (or invalidate) this.
+		argument_table_shadow& argument_table_contents(argument_table_slot slot) { return m_argument_table_shadows[slot]; }
+		// Pipeline state and tables set on the open render encoder
+		render_encoder_bindings& render_bindings() { return m_render_bindings; }
 
 		// --- Misc -----------------------------------------------------------------------------------------------
 		MTL4::CommandBuffer* handle() const { return m_commands; }

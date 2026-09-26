@@ -15,6 +15,7 @@ namespace mtl
 	class buffer
 	{
 		MTL::Buffer* m_buffer = nullptr;
+		MTL::GPUAddress m_gpu_address = 0; // Fixed for the buffer's lifetime; cached because draws bind buffers by address
 		u64 m_size = 0;
 		memory_location m_location = memory_location::host_visible;
 		bool m_host_import = false;
@@ -41,13 +42,14 @@ namespace mtl
 		// Persistent CPU pointer (host_visible buffers only). Unified memory: no map/unmap cost.
 		void* map(u64 offset = 0) const;
 
-		MTL::GPUAddress gpu_address(u64 offset = 0) const { return m_buffer->gpuAddress() + offset; }
+		MTL::GPUAddress gpu_address(u64 offset = 0) const { return m_gpu_address + offset; }
 	};
 
 	// A typed texel view of a buffer (MSL texture_buffer<T>), used for vertex pulling and texel-buffer inputs.
 	struct buffer_view
 	{
 		MTL::Texture* value = nullptr;
+		MTL::ResourceID resource_id{};   // value->gpuResourceID(), fixed for the view's lifetime (bound by resource ID)
 		MTL::Buffer* parent = nullptr;
 		MTL::PixelFormat format = MTL::PixelFormatInvalid;
 		u64 offset = 0;
