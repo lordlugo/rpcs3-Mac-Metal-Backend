@@ -702,9 +702,11 @@ MTLGSRender::~MTLGSRender()
 	m_present_timeline.destroy();
 	m_present_queue = nullptr;
 
-	// Caches
-	m_rtts.destroy();
+	// Caches. The texture cache goes first: its framebuffer sections (Write Color Buffers) point at render targets and
+	// unlocking them on teardown touches the surface (post_protect -> get_render_target -> on_unlock), which would be
+	// freed memory once the surface cache is destroyed.
 	m_texture_cache.destroy();
+	m_rtts.destroy();
 	m_vertex_cache.reset();
 
 	m_persistent_attribute_storage.reset();

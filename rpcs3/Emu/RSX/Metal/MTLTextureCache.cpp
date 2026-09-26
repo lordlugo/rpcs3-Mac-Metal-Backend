@@ -447,6 +447,9 @@ namespace mtl
 			std::lock_guard lock(m_cached_pool_lock);
 			m_cache_is_exiting = true;
 		}
+
+		// Views handed out for a draw that never finished (emulation stopped mid-draw); the common clear() skips them
+		release_uncached_temporary_subresources();
 		baseclass::clear();
 
 		m_cached_images.clear();
