@@ -132,7 +132,8 @@ namespace mtl
 
 	// Metal has no vkCmdClearColorImage / vkCmdClearDepthStencilImage. Clears every selected mip level and layer (or 3D
 	// slice) with an empty loadAction=Clear render pass. Non-renderable (block-compressed) formats are zero-filled
-	// from a scratch buffer instead and `value` is ignored.
+	// from a scratch buffer instead and `value` is ignored. base_slice/slice_count select array layers (cube faces), or
+	// depth slices of 3D images (clamped to the slices of each level).
 	struct image_clear_value
 	{
 		color4f color{ 0.f, 0.f, 0.f, 0.f };
@@ -140,7 +141,8 @@ namespace mtl
 		u8 stencil = 0;
 	};
 
-	void clear_image(mtl::command_list& cmd, mtl::image* image, const image_clear_value& value, u32 base_level = 0, u32 level_count = ~0u);
+	void clear_image(mtl::command_list& cmd, mtl::image* image, const image_clear_value& value, u32 base_level = 0, u32 level_count = ~0u,
+		u32 base_slice = 0, u32 slice_count = ~0u);
 
 	// ---- Scratch resources (port of vkutils/scratch.{h,cpp}; implemented in MTLTexture.cpp) ------------------------
 	// Double-buffered, growable device_local (private) scratch buffer. New/grown buffers are zero-filled on `cmd`.

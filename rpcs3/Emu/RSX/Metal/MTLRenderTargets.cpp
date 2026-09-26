@@ -15,6 +15,13 @@ namespace mtl
 	atomic_t<u32> g_feedback_loop_pass_splits{ 0 };
 	u64 g_feedback_draw_key = 0;
 
+	u64 new_surface_content_tag()
+	{
+		// Surfaces can be created off the RSX thread (e.g. during flushes); keep values unique regardless
+		static atomic_t<u64> s_content_tag{ 0 };
+		return ++s_content_tag;
+	}
+
 	// ---------------------------------------------------------------------------------------------------------------
 	// Memory accounting
 	// ---------------------------------------------------------------------------------------------------------------
@@ -294,6 +301,7 @@ namespace mtl
 		}
 
 		sink->on_clone_from(ref);
+		sink->on_contents_changed();
 
 		if (!sink->old_contents.empty())
 		{
@@ -730,6 +738,7 @@ namespace mtl
 		ensure(!(msaa_flags & rsx::surface_state_flags::require_resolve));
 
 		mtl::unresolve_image(cmd, this, resolve_surface.get());
+		on_contents_changed();
 
 		msaa_flags &= ~(rsx::surface_state_flags::require_unresolve);
 	}
@@ -749,6 +758,7 @@ namespace mtl
 		}
 
 		mtl::clear_image(cmd, surface, clear, 0, 1);
+		on_contents_changed();
 
 		if (surface == this)
 		{
@@ -898,6 +908,7 @@ namespace mtl
 		const auto pdev = mtl::get_current_renderer();
 		create_impl(*pdev, info);
 		account_memory(VMM_ALLOCATION_POOL_SURFACE_CACHE);
+		on_contents_changed();
 
 		// Load image from host-visible buffer
 		ensure(m_spilled_mem);
@@ -943,6 +954,7 @@ namespace mtl
 		const auto range = get_memory_range();
 		rsx::flags32_t upload_flags = upload_contents_inline;
 		u32 heap_align = rsx_pitch;
+		on_contents_changed();
 
 #if DEBUG_DMA_TILING
 		std::vector<u8> ext_data;
@@ -1334,6 +1346,10 @@ namespace mtl
 			initialize_memory(cmd, access);
 			ensure(state_flags == rsx::surface_state_flags::ready);
 		}
+
+		// The inherited data was written above. on_write_copy() may set last_use_tag to an older value (the newest
+		// source's), so only the content tag tells copies of this surface that its contents changed.
+		on_contents_changed();
 
 		// NOTE: Optimize flag relates to stencil resolve/unresolve for NVIDIA.
 		on_write_copy(newest_tag, optimize_copy);
