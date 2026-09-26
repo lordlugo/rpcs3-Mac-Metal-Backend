@@ -2,7 +2,7 @@
 # Build RPCS3 Metal (native Metal 4 renderer) on macOS 26+ / Apple silicon with Homebrew.
 #
 #   ./build-macos.sh --deps            install/upgrade the Homebrew dependencies, then exit
-#   ./build-macos.sh                   configure + build (RelWithDebInfo) into build-metal/
+#   ./build-macos.sh                   configure + build (RelWithDebInfo: -O3 with debug info) into build-metal/
 #   ./build-macos.sh --release|--debug choose the build type (default: RelWithDebInfo)
 #   ./build-macos.sh --clean           delete build-metal/ first (full rebuild)
 #   ./build-macos.sh --configure-only  init submodules and configure, but do not build (used by CI)
@@ -11,7 +11,7 @@
 #
 # Environment:
 #   RPCS3_WITH_OPENCV=1   also install/use Homebrew OpenCV (optional camera features)
-#   RPCS3_NATIVE_INSTRUCTIONS=OFF  portable binary (-march=armv8.4-a) instead of -march=native (CI artifacts)
+#   RPCS3_NATIVE_INSTRUCTIONS=OFF  portable binary (-march=armv8.4-a) instead of -mcpu=native (CI artifacts)
 #   BUILD_DIR=<dir>       build directory (default: build-metal)
 #   JOBS=<n>              parallel jobs for ninja (default: ninja's choice)
 
@@ -168,8 +168,12 @@ if [[ "${RPCS3_WITH_OPENCV:-0}" == "1" ]]; then
     USE_OPENCV=ON
 fi
 
-# -march=native by default (local builds); CI sets RPCS3_NATIVE_INSTRUCTIONS=OFF so artifacts run on every Apple silicon Mac
+# -mcpu=native by default (local builds); CI sets RPCS3_NATIVE_INSTRUCTIONS=OFF so artifacts run on every Apple silicon Mac
 USE_NATIVE="${RPCS3_NATIVE_INSTRUCTIONS:-ON}"
+
+# RelWithDebInfo (the default) is the build people play with: optimize like Release (-O3; CMake's RelWithDebInfo default
+# is -O2) and keep the debug info for crash reports
+RELWITHDEBINFO_FLAGS="-O3 -g -DNDEBUG"
 
 # ThinLTO (rpcs3_emu) re-optimizes the whole emulator in the final link step (10+ minutes, no output while it runs)
 RPCS3_USE_LTO="${RPCS3_USE_LTO:-ON}"
@@ -207,6 +211,8 @@ echo "    Qt6: $QT6_CMAKE_DIR, LLVM: $LLVM_CMAKE_DIR"
 
 cmake -S "$ROOT" -B "$BUILD_DIR" -G Ninja \
     -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+    -DCMAKE_C_FLAGS_RELWITHDEBINFO="$RELWITHDEBINFO_FLAGS" \
+    -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="$RELWITHDEBINFO_FLAGS" \
     -DCMAKE_C_COMPILER="$CC" \
     -DCMAKE_CXX_COMPILER="$CXX" \
     -DCMAKE_OSX_SYSROOT="$SDK_PATH" \

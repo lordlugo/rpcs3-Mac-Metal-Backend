@@ -25,11 +25,19 @@ else()
 		check_cxx_compiler_flag("-march=armv8.1-a" COMPILER_ARM)
 	endif()
 
+	# On AArch64, clang's -march=native only selects the host's architecture version and leaves the CPU at the
+	# target default (apple-m1 on macOS), while -mcpu=native also enables and tunes for the host CPU (e.g. apple-m2+)
+	if(APPLE AND CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
+		check_cxx_compiler_flag("-mcpu=native" COMPILER_SUPPORTS_MCPU_NATIVE)
+	endif()
+
 	add_compile_options(-Wall)
 	add_compile_options(-fno-exceptions)
 	add_compile_options(-fstack-protector)
 
-	if(USE_NATIVE_INSTRUCTIONS AND COMPILER_SUPPORTS_MARCH_NATIVE)
+	if(USE_NATIVE_INSTRUCTIONS AND COMPILER_SUPPORTS_MCPU_NATIVE)
+		add_compile_options(-mcpu=native)
+	elseif(USE_NATIVE_INSTRUCTIONS AND COMPILER_SUPPORTS_MARCH_NATIVE)
 		add_compile_options(-march=native)
 	elseif(COMPILER_ARM)
 		# This section needs a review. Apple claims armv8.5-a on M-series but doesn't support SVE.
