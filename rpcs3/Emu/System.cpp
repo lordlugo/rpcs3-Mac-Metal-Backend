@@ -286,6 +286,32 @@ void init_fxo_for_exec(utils::serial* ar, bool full = false)
 	}
 }
 
+// RPCS3 Metal fork: recommended settings for titles that are unplayable without them, used like the config database
+// (applied when the title has no custom config, overriding the global config only for these keys). Taken from the
+// official config database entries, without Vulkan-only settings and without Shader Precision: Low.
+static std::string get_builtin_title_config(std::string_view title_id, std::string_view title)
+{
+	// Grand Theft Auto IV (disc, PSN, Complete Edition). Approximate SPU floats break collision: the car falls through
+	// the world into the water in the prologue. The official entry also turns MSAA off for it.
+	static constexpr std::string_view gta4_serials[] = { "BLES00229", "BLUS30127", "NPEB00882", "BLES01128", "BLUS30682" };
+
+	if (std::ranges::contains(gta4_serials, title_id) || title.starts_with("Grand Theft Auto IV"))
+	{
+		return
+			"Core:\n"
+			"  SPU XFloat Accuracy: Accurate\n"
+			"  Sleep Timers Accuracy: As Host\n"
+			"Video:\n"
+			"  MSAA: Disabled\n"
+			"  Multithreaded RSX: true\n"
+			"  Write Color Buffers: true\n"
+			"  Accurate ZCULL stats: false\n"
+			"  Relaxed ZCULL Sync: true\n";
+	}
+
+	return {};
+}
+
 // Some settings are not allowed with certain conditions
 static void fixup_settings(const psf::registry* _psf)
 {
@@ -1799,6 +1825,17 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 					// Get database config if possible. This only happens if the database config hasn't been set by the UI (e.g. if booted with no-gui).
 					// We only know the title_id for sure at this point, so it doesn't make sense to retrieve it earlier.
 					m_db_config = g_emu_callbacks.get_database_config(m_title_id);
+				}
+
+				// RPCS3 Metal fork: the config database (Help > Download Config Database) is only downloaded on request.
+				// Titles that cannot be played without some settings get them from a small built-in table instead.
+				if (!m_db_config || m_db_config->empty())
+				{
+					if (std::string builtin = get_builtin_title_config(m_title_id, m_title); !builtin.empty())
+					{
+						sys_log.notice("Using the built-in recommended settings for %s as its database config", m_title_id);
+						m_db_config = std::move(builtin);
+					}
 				}
 
 				// We add the database configuration if it is set, unless we are using a mode that specifically selects a different configuration.

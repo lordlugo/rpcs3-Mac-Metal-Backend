@@ -134,6 +134,14 @@ settings.
 | Multithreaded RSX | On | The worker thread sleeps when idle (upstream keeps it spinning on a core forever) and only takes large copies and GPU command submission, so it no longer costs a performance core |
 | Audio renderer | Core Audio (Spatial Audio) | Native output, see [Audio](#audio). Cubeb is still available |
 
+Some games need specific settings to be playable. RPCS3 keeps them in its config database, which this build only
+downloads when asked (Help > Download Config Database). A few titles get them built in, applied like the database:
+only when the game has no custom configuration, and only for the listed settings.
+
+| Game | Built-in settings | Fixes |
+|---|---|---|
+| Grand Theft Auto IV (BLES00229, BLUS30127, NPEB00882, Complete Edition) | SPU XFloat Accuracy: Accurate, MSAA: Disabled, Write Color Buffers: On, Relaxed ZCULL Sync: On, Accurate ZCULL stats: Off, Sleep Timers Accuracy: As Host | Falling through the world in the prologue (missing collision), doubled or flickering image, missing reflections |
+
 ## Audio
 
 The Core Audio renderer (Settings > Audio > Renderer, default on macOS) outputs exactly what the emulated system
