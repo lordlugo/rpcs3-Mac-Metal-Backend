@@ -295,6 +295,8 @@ static std::string get_builtin_title_config(std::string_view title_id, std::stri
 {
 	// Grand Theft Auto IV (disc, PSN, Complete Edition). Approximate SPU floats break collision: the car falls through
 	// the world into the water in the prologue. The official entry also turns MSAA off for it.
+	// Its frames take 26-40 ms with the SPUs saturated, and its audio arrives late accordingly: a 100 ms audio buffer
+	// covers that without gaps (the default 34 ms does not).
 	static constexpr std::string_view gta4_serials[] = { "BLES00229", "BLUS30127", "NPEB00882", "BLES01128", "BLUS30682" };
 
 	if (std::ranges::contains(gta4_serials, title_id) || title.starts_with("Grand Theft Auto IV"))
@@ -306,7 +308,9 @@ static std::string get_builtin_title_config(std::string_view title_id, std::stri
 			"Video:\n"
 			"  MSAA: Disabled\n"
 			"  Multithreaded RSX: true\n"
-			"  Write Color Buffers: true\n";
+			"  Write Color Buffers: true\n"
+			"Audio:\n"
+			"  Desired Audio Buffer Duration: 100\n";
 	}
 
 	return {};
