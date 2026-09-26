@@ -13,6 +13,7 @@
 namespace mtl
 {
 	atomic_t<u32> g_feedback_loop_pass_splits{ 0 };
+	u64 g_feedback_draw_key = 0;
 
 	// ---------------------------------------------------------------------------------------------------------------
 	// Memory accounting
@@ -1089,12 +1090,13 @@ namespace mtl
 
 		// Apple GPUs cannot wait on attachment writes inside a render pass. Split the pass instead: the next encoder
 		// begins with a barrier on all previously encoded work (see mtl::command_list). Writes of passes that already
-		// ended are in memory, so only writes by the open pass (marked by the renderer) need the split.
-		if (cmd.is_render_pass_open() && written_in_pass == cmd.open_pass_serial())
+		// ended are in memory, so only writes by the open pass (marked by the renderer) need the split, unless they
+		// come from the feedback streak the current draw belongs to.
+		if (cmd.is_render_pass_open() && !feedback_read_in_pass_allowed(cmd.open_pass_serial(), g_feedback_draw_key))
 		{
 			cmd.end_render_pass();
 			g_feedback_loop_pass_splits++;
-			count_feedback_split();
+			count_feedback_split(pass_split_reason::read_after_write);
 		}
 
 		m_cyclic_ref_tracker.on_insert_texture_barrier();
@@ -1117,12 +1119,14 @@ namespace mtl
 			return;
 		}
 
-		// Reads by previous draws of this pass must complete before the next attachment write: split the pass.
-		if (cmd.is_render_pass_open())
+		// Reads by previous draws of this pass must complete before the next attachment write. On a tile-based GPU they
+		// do: the write reaches memory when the tile is stored, after every earlier draw of that tile has been shaded.
+		// Strict Rendering Mode keeps the explicit split.
+		if (cmd.is_render_pass_open() && g_cfg.video.strict_rendering_mode)
 		{
 			cmd.end_render_pass();
 			g_feedback_loop_pass_splits++;
-			count_feedback_split();
+			count_feedback_split(pass_split_reason::write_after_read);
 		}
 
 		m_cyclic_ref_tracker.reset();

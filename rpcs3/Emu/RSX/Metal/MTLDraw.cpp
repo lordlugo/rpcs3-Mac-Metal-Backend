@@ -419,17 +419,17 @@ void MTLGSRender::close_render_pass()
 void MTLGSRender::invalidate_render_pass()
 {
 	// Vulkan regenerates the render pass here (feedback loop layouts). Metal cannot make attachment writes visible to
-	// texture reads inside a pass, so the pass is ended; the next draw reopens it behind a full queue barrier.
-	split_render_pass();
+	// texture reads inside a pass, so the pass is ended; the next draw reopens it behind a queue barrier.
+	split_render_pass(mtl::pass_split_reason::read_after_write);
 }
 
-void MTLGSRender::split_render_pass()
+void MTLGSRender::split_render_pass(mtl::pass_split_reason reason)
 {
 	if (is_render_pass_open())
 	{
 		close_render_pass();
 		mtl::g_feedback_loop_pass_splits++;
-		mtl::count_feedback_split();
+		mtl::count_feedback_split(reason);
 	}
 }
 
@@ -633,6 +633,11 @@ void MTLGSRender::update_draw_state()
 
 void MTLGSRender::load_texture_env()
 {
+	// Material key of this draw: texture barriers of the texture cache compare it with the feedback streak of the
+	// sampled attachment (MTLRenderTargets.h)
+	m_feedback_draw_key = get_feedback_draw_key();
+	mtl::g_feedback_draw_key = m_feedback_draw_key;
+
 	// Load textures
 	bool check_for_cyclic_refs = false;
 	auto check_surface_cache_sampler_valid = [&](auto descriptor, const auto& tex)
@@ -1013,6 +1018,12 @@ void MTLGSRender::load_texture_env()
 
 	m_samplers_dirty.store(false);
 
+	// Render passes let their vertex work overlap the fragment work of earlier passes (mtl::command_list). Any vertex
+	// texture (a render target, a blit or copy result, even the placeholder image, can be written by fragment work)
+	// needs the pass of this draw ordered after that work: emit_geometry() requests it right before opening the pass.
+	// Vertex texture fetch is rare on the RSX.
+	m_draw_reads_images_in_vertex_stage = current_vp_metadata.referenced_textures_mask != 0;
+
 	bool depth_feedback = false;
 	if (current_fragment_program.ctrl & RSX_SHADER_CONTROL_EMULATE_DEPTH_COMPARE)
 	{
@@ -1025,15 +1036,28 @@ void MTLGSRender::load_texture_env()
 	}
 
 	// Feedback loop: end the render pass (counted as a pass split) only when a sampled attachment holds writes of the
-	// open pass. Chains of reads of a surface that the pass does not write (soft particles, fog and distortion sampling
-	// the depth or colour buffer) used to split on every draw, storing and reloading every attachment each time.
-	if (is_render_pass_open() && (depth_feedback || (check_for_cyclic_refs && feedback_read_needs_split())))
+	// open pass that do not come from the feedback streak this draw belongs to. Reads of a surface that the pass does
+	// not write (soft particles, fog sampling depth) and runs of draws of one material that sample and write the same
+	// surface (water, refraction, distortion) used to split on every draw, storing and reloading every attachment.
+	if (is_render_pass_open())
 	{
-		invalidate_render_pass();
+		if (depth_feedback)
+		{
+			split_render_pass(mtl::pass_split_reason::depth_compare);
+		}
+		else if (check_for_cyclic_refs)
+		{
+			if (const auto reason = feedback_read_needs_split(); reason != mtl::pass_split_reason::count)
+			{
+				split_render_pass(reason);
+			}
+		}
 	}
+
+	mtl::g_feedback_draw_key = 0;
 }
 
-void MTLGSRender::mark_attachment_writes(const std::array<bool, 4>& color, bool depth_stencil)
+void MTLGSRender::mark_attachment_writes(const std::array<bool, 4>& color, bool depth_stencil, bool from_draw)
 {
 	if (!is_render_pass_open())
 	{
@@ -1042,23 +1066,134 @@ void MTLGSRender::mark_attachment_writes(const std::array<bool, 4>& color, bool 
 
 	const u64 pass = m_current_command_buffer->open_pass_serial();
 
+	auto mark = [&](mtl::render_target* surface)
+	{
+		surface->written_in_pass = pass;
+
+		if (!from_draw)
+		{
+			// Clears are not part of a feedback streak (draws update theirs in update_feedback_streaks())
+			surface->feedback_streak_pass = 0;
+		}
+	};
+
 	for (const auto& index : m_rtts.m_bound_render_target_ids)
 	{
 		if (auto surface = m_rtts.m_bound_render_targets[index].second; surface && color[index])
 		{
-			surface->written_in_pass = pass;
+			mark(surface);
 		}
 	}
 
 	if (auto surface = m_rtts.m_bound_depth_stencil.second; surface && depth_stencil)
 	{
-		surface->written_in_pass = pass;
+		mark(surface);
 	}
 }
 
-bool MTLGSRender::is_written_in_open_pass(const mtl::image* image) const
+void MTLGSRender::update_feedback_streaks(const std::array<bool, 4>& color, bool depth_stencil)
 {
-	if (!image || !is_render_pass_open())
+	// Called after a draw was recorded, before its writes are marked. A draw that samples and writes an attachment
+	// starts a streak when the attachment had no writes in this pass yet (the read saw current memory), and continues
+	// the streak of its material otherwise (its read was allowed by feedback_read_in_pass_allowed()). Every other
+	// write ends the streak, so a later read by another draw splits the pass and sees all writes.
+	if (!is_render_pass_open())
+	{
+		return;
+	}
+
+	const u64 pass = m_current_command_buffer->open_pass_serial();
+
+	// Feedback reads of this draw (write-after-read tracking, see colour_write_after_read()). The readers keep a key only
+	// while they all are draws of one streak that also write the surface.
+	auto note_read = [&](mtl::render_target* surface, bool written)
+	{
+		if (!draw_samples_attachment(surface))
+		{
+			return;
+		}
+
+		const u64 reader_key = written ? m_feedback_draw_key : 0;
+		if (surface->read_in_pass != pass)
+		{
+			surface->read_in_pass = pass;
+			surface->read_in_pass_key = reader_key;
+		}
+		else if (surface->read_in_pass_key != reader_key)
+		{
+			surface->read_in_pass_key = 0;
+		}
+	};
+
+	for (const auto& index : m_rtts.m_bound_render_target_ids)
+	{
+		if (auto surface = m_rtts.m_bound_render_targets[index].second)
+		{
+			note_read(surface, color[index]);
+		}
+	}
+
+	if (auto surface = m_rtts.m_bound_depth_stencil.second)
+	{
+		note_read(surface, depth_stencil);
+	}
+
+	auto update = [&](mtl::render_target* surface)
+	{
+		if (!draw_samples_attachment(surface))
+		{
+			surface->feedback_streak_pass = 0;
+		}
+		else if (surface->written_in_pass != pass)
+		{
+			surface->feedback_streak_pass = pass;
+			surface->feedback_streak_key = m_feedback_draw_key;
+		}
+		else if (surface->feedback_streak_pass != pass || surface->feedback_streak_key != m_feedback_draw_key)
+		{
+			surface->feedback_streak_pass = 0;
+		}
+	};
+
+	for (const auto& index : m_rtts.m_bound_render_target_ids)
+	{
+		if (auto surface = m_rtts.m_bound_render_targets[index].second; surface && color[index])
+		{
+			update(surface);
+		}
+	}
+
+	if (auto surface = m_rtts.m_bound_depth_stencil.second; surface && depth_stencil)
+	{
+		update(surface);
+	}
+}
+
+std::array<bool, 4> MTLGSRender::get_live_color_writes() const
+{
+	// The layout's color_write_enabled only ever gains bits between layout rebuilds; the live masks say what this
+	// draw writes
+	std::array<bool, 4> result{};
+	const auto mrt_buffers = rsx::utility::get_rtt_indexes(m_framebuffer_layout.target);
+
+	for (u32 i = 0; i < mrt_buffers.size(); ++i)
+	{
+		if (rsx::method_registers.color_write_enabled(i))
+		{
+			result[mrt_buffers[i]] = true;
+		}
+	}
+
+	return result;
+}
+
+bool MTLGSRender::colour_write_after_read(const std::array<bool, 4>& color, bool writer_samples_as_streak) const
+{
+	// A colour write after feedback reads of the same surface in the open pass. Offset reads (refraction, distortion)
+	// could reach an already stored tile holding this write, so the pass must be split (see MTLRenderTargets.h),
+	// unless every reader and this writer are draws of one feedback streak. Depth reads are same-pixel reads and need
+	// nothing. Strict Rendering Mode splits through post_texture_barrier() instead.
+	if (!is_render_pass_open() || g_cfg.video.strict_rendering_mode)
 	{
 		return false;
 	}
@@ -1067,26 +1202,97 @@ bool MTLGSRender::is_written_in_open_pass(const mtl::image* image) const
 
 	for (const auto& index : m_rtts.m_bound_render_target_ids)
 	{
+		const auto surface = m_rtts.m_bound_render_targets[index].second;
+		if (!surface || !color[index] || surface->read_in_pass != pass)
+		{
+			continue;
+		}
+
+		if (!writer_samples_as_streak || !draw_samples_attachment(surface) || surface->read_in_pass_key != m_feedback_draw_key)
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool MTLGSRender::draw_samples_attachment(const mtl::render_target* surface) const
+{
+	// The current draw samples this bound surface directly (not through a copy)
+	auto check = [surface](const auto& states, u32 mask)
+	{
+		for (u32 i = 0; mask; mask >>= 1, ++i)
+		{
+			if (!(mask & 1) || !states[i])
+			{
+				continue;
+			}
+
+			const auto desc = static_cast<const mtl::texture_cache::sampled_image_descriptor*>(states[i].get());
+			if (desc->is_cyclic_reference && desc->image_handle &&
+				desc->image_handle->image() == static_cast<const mtl::image*>(surface))
+			{
+				return true;
+			}
+		}
+
+		return false;
+	};
+
+	return check(fs_sampler_state, current_fp_metadata.referenced_textures_mask) ||
+		check(vs_sampler_state, current_vp_metadata.referenced_textures_mask);
+}
+
+mtl::render_target* MTLGSRender::find_bound_attachment(const mtl::image* image) const
+{
+	if (!image)
+	{
+		return nullptr;
+	}
+
+	for (const auto& index : m_rtts.m_bound_render_target_ids)
+	{
 		if (const auto surface = m_rtts.m_bound_render_targets[index].second;
 			surface && static_cast<const mtl::image*>(surface) == image)
 		{
-			return surface->written_in_pass == pass;
+			return surface;
 		}
 	}
 
 	if (const auto surface = m_rtts.m_bound_depth_stencil.second;
 		surface && static_cast<const mtl::image*>(surface) == image)
 	{
-		return surface->written_in_pass == pass;
+		return surface;
+	}
+
+	return nullptr;
+}
+
+bool MTLGSRender::is_written_in_open_pass(const mtl::image* image) const
+{
+	if (!is_render_pass_open())
+	{
+		return false;
 	}
 
 	// Not an attachment of the open pass: its memory is current
-	return false;
+	const auto surface = find_bound_attachment(image);
+	return surface && surface->written_in_pass == m_current_command_buffer->open_pass_serial();
 }
 
-bool MTLGSRender::feedback_read_needs_split() const
+mtl::pass_split_reason MTLGSRender::feedback_read_needs_split() const
 {
-	auto check = [this](const auto& states, u32 mask)
+	if (!is_render_pass_open())
+	{
+		return mtl::pass_split_reason::count;
+	}
+
+	const u64 pass = m_current_command_buffer->open_pass_serial();
+	bool read_in_pass = false;
+	bool through_copy = false;
+
+	auto check = [&](const auto& states, u32 mask)
 	{
 		for (u32 i = 0; mask; mask >>= 1, ++i)
 		{
@@ -1103,21 +1309,73 @@ bool MTLGSRender::feedback_read_needs_split() const
 
 			if (!desc->image_handle)
 			{
-				// Composed or copied from the surface when bound: keep the conservative split
+				// Composed or copied from the surface when bound: keep the conservative split (the copy is recorded
+				// outside the pass anyway)
+				through_copy = true;
 				return true;
 			}
 
-			if (is_written_in_open_pass(desc->image_handle->image()))
+			const auto surface = find_bound_attachment(desc->image_handle->image());
+			if (!surface)
+			{
+				continue;
+			}
+
+			if (!surface->feedback_read_in_pass_allowed(pass, m_feedback_draw_key))
 			{
 				return true;
 			}
+
+			read_in_pass |= (surface->written_in_pass == pass);
 		}
 
 		return false;
 	};
 
-	return check(fs_sampler_state, current_fp_metadata.referenced_textures_mask) ||
-		check(vs_sampler_state, current_vp_metadata.referenced_textures_mask);
+	if (check(fs_sampler_state, current_fp_metadata.referenced_textures_mask) ||
+		check(vs_sampler_state, current_vp_metadata.referenced_textures_mask))
+	{
+		return through_copy ? mtl::pass_split_reason::read_through_copy : mtl::pass_split_reason::read_after_write;
+	}
+
+	if (read_in_pass)
+	{
+		mtl::count_feedback_read_in_pass();
+	}
+
+	return mtl::pass_split_reason::count;
+}
+
+u64 MTLGSRender::get_feedback_draw_key() const
+{
+	// Same material: same fragment and vertex program instructions (embedded constants excluded, they are patched per
+	// object; hashes updated in end() when the RSX reloads a program), shader control, textures, blending, viewport
+	// and scissor. A texture cache invalidation or wait-for-idle changes the key.
+	const auto& regs = rsx::method_registers;
+	u64 key = 0;
+	auto mix = [&key](u64 value)
+	{
+		key ^= value + 0x9e3779b97f4a7c15ull + (key << 6) + (key >> 2);
+	};
+
+	mix(m_fp_ucode_hash);
+	mix(m_vp_ucode_hash);
+	mix(regs.shader_control());
+
+	for (u32 textures_ref = current_fp_metadata.referenced_textures_mask, i = 0; textures_ref; textures_ref >>= 1, ++i)
+	{
+		if (textures_ref & 1)
+		{
+			mix(u64{regs.fragment_textures[i].offset()} << 8 | regs.fragment_textures[i].location());
+		}
+	}
+
+	mix(u64{regs.blend_enabled_mask()} | u64{static_cast<u32>(regs.blend_func_sfactor_rgb())} << 8 |
+		u64{static_cast<u32>(regs.blend_func_dfactor_rgb())} << 24 | u64{static_cast<u32>(regs.blend_equation_rgb())} << 40);
+	mix(u64{regs.viewport_origin_x()} | u64{regs.viewport_origin_y()} << 16 | u64{regs.viewport_width()} << 32 | u64{regs.viewport_height()} << 48);
+	mix(u64{regs.scissor_origin_x()} | u64{regs.scissor_origin_y()} << 16 | u64{regs.scissor_width()} << 32 | u64{regs.scissor_height()} << 48);
+	mix(texture_cache_sync_serial);
+	return key | 1; // Never 0 (0 means "no draw")
 }
 
 bool MTLGSRender::bind_texture_env()
@@ -1396,6 +1654,14 @@ void MTLGSRender::emit_geometry(u32 sub_index)
 
 	bool reload_state = (!m_current_draw.subdraw_id++);
 
+	// Vertex textures: the pass must order vertex work after earlier fragment work (see load_texture_env). Requested
+	// here so that nothing (copies, helper passes, a flush) can open a pass in between.
+	if (m_draw_reads_images_in_vertex_stage && m_current_command_buffer->require_vertex_after_fragment())
+	{
+		mtl::g_feedback_loop_pass_splits++;
+		mtl::count_feedback_split(mtl::pass_split_reason::vertex_read);
+	}
+
 	// (Re)open the main pass. It may have been ended by a copy/compute operation, a pass of another component, a
 	// feedback-loop split or a submit.
 	if (!is_render_pass_open())
@@ -1562,7 +1828,22 @@ void MTLGSRender::end()
 		m_current_frame->flags &= ~frame_context_state::dirty;
 	}
 
+	// Programs reloaded by the RSX for this draw (analyse_current_rsx_pipeline() consumes the flags)
+	const bool fp_ucode_reloaded = m_graphics_state.test(rsx::pipeline_state::fragment_program_ucode_dirty);
+	const bool vp_ucode_reloaded = m_graphics_state.test(rsx::pipeline_state::vertex_program_ucode_dirty);
+
 	analyse_current_rsx_pipeline();
+
+	if (fp_ucode_reloaded || !m_fp_ucode_hash)
+	{
+		m_fp_ucode_hash = current_fragment_program.get_data() ?
+			program_hash_util::fragment_program_utils::get_fragment_program_ucode_hash(current_fragment_program) | 1 : 0;
+	}
+
+	if (vp_ucode_reloaded || !m_vp_ucode_hash)
+	{
+		m_vp_ucode_hash = program_hash_util::vertex_program_utils::get_vertex_program_ucode_hash(current_vertex_program) | 1;
+	}
 
 	m_frame_stats.setup_time += m_profiler.duration();
 
@@ -1583,6 +1864,13 @@ void MTLGSRender::end()
 	load_program_env();
 	m_frame_stats.setup_time += m_profiler.duration();
 
+	// Write-after-read on colour attachments (see colour_write_after_read())
+	const auto live_color_writes = get_live_color_writes();
+	if (colour_write_after_read(live_color_writes, true))
+	{
+		split_render_pass(mtl::pass_split_reason::write_after_read);
+	}
+
 	// Apply write memory barriers
 	if (auto ds = std::get<1>(m_rtts.m_bound_depth_stencil))
 	{
@@ -1590,10 +1878,16 @@ void MTLGSRender::end()
 
 		if (m_graphics_state.test(rsx::zeta_address_cyclic_barrier))
 		{
-			// We actually need to end the pass as a minimum. Without this, early-Z optimiazations in following draws
-			// will clobber reads from previous draws and cause flickering.
+			// Vulkan ends the pass here: on an immediate-mode GPU, early depth writes of the following draws can reach
+			// memory before the depth reads of the previous draws. On a tile-based GPU depth writes stay in tile memory
+			// until the tile is stored, after every earlier draw of the tile, so no split is needed (Strict Rendering
+			// Mode keeps it).
 			ds->reset_surface_counters();
-			invalidate_render_pass();
+
+			if (g_cfg.video.strict_rendering_mode)
+			{
+				split_render_pass(mtl::pass_split_reason::write_after_read);
+			}
 		}
 	}
 
@@ -1672,7 +1966,8 @@ void MTLGSRender::end()
 	const bool depth_stencil_written = m_framebuffer_layout.zeta_write_enabled ||
 		(regs.depth_test_enabled() && regs.depth_write_enabled()) ||
 		(regs.stencil_test_enabled() && regs.stencil_mask() != 0);
-	mark_attachment_writes(m_framebuffer_layout.color_write_enabled, depth_stencil_written);
+	update_feedback_streaks(live_color_writes, depth_stencil_written);
+	mark_attachment_writes(live_color_writes, depth_stencil_written, true);
 
 	rsx::thread::end();
 }
@@ -1962,7 +2257,13 @@ void MTLGSRender::clear_surface(u32 mask)
 		return;
 	}
 
-	// Scissored / masked clear: draw a quad inside the main pass
+	// Scissored / masked clear: draw a quad inside the main pass. A colour clear after feedback reads of the target in
+	// the open pass is a write-after-read like a draw's (see colour_write_after_read())
+	if (inpass.color_write_mask && colour_write_after_read({ true, true, true, true }, false))
+	{
+		split_render_pass(mtl::pass_split_reason::write_after_read);
+	}
+
 	begin_render_pass();
 	auto encoder = ensure(get_render_encoder());
 

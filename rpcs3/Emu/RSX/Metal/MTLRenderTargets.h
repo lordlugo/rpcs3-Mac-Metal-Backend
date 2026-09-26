@@ -11,6 +11,17 @@
 //    was written by that pass (written_in_pass, marked by the renderer after draws and clears), and counts the split
 //    in mtl::g_feedback_loop_pass_splits. Writes of passes that already ended are in memory and need no split.
 //    Same-pixel feedback can use framebuffer fetch instead (renderer's call).
+//  - Feedback streaks: a run of draws of the same material (same programs, textures, blending, viewport and scissor,
+//    no texture cache invalidation or wait-for-idle in between) that each sample and write the same attachment (water
+//    surfaces, refraction, distortion particles) no longer ends the pass before every draw. Each draw of the run reads
+//    the attachment without the writes of the other draws of the run (except where a read crosses into a tile that
+//    was already stored, the same race a single feedback draw has with its own writes). The RSX gives no ordering for
+//    such reads without a sync command either. Any other write, a clear, another material or a sync ends the run.
+//  - Write-after-read inside a pass: depth reads of effects are same-pixel reads, which a tile-based GPU orders before
+//    the writes of later draws (a tile is stored after all its draws are shaded), so they need no split. Colour
+//    reads are often offset (refraction, distortion) and could reach an already stored tile: a colour write by a draw
+//    that does not sample the surface, after reads in the open pass, still splits the pass. Strict Rendering Mode
+//    keeps the exact ordering: a split for every read of a surface written in the open pass and every such write.
 //  - Destructive cloning for spills moves the MTLTexture into a disposable drawable_surface_t (GC-deferred release).
 
 #include "util/types.hpp"
@@ -53,6 +64,10 @@ namespace mtl
 	// Number of render passes that had to be split to resolve texture feedback loops (Apple GPUs cannot barrier
 	// inside a pass). The renderer resets/reads this once per frame for logging and the debug overlay.
 	extern atomic_t<u32> g_feedback_loop_pass_splits;
+
+	// Material key of the draw whose texture reads are being prepared (0 outside of that): see feedback streaks above.
+	// Set by the renderer around load_texture_env(); texture barriers of the texture cache compare it.
+	extern u64 g_feedback_draw_key;
 
 	namespace surface_cache_utils
 	{
@@ -180,6 +195,18 @@ namespace mtl
 		u64 spill_request_tag = 0;      // timestamp when spilling was requested
 		bool is_bound = false;          // set when the surface is bound for rendering
 		u64 written_in_pass = 0;        // command_list::open_pass_serial() of the pass whose draws/clears last wrote it
+		u64 feedback_streak_pass = 0;   // pass in which only a feedback streak wrote it so far (0: none)
+		u64 feedback_streak_key = 0;    // material key of that streak
+		u64 read_in_pass = 0;           // pass in which draws sampled it while it was bound (feedback reads)
+		u64 read_in_pass_key = 0;       // material key of those readers if they all were one streak writing it, else 0
+
+		// A read by the current draw may use the memory contents (no pass split): not written by the open pass, or
+		// written only by earlier draws of the same feedback streak
+		bool feedback_read_in_pass_allowed(u64 open_pass, u64 draw_key) const
+		{
+			return written_in_pass != open_pass ||
+				(draw_key && feedback_streak_pass == open_pass && feedback_streak_key == draw_key && !g_cfg.video.strict_rendering_mode);
+		}
 
 		using drawable_surface_t::drawable_surface_t;
 

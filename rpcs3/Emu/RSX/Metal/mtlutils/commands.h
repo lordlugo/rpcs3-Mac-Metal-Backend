@@ -17,6 +17,17 @@ namespace mtl
 		table_count = 3
 	};
 
+	// Why a render pass had to be ended early (telemetry)
+	enum class pass_split_reason : u32
+	{
+		read_after_write = 0, // a draw samples an attachment written by the open pass
+		write_after_read,     // strict mode only: a write follows reads of the same attachment
+		depth_compare,        // depth compare emulated by sampling the bound depth buffer after it was written
+		vertex_read,          // a vertex program samples an image written by earlier fragment work
+		read_through_copy,    // a draw samples a converted/copied view of a bound surface (made outside the pass)
+		count
+	};
+
 	// Telemetry for the renderer's periodic log line: GPU time of committed work (union of the start-end intervals
 	// reported by Metal 4 commit feedback, so overlapping work is not counted twice) and render passes begun.
 	struct gpu_stats_t
@@ -24,10 +35,13 @@ namespace mtl
 		u64 busy_ns = 0;
 		u64 render_passes = 0;
 		u64 feedback_splits = 0;
+		std::array<u64, static_cast<u32>(pass_split_reason::count)> splits_by_reason{};
+		u64 feedback_reads_in_pass = 0; // feedback reads served without a split (see render_target feedback streaks)
 	};
 
 	gpu_stats_t get_gpu_stats_and_reset();
-	void count_feedback_split();
+	void count_feedback_split(pass_split_reason reason = pass_split_reason::read_after_write);
+	void count_feedback_read_in_pass();
 
 	struct submit_info_t
 	{
@@ -42,8 +56,12 @@ namespace mtl
 	// Metal 4 command recording unit (equivalent of vk::command_buffer + command pool).
 	//
 	// Hazard model (Metal 4 resources are untracked):
-	//  - Every new encoder starts with a consumer barrier on ALL previously committed/encoded work of the queue
-	//    (barrierAfterQueueStages(all, <encoder stages>)). Passes are therefore serialized like a tracked queue.
+	//  - Every new compute encoder starts with a consumer barrier on ALL previously committed/encoded work of the queue
+	//    (barrierAfterQueueStages(all, <encoder stages>)).
+	//  - A render pass orders its fragment work (shading, attachment loads) after all earlier work, and its vertex
+	//    work after all earlier work except fragment work: binning of the next pass overlaps the shading of the
+	//    previous one, which matters with many short passes (feedback loops). Vertex programs reading images written
+	//    by fragment work (render targets as vertex textures) call require_vertex_after_fragment() for the full barrier.
 	//  - Every command recorded through compute() after the first one in the same compute encoder is preceded by an
 	//    intra-encoder barrier (dispatch|blit -> dispatch|blit), because MTL4 compute encoders run commands concurrently.
 	//  - Inside a render pass nothing can be waited on (Apple GPUs do not support fragment->fragment barriers inside a
@@ -91,6 +109,8 @@ namespace mtl
 		MTL4::ComputeCommandEncoder* m_compute_encoder = nullptr; // Not owned
 		u32 m_compute_commands_since_barrier = 0;
 		bool m_pending_full_barrier = true;
+		bool m_next_pass_orders_vertex = false;  // the next render pass also orders its vertex work after fragment work
+		bool m_pass_orders_vertex = false;       // the open render pass was begun that way
 
 		std::array<MTL4::ArgumentTable*, table_count> m_argument_tables{};
 
@@ -133,6 +153,10 @@ namespace mtl
 		u64 open_pass_serial() const { return m_render_encoder ? m_pass_serial : 0; }
 		MTL4::RenderCommandEncoder* render_encoder() const { return m_render_encoder; }
 		void end_render_pass();
+
+		// The current draw reads, in its vertex stage, an image written by earlier fragment work. Ends the open pass if
+		// it was begun without ordering vertex work after fragment work (returns true then); the next pass is.
+		bool require_vertex_after_fragment();
 
 		// Returns an open compute/blit encoder (ending a render pass if needed) and inserts the intra-encoder
 		// barrier required before the next command. Call once per recorded command.

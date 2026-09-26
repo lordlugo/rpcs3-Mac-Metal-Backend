@@ -145,4 +145,6 @@ namespace mtl
 	// "After" scope for queue barriers: everything that may have been encoded before, including work encoded by
 	// frameworks (MetalFX may use machine-learning / resource-state stages).
 	constexpr MTL::Stages stages_all_producers = stages_all_work | MTL::StageMachineLearning | MTL::StageResourceState;
+	// Fragment shading and attachment load/store of render passes
+	constexpr MTL::Stages stages_fragment_work = MTL::StageFragment | MTL::StageTile;
 }

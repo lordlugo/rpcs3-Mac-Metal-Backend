@@ -251,6 +251,10 @@ private:
 	bool m_depth_bounds_warning_logged = false;
 	bool m_logic_op_warning_logged = false;
 	bool m_flat_shading_warning_logged = false;
+	u64 m_feedback_draw_key = 0; // Material key of the current draw (feedback streaks, see MTLRenderTargets.h)
+	u64 m_fp_ucode_hash = 0;     // Instruction hashes (embedded constants excluded) of the current programs,
+	u64 m_vp_ucode_hash = 0;     // updated when the RSX reloads them
+	bool m_draw_reads_images_in_vertex_stage = false; // Current draw: its pass must order vertex after fragment work
 
 public:
 	u64 get_cycles() final;
@@ -284,14 +288,21 @@ private:
 	void begin_render_pass(const mtl::attachment_clear_info* clear = nullptr);
 	void close_render_pass();
 	void invalidate_render_pass();
-	void split_render_pass();
+	void split_render_pass(mtl::pass_split_reason reason);
 	bool is_render_pass_open() const;
 
 	// Feedback loops (a draw samples a bound attachment). Tile-based GPUs write attachments to memory when the pass
-	// ends, so a read only needs a pass split when the sampled surface was written by the pass that is still open.
-	void mark_attachment_writes(const std::array<bool, 4>& color, bool depth_stencil);
+	// ends, so a read only needs a pass split when the sampled surface was written by the pass that is still open,
+	// and not only by earlier draws of the feedback streak the current draw belongs to.
+	void mark_attachment_writes(const std::array<bool, 4>& color, bool depth_stencil, bool from_draw = false);
+	void update_feedback_streaks(const std::array<bool, 4>& color, bool depth_stencil);
+	bool draw_samples_attachment(const mtl::render_target* surface) const;
+	std::array<bool, 4> get_live_color_writes() const;
+	bool colour_write_after_read(const std::array<bool, 4>& color, bool writer_samples_as_streak) const;
+	mtl::render_target* find_bound_attachment(const mtl::image* image) const;
 	bool is_written_in_open_pass(const mtl::image* image) const;
-	bool feedback_read_needs_split() const;
+	mtl::pass_split_reason feedback_read_needs_split() const; // count: no split needed
+	u64 get_feedback_draw_key() const;
 	MTL4::RenderCommandEncoder* get_render_encoder() const;
 	void on_render_pass_begin(MTL4::RenderCommandEncoder* encoder);
 

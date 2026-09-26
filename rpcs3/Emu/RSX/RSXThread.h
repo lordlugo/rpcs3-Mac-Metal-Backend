@@ -230,6 +230,10 @@ namespace rsx
 
 		// I hate this flag, but until hle is closer to lle, its needed
 		bool isHLE{ false };
+
+		// Incremented by texture cache invalidation (NV4097_INVALIDATE_L2) and NV4097_WAIT_FOR_IDLE: the game asks
+		// for recent RSX writes to be visible to texture reads. Backends that relax feedback-loop ordering use it.
+		u64 texture_cache_sync_serial = 0;
 		bool serialized = false;
 
 		u32 flip_status = CELL_GCM_DISPLAY_FLIP_STATUS_DONE;

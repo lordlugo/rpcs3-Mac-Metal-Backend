@@ -61,13 +61,26 @@ Every component is a port of its `rpcs3/Emu/RSX/VK/` counterpart. Keep the same 
 ## 3. Synchronization model (Metal 4: all resources untracked)
 
 `mtl::command_list` (mtlutils/commands.h) implements a conservative, always-correct model:
-* Every new encoder (render pass or compute) begins with `barrierAfterQueueStages(all work -> this encoder's stages)`.
+* Every new compute encoder begins with `barrierAfterQueueStages(all work -> this encoder's stages)`.
+* A render pass begins with two barriers: all work except fragment work -> vertex|fragment|tile, and fragment|tile ->
+  fragment|tile. Its vertex work (binning) can overlap the shading of the previous pass; a vertex program that samples
+  an image possibly written by fragment work (render target, blit or copy result) calls
+  `command_list::require_vertex_after_fragment()`, which ends the pass if needed so that the next one uses the full
+  barrier.
 * Every command recorded via `cmd.compute()` gets an intra-encoder barrier before it (MTL4 compute commands run
   concurrently otherwise). Use `cmd.compute_unordered()` only for a command that is independent of the previous one
   (e.g. the dispatch right after `program::bind`).
 * Inside a render pass nothing can wait: Apple GPUs do not support fragment->fragment barriers in a pass. To sample a
   surface that is bound as an attachment either (a) use framebuffer fetch (`[[color(n)]]`, same pixel only) or
-  (b) end the pass, which the next encoder's barrier then orders.
+  (b) end the pass, which the next encoder's barrier then orders. The pass only ends when the sampled surface was
+  written by the open pass (`render_target::written_in_pass`) and not only by earlier draws of the current draw's
+  feedback streak (same program instructions, shader control, fragment textures, blending, viewport and scissor, no
+  texture cache invalidation or wait-for-idle in between; `render_target::feedback_read_in_pass_allowed`): a draw of
+  the run reads the surface without the writes of the other draws of the run, except for reads that cross into a tile
+  already stored (the same race a single feedback draw has with its own writes). Write-after-read: depth needs no
+  split (same-pixel reads are ordered before later writes of the tile); a colour write by a draw that does not sample
+  the surface, after reads in the open pass (`render_target::read_in_pass`), splits. Strict Rendering Mode restores a
+  split for every read-after-write and write-after-read.
 * CPU/GPU sync: `mtl::timeline` (MTLSharedEvent). `command_list::submit()` commits and signals the next timeline
   value; `poke()`/`wait()` poll/wait. The renderer's `command_buffer_chunk` calls `mtl::on_event_completed(eid_tag)`.
 * Shared (unified memory) buffers written by the CPU before `submit()` are visible to that submission. GPU writes are

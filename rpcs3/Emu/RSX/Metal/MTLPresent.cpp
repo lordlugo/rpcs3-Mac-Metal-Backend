@@ -385,8 +385,17 @@ void MTLGSRender::present_drawable(mtl::frame_context_t* ctx)
 		if (frames && window_ms > 0.)
 		{
 			const f64 busy_ms = gpu.busy_ns / 1'000'000.;
-			rsx_log.notice("Metal: GPU busy %.2f ms per frame (%.0f%% of the time), %.1f render passes and %.1f feedback splits per frame",
-				busy_ms / frames, 100. * busy_ms / window_ms, static_cast<f64>(gpu.render_passes) / frames, static_cast<f64>(gpu.feedback_splits) / frames);
+			const auto per_frame = [frames](u64 count) { return static_cast<f64>(count) / frames; };
+			const auto& reasons = gpu.splits_by_reason;
+			rsx_log.notice("Metal: GPU busy %.2f ms per frame (%.0f%% of the time), %.1f render passes and %.1f feedback splits per frame "
+				"(read after write %.1f, through a copy %.1f, write after read %.1f, depth compare %.1f, vertex read %.1f; %.1f feedback reads kept in the pass)",
+				busy_ms / frames, 100. * busy_ms / window_ms, per_frame(gpu.render_passes), per_frame(gpu.feedback_splits),
+				per_frame(reasons[static_cast<u32>(mtl::pass_split_reason::read_after_write)]),
+				per_frame(reasons[static_cast<u32>(mtl::pass_split_reason::read_through_copy)]),
+				per_frame(reasons[static_cast<u32>(mtl::pass_split_reason::write_after_read)]),
+				per_frame(reasons[static_cast<u32>(mtl::pass_split_reason::depth_compare)]),
+				per_frame(reasons[static_cast<u32>(mtl::pass_split_reason::vertex_read)]),
+				per_frame(gpu.feedback_reads_in_pass));
 		}
 
 		pacing.stats_time = now_us;

@@ -67,6 +67,8 @@ namespace rsx
 
 		void set_shader_program_dirty(context* ctx, u32, u32);
 
+		void invalidate_texture_cache(context* ctx, u32, u32);
+
 		void set_surface_dirty_bit(context* ctx, u32 reg, u32 arg);
 
 		void set_surface_format(context* ctx, u32 reg, u32 arg);

@@ -1704,7 +1704,7 @@ namespace rsx
 		bind(NV4097_SET_BACK_STENCIL_OP_FAIL, nv4097::set_stencil_op);
 		bind(NV4097_SET_BACK_STENCIL_OP_ZFAIL, nv4097::set_stencil_op);
 		bind(NV4097_WAIT_FOR_IDLE, nv4097::sync);
-		bind(NV4097_INVALIDATE_L2, nv4097::set_shader_program_dirty);
+		bind(NV4097_INVALIDATE_L2, nv4097::invalidate_texture_cache);
 		bind(NV4097_SET_SHADER_PROGRAM, nv4097::set_shader_program_dirty);
 		bind(NV4097_SET_SHADE_MODE, nv4097::set_shading_mode);
 

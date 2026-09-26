@@ -21,6 +21,13 @@ namespace rsx
 			RSX(ctx)->m_graphics_state |= rsx::pipeline_state::fragment_program_ucode_dirty;
 		}
 
+		void invalidate_texture_cache(context* ctx, u32 reg, u32 arg)
+		{
+			// Fragment programs are fetched through the texture cache: invalidating it can mean new program ucode
+			RSX(ctx)->texture_cache_sync_serial++;
+			set_shader_program_dirty(ctx, reg, arg);
+		}
+
 		void set_transform_constant::decode_one([[maybe_unused]] context* ctx, u32 reg, u32 arg)
 		{
 			const u32 index = reg - NV4097_SET_TRANSFORM_CONSTANT;
@@ -799,6 +806,7 @@ namespace rsx
 
 		void sync(context* ctx, u32, u32)
 		{
+			RSX(ctx)->texture_cache_sync_serial++;
 			RSX(ctx)->sync();
 		}
 	}

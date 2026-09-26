@@ -176,11 +176,20 @@ game's shaders once.
 ends; every extra pass stores and reloads the whole frame, which at high resolution scales is most of the GPU's work.
 The renderer now ends a pass for a feedback read (an effect sampling the depth or colour buffer being drawn) only when
 the sampled buffer was written in that pass, instead of on every such draw. Particles, fog, heat haze and deferred
-lights used to split the pass on each draw and pegged the GPU. At the output, the letterbox bars are cleared by the
+lights used to split the pass on each draw and pegged the GPU. Water, refraction and distortion are usually drawn as a
+run of draws of one material (same shaders, textures, blending, viewport) that each sample and write the colour or
+depth buffer. Such a run no longer ends the pass before every piece: each piece reads the buffer without the other
+pieces of the run. The PS3 does not order these reads either unless the game invalidates its texture cache or waits
+for idle, and either one ends the run, as do a clear, another material or a plain write. Depth writes after depth
+reads (soft particles, fog) no longer split the pass: those reads are per pixel, which a tile-based GPU already orders
+before later writes. Colour writes after colour reads still split it once. The next pass's geometry is now processed
+while the previous pass is still being shaded. Strict Rendering Mode keeps the exact ordering, one pass split per such
+read or write, if a game ever shows a difference. At the output, the letterbox bars are cleared by the
 final draw itself, and the automatic 16x anisotropic filtering applies to the game's textures only, not to screen-space
 buffers. Every 30 s the log gets a line
-`Metal: GPU busy ... ms per frame (...% of the time), ... render passes and ... feedback splits per frame`; if the GPU
-time per frame rises in the same scene after a while, the Mac is getting hot and lowering its GPU clock.
+`Metal: GPU busy ... ms per frame (...% of the time), ... render passes and ... feedback splits per frame (...)` with
+the reasons for the splits and the feedback reads that stayed in the pass; if the GPU time per frame rises in the same
+scene after a while, the Mac is getting hot and lowering its GPU clock.
 
 **Shader compilation.** There is no shader interpreter on Metal yet, so a draw whose shaders are still compiling is
 skipped (missing geometry for a moment the first time an effect appears). The renderer now waits up to 8 ms per frame

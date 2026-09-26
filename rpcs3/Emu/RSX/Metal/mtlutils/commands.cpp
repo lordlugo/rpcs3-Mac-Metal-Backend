@@ -14,6 +14,8 @@ namespace mtl
 			u64 busy_ns = 0;
 			atomic_t<u64> render_passes = 0;
 			atomic_t<u64> feedback_splits = 0;
+			std::array<atomic_t<u64>, static_cast<u32>(pass_split_reason::count)> splits_by_reason{};
+			atomic_t<u64> feedback_reads_in_pass = 0;
 			atomic_t<u32> errors_logged = 0;
 		};
 
@@ -70,12 +72,24 @@ namespace mtl
 		}
 		stats.render_passes = state.render_passes.exchange(0);
 		stats.feedback_splits = state.feedback_splits.exchange(0);
+		for (u32 i = 0; i < stats.splits_by_reason.size(); i++)
+		{
+			stats.splits_by_reason[i] = state.splits_by_reason[i].exchange(0);
+		}
+		stats.feedback_reads_in_pass = state.feedback_reads_in_pass.exchange(0);
 		return stats;
 	}
 
-	void count_feedback_split()
+	void count_feedback_split(pass_split_reason reason)
 	{
-		gpu_stats().feedback_splits++;
+		auto& state = gpu_stats();
+		state.feedback_splits++;
+		state.splits_by_reason[static_cast<u32>(reason)]++;
+	}
+
+	void count_feedback_read_in_pass()
+	{
+		gpu_stats().feedback_reads_in_pass++;
 	}
 
 	command_list::~command_list()
@@ -171,6 +185,8 @@ namespace mtl
 
 		m_is_open = true;
 		m_pending_full_barrier = true;
+		m_next_pass_orders_vertex = false;
+		m_pass_orders_vertex = false;
 		m_compute_commands_since_barrier = 0;
 	}
 
@@ -248,8 +264,42 @@ namespace mtl
 		m_pass_serial = ++g_pass_serial;
 		gpu_stats().render_passes++;
 
-		open_encoder_barrier(m_render_encoder, stages_render);
+		if (m_next_pass_orders_vertex)
+		{
+			open_encoder_barrier(m_render_encoder, stages_render);
+			m_pass_orders_vertex = true;
+		}
+		else
+		{
+			// Fragment work (shading, attachment loads) waits for everything before it, including the attachment stores
+			// and texture reads of earlier passes. Vertex work only waits for non-fragment work (uploads, copies,
+			// compute), so the GPU can bin this pass while the previous one is still being shaded.
+			m_render_encoder->barrierAfterQueueStages(stages_all_producers & ~stages_fragment_work, stages_render, MTL4::VisibilityOptionDevice);
+			m_render_encoder->barrierAfterQueueStages(stages_fragment_work, stages_fragment_work, MTL4::VisibilityOptionDevice);
+			m_pending_full_barrier = false;
+			m_pass_orders_vertex = false;
+		}
+
+		m_next_pass_orders_vertex = false;
 		return m_render_encoder;
+	}
+
+	bool command_list::require_vertex_after_fragment()
+	{
+		if (m_render_encoder)
+		{
+			if (m_pass_orders_vertex)
+			{
+				return false;
+			}
+
+			end_render_pass();
+			m_next_pass_orders_vertex = true;
+			return true;
+		}
+
+		m_next_pass_orders_vertex = true;
+		return false;
 	}
 
 	void command_list::end_render_pass()
