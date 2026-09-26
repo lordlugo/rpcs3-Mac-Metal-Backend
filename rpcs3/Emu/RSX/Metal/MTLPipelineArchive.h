@@ -42,6 +42,8 @@ namespace mtl
 
 	// Build a pipeline state. Owned (+1) result, or nullptr with `error` set (autoreleased) on failure. Thread-safe.
 	// Uses the archive when enabled, otherwise the device compiler without task options.
-	MTL::RenderPipelineState* new_render_pipeline_state(const MTL4::RenderPipelineDescriptor* descriptor, NS::Error** error);
-	MTL::ComputePipelineState* new_compute_pipeline_state(const MTL4::ComputePipelineDescriptor* descriptor, NS::Error** error);
+	// `key` identifies the pipeline across sessions: a hash of everything the descriptor is derived from (0 = unknown).
+	// The archive uses it to recognize a preload that recorded exactly the pipelines its newest file already holds.
+	MTL::RenderPipelineState* new_render_pipeline_state(const MTL4::RenderPipelineDescriptor* descriptor, NS::Error** error, u64 key = 0);
+	MTL::ComputePipelineState* new_compute_pipeline_state(const MTL4::ComputePipelineDescriptor* descriptor, NS::Error** error, u64 key = 0);
 }
