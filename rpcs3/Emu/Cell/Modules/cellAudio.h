@@ -10,6 +10,8 @@
 #include "Emu/Audio/audio_resampler.h"
 #include "Emu/system_config_types.h"
 
+#include <atomic>
+
 struct lv2_event_queue;
 struct lv2_memory;
 class ppu_thread;
@@ -253,6 +255,7 @@ struct cell_audio_config
 	u32 audio_block_period = 0;
 	u32 audio_sample_size = 0;
 	f64 audio_min_buffer_duration = 0.0;
+	u64 backend_buffer_duration = 0; // usecs, one backend callback (the output device's buffer)
 
 	u32 audio_buffer_length = 0;
 
@@ -314,6 +317,10 @@ private:
 
 	const u32 buf_sz;
 
+	// Output format of the ring buffer (what backend_write_callback hands out)
+	const u32 cb_channels;
+	const u32 cb_sample_size;
+
 	AudioDumper m_dump{};
 
 	std::unique_ptr<float[]> buffer[MAX_AUDIO_BUFFERS]{};
@@ -334,6 +341,21 @@ private:
 
 	u32 cur_pos = 0;
 
+	// Underruns of the output, handled in backend_write_callback. The cb_ state belongs to the backend's callback
+	// thread; the cellAudio thread only resets it in flush(), after Pause() returned (no callback runs until Play()).
+	static constexpr u32 cb_fade_frames = 128; // 2.7 ms at 48 kHz
+	u64 cb_capacity = 0;                       // Bytes the ring buffer can hold
+	bool cb_refilling = true;                  // Silent after an underrun until enough is queued again
+	bool cb_counting = false;                  // Underruns count once playback got going, not while priming after start or flush
+	f32 cb_fade_in_level = 0.0f;               // Gain of the last frame output while fading in after silence
+	f32 cb_pad_level = 0.0f;                   // Level of cb_last_frame in the last padded frame
+	std::array<u8, sizeof(f32) * AUDIO_MAX_CHANNELS> cb_last_frame{};
+
+	// Diagnostics, see take_xrun_stats(). Written by the backend's real-time callback: relaxed atomics only.
+	std::atomic<u64> cb_underruns{0};
+	std::atomic<u64> cb_padded_frames{0};
+	u64 m_dropped_frames = 0; // cellAudio thread only
+
 	bool get_backend_playing() const
 	{
 		return backend->IsPlaying();
@@ -344,6 +366,16 @@ private:
 	void backend_state_callback(AudioStateEvent event);
 
 public:
+	struct xrun_stats
+	{
+		u64 underruns = 0;      // The output ran dry while playing
+		u64 padded_frames = 0;  // Frames of silence it got because of that
+		u64 dropped_frames = 0; // Frames that did not fit into the full ring buffer
+	};
+
+	// Counters since the last call (cellAudio thread)
+	xrun_stats take_xrun_stats();
+
 	audio_ringbuffer(cell_audio_config &cfg);
 	~audio_ringbuffer();
 
@@ -404,6 +436,24 @@ private:
 
 	void update_config(bool backend_changed);
 	void reset_counters();
+	void report_stats(u64 timestamp);
+
+	// Stutter diagnostics that tell a late game apart from a late cellAudio thread and from output underruns.
+	// report_stats() logs them at most every 30 seconds, only when something happened. This thread only.
+	struct period_stats
+	{
+		u64 late_waited = 0;    // The game was later than the skip timeouts and the queued audio covered the wait
+		u64 skipped = 0;        // The game was too late: time advanced without its audio
+		u64 silent = 0;         // Ports started but untouched as expected: silence enqueued
+		u64 thread_late = 0;    // This thread ran more than two periods after its previous loop iteration
+		u64 max_thread_gap = 0; // usecs
+		audio_ringbuffer::xrun_stats output{};
+	};
+
+	period_stats m_stats{};
+	u64 m_stats_time = 0;       // Start of the current report window
+	u64 m_last_loop_time = 0;   // Previous loop iteration, 0 when the next gap must not be measured
+	bool m_period_late = false; // The game is later than the skip timeouts for the current period
 
 public:
 	shared_mutex emu_cfg_upd_m{};

@@ -19,11 +19,203 @@
 
 #include <cmath>
 
+#ifdef __APPLE__
+#include <AudioToolbox/AudioWorkInterval.h>
+#include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <mach/thread_policy.h>
+#include <os/object.h>
+#include <pthread.h>
+#endif
+
 LOG_CHANNEL(cellAudio);
 
 extern atomic_t<recording_mode> g_recording_mode;
 
 extern void lv2_sleep(u64 timeout, ppu_thread* ppu = nullptr);
+
+namespace
+{
+	// Scheduling of the cellAudio thread, for its whole run. begin_period()/end_period() bracket the work of one audio
+	// period (mixing, enqueueing, advancing), see period_work.
+	class audio_thread_scheduling
+	{
+	public:
+		explicit audio_thread_scheduling(u64 period_us);
+		~audio_thread_scheduling();
+
+		audio_thread_scheduling(const audio_thread_scheduling&) = delete;
+		audio_thread_scheduling& operator=(const audio_thread_scheduling&) = delete;
+
+		void begin_period();
+		void end_period();
+
+	private:
+#ifdef __APPLE__
+		u64 m_period_ticks = 0; // mach_absolute_time() units
+		bool m_realtime = false;
+		os_workgroup_interval_t m_workgroup = nullptr;
+		os_workgroup_join_token_s m_join_token{};
+		bool m_joined = false;
+		bool m_in_period = false;
+#else
+		thread_ctrl::scoped_priority m_priority{+1};
+#endif
+	};
+
+	struct period_work
+	{
+		audio_thread_scheduling& sched;
+
+		explicit period_work(audio_thread_scheduling& s) : sched(s)
+		{
+			sched.begin_period();
+		}
+
+		~period_work()
+		{
+			sched.end_period();
+		}
+
+		period_work(const period_work&) = delete;
+		period_work& operator=(const period_work&) = delete;
+	};
+
+#ifdef __APPLE__
+	// macOS: real-time scheduling in an audio workgroup of its own.
+	//
+	// Every emulation thread runs at QOS_CLASS_USER_INTERACTIVE (thread_base::start()), and scoped_priority(+1) maps
+	// to that same class. With the SPU, PPU and RSX threads saturating the CPU, this thread therefore waits for a core
+	// like any of them and wakes up a scheduler quantum late, which is two of its ~5.3 ms periods: the period gets
+	// skipped or the output underruns. Apple's scheme for audio threads an app creates itself:
+	//  - The Mach time constraint policy (<mach/thread_policy.h>): scheduled ahead of every QoS class. This thread
+	//    mostly sleeps, so it takes a core promptly without starving anything. The kernel forces the computation to
+	//    at least constraint/2 and ignores `preemptible`.
+	//  - "Only real-time threads can join an audio workgroup" (Understanding Audio Workgroups,
+	//    https://developer.apple.com/documentation/audiotoolbox/understanding-audio-workgroups).
+	//  - A thread that runs asynchronously to the device's I/O thread must not join the device's workgroup
+	//    (kAudioOutputUnitProperty_OSWorkgroup): it creates its own work interval with AudioWorkIntervalCreate(), joins
+	//    it, and marks each work cycle with os_workgroup_interval_start()/finish() (Adding Asynchronous Real-Time Threads
+	//    to Audio Workgroups, https://developer.apple.com/documentation/audiotoolbox/adding-asynchronous-real-time-threads-to-audio-workgroups,
+	//    and <AudioToolbox/AudioWorkInterval.h>). This thread is asynchronous: it runs on its own 256 sample cadence
+	//    and feeds the output through a ring buffer. Owning the interval also means that no device change or close
+	//    can cancel it underneath this thread.
+	// Priority inversion: g_audio.mutex is also taken by PPU threads at their normal class. This thread sleeps while it
+	// waits for it (after a spin of microseconds), so it cannot starve the holder; it waits no longer than before.
+	// Budget: the work of a period is a small fraction of the computation allowed. Longer work (reopening the output
+	// device) just lets other real-time threads preempt it; the kernel's fail-safe only demotes real-time threads that
+	// compute for long stretches without blocking, and this one blocks at least once per period.
+	audio_thread_scheduling::audio_thread_scheduling(u64 period_us)
+	{
+		mach_timebase_info_data_t timebase{};
+		mach_timebase_info(&timebase);
+
+		if (!timebase.numer || !timebase.denom)
+		{
+			return;
+		}
+
+		m_period_ticks = period_us * 1000 * timebase.denom / timebase.numer;
+
+		thread_time_constraint_policy_data_t policy{};
+		policy.period = static_cast<u32>(m_period_ticks);
+		policy.computation = static_cast<u32>(m_period_ticks / 2);
+		policy.constraint = static_cast<u32>(m_period_ticks);
+		policy.preemptible = TRUE;
+
+		const mach_port_t thread = pthread_mach_thread_np(pthread_self());
+
+		if (const kern_return_t err = thread_policy_set(thread, THREAD_TIME_CONSTRAINT_POLICY, reinterpret_cast<thread_policy_t>(&policy), THREAD_TIME_CONSTRAINT_POLICY_COUNT); err != KERN_SUCCESS)
+		{
+			cellAudio.warning("Could not give the cellAudio thread real-time priority (error %d)", err);
+			return;
+		}
+
+		m_realtime = true;
+		m_workgroup = AudioWorkIntervalCreate("cellAudio", OS_CLOCK_MACH_ABSOLUTE_TIME, nullptr);
+
+		if (!m_workgroup)
+		{
+			cellAudio.warning("Could not create an audio workgroup for the cellAudio thread; it runs real-time without one");
+			return;
+		}
+
+		// EALREADY: the thread is in a workgroup this one cannot nest in, EINVAL: cancelled
+		if (const int err = os_workgroup_join(m_workgroup, &m_join_token))
+		{
+			cellAudio.warning("Could not join the cellAudio thread to its audio workgroup (error %d); it runs real-time without one", err);
+			os_release(m_workgroup);
+			m_workgroup = nullptr;
+			return;
+		}
+
+		m_joined = true;
+		cellAudio.notice("cellAudio thread: real-time, %u us period, in its own audio workgroup", period_us);
+	}
+
+	audio_thread_scheduling::~audio_thread_scheduling()
+	{
+		end_period();
+
+		// Must happen on this thread, before it exits
+		if (m_joined)
+		{
+			os_workgroup_leave(m_workgroup, &m_join_token);
+		}
+
+		if (m_workgroup)
+		{
+			os_release(m_workgroup);
+		}
+
+		if (m_realtime)
+		{
+			thread_standard_policy_data_t policy{};
+			thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_STANDARD_POLICY, reinterpret_cast<thread_policy_t>(&policy), THREAD_STANDARD_POLICY_COUNT);
+		}
+	}
+
+	void audio_thread_scheduling::begin_period()
+	{
+		end_period();
+
+		if (m_joined)
+		{
+			// Real-time safe. The deadline is the end of the period; an error (e.g. a malformed timestamp) only means
+			// that this period is not reported.
+			const u64 now = mach_absolute_time();
+			m_in_period = os_workgroup_interval_start(m_workgroup, now, now + m_period_ticks, nullptr) == 0;
+		}
+	}
+
+	void audio_thread_scheduling::end_period()
+	{
+		if (m_in_period)
+		{
+			m_in_period = false;
+
+			// Real-time safe. An error only means that this period is not reported.
+			static_cast<void>(os_workgroup_interval_finish(m_workgroup, nullptr));
+		}
+	}
+#else
+	audio_thread_scheduling::audio_thread_scheduling(u64 /*period_us*/)
+	{
+	}
+
+	audio_thread_scheduling::~audio_thread_scheduling()
+	{
+	}
+
+	void audio_thread_scheduling::begin_period()
+	{
+	}
+
+	void audio_thread_scheduling::end_period()
+	{
+	}
+#endif
+}
 
 template <>
 void fmt_class_string<CellAudioError>::format(std::string& out, u64 arg)
@@ -97,6 +289,7 @@ void cell_audio_config::reset(bool backend_changed)
 	audio_block_period = AUDIO_BUFFER_SAMPLES * 1'000'000 / audio_sampling_rate;
 	audio_sample_size = static_cast<u32>(sample_size);
 	audio_min_buffer_duration = cb_frame_len + u32{AUDIO_BUFFER_SAMPLES} * 2.0 / audio_sampling_rate; // Add 2 blocks to allow jitter compensation
+	backend_buffer_duration = static_cast<u64>(cb_frame_len * 1'000'000);
 
 	audio_buffer_length = AUDIO_BUFFER_SAMPLES * audio_channels;
 
@@ -133,6 +326,8 @@ audio_ringbuffer::audio_ringbuffer(cell_audio_config& _cfg)
 	: backend(_cfg.backend)
 	, cfg(_cfg)
 	, buf_sz(AUDIO_BUFFER_SAMPLES * _cfg.audio_channels)
+	, cb_channels(_cfg.backend_ch_cnt)
+	, cb_sample_size(_cfg.audio_sample_size)
 {
 	// Initialize buffers
 	if (cfg.num_allocated_buffers > MAX_AUDIO_BUFFERS)
@@ -166,6 +361,7 @@ audio_ringbuffer::audio_ringbuffer(cell_audio_config& _cfg)
 	}();
 
 	cb_ringbuf.set_buf_size(static_cast<u32>(cfg.backend_ch_cnt * cfg.audio_sampling_rate * cfg.audio_sample_size * buffer_dur_mult));
+	cb_capacity = cb_ringbuf.get_total_size();
 	backend->SetWriteCallback(std::bind(&audio_ringbuffer::backend_write_callback, this, std::placeholders::_1, std::placeholders::_2));
 	backend->SetStateCallback(std::bind(&audio_ringbuffer::backend_state_callback, this, std::placeholders::_1));
 }
@@ -203,7 +399,101 @@ u32 audio_ringbuffer::backend_write_callback(u32 size, void *buf)
 {
 	if (!backend_active.observe()) backend_active = true;
 
-	return static_cast<u32>(cb_ringbuf.pop(buf, size, true));
+	// Runs on the backend's real-time thread: no allocation, no blocking, no logging.
+	// The buffer is always filled completely, so the backend never pads it itself (it would hold the last sample).
+	u8* const out = static_cast<u8*>(buf);
+	const u32 frame_bytes = cb_channels * cb_sample_size;
+
+	if (!frame_bytes)
+	{
+		std::memset(out, 0, size);
+		return size;
+	}
+
+	const u32 frames_req = size / frame_bytes;
+	const u64 bytes_req = u64{frames_req} * frame_bytes;
+	const f32 fade_step = 1.0f / cb_fade_frames;
+	u32 frames = 0;
+
+	if (cb_refilling)
+	{
+		// Hysteresis: after an underrun, stay silent until this request plus two cellAudio periods are queued again.
+		// Resuming with whatever trickled in runs dry again within the same device cycle and chops the output into
+		// fragments for as long as the game runs slow. Capped at half the ring buffer: always reachable, and the
+		// producer cannot overflow it in the meantime.
+		const u64 period_bytes = u64{AUDIO_BUFFER_SAMPLES} * frame_bytes;
+		const u64 resume_level = std::min({bytes_req + period_bytes * 2, std::max(bytes_req, cb_capacity / 2), cb_capacity});
+
+		if (cb_ringbuf.get_used_size() >= resume_level)
+		{
+			cb_refilling = false;
+			cb_counting = true;
+			cb_fade_in_level = 0.0f;
+		}
+	}
+
+	if (!cb_refilling)
+	{
+		frames = static_cast<u32>(cb_ringbuf.pop(out, bytes_req, true) / frame_bytes);
+
+		if (frames)
+		{
+			// Fade in after silence instead of jumping to the signal level
+			if (cb_fade_in_level < 1.0f)
+			{
+				cb_fade_in_level = AudioBackend::apply_gain_ramp(out, std::min(frames, cb_fade_frames), cb_channels, cb_sample_size, cb_fade_in_level, fade_step);
+			}
+
+			if (frames < frames_req && frames >= cb_fade_frames)
+			{
+				// Underrun: fade the tail of what is there to silence
+				AudioBackend::apply_gain_ramp(out + usz{frames - cb_fade_frames} * frame_bytes, cb_fade_frames, cb_channels, cb_sample_size, 1.0f, -fade_step);
+				cb_pad_level = 0.0f;
+			}
+			else
+			{
+				cb_pad_level = 1.0f;
+			}
+
+			std::memcpy(cb_last_frame.data(), out + usz{frames - 1} * frame_bytes, frame_bytes);
+		}
+
+		if (frames < frames_req)
+		{
+			cb_refilling = true;
+
+			if (cb_counting)
+			{
+				cb_underruns.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+	}
+
+	if (frames < frames_req)
+	{
+		// A partial chunk too short to fade on its own (or none at all) continues from the last frame output down to
+		// silence within cb_fade_frames: no step, and no held level that buzzes with every device cycle.
+		cb_pad_level = AudioBackend::fill_decay(out + usz{frames} * frame_bytes, frames_req - frames, cb_last_frame.data(), cb_channels, cb_sample_size, cb_pad_level, fade_step);
+
+		if (cb_counting)
+		{
+			cb_padded_frames.fetch_add(frames_req - frames, std::memory_order_relaxed);
+		}
+	}
+
+	// Incomplete frame at the end (not expected)
+	std::memset(out + bytes_req, 0, size - bytes_req);
+	return size;
+}
+
+audio_ringbuffer::xrun_stats audio_ringbuffer::take_xrun_stats()
+{
+	return
+	{
+		.underruns = cb_underruns.exchange(0, std::memory_order_relaxed),
+		.padded_frames = cb_padded_frames.exchange(0, std::memory_order_relaxed),
+		.dropped_frames = std::exchange(m_dropped_frames, 0),
+	};
 }
 
 void audio_ringbuffer::backend_state_callback(AudioStateEvent event)
@@ -315,7 +605,11 @@ void audio_ringbuffer::commit_data(f32* buf, u32 sample_cnt)
 		AudioBackend::convert_to_s16(sample_cnt_out, buf, buf);
 	}
 
-	cb_ringbuf.push(buf, sample_cnt_out * cfg.audio_sample_size);
+	if (!cb_ringbuf.push(buf, sample_cnt_out * cfg.audio_sample_size))
+	{
+		// No room for the whole chunk (the output stopped pulling, or the producer ran ahead): it is lost
+		m_dropped_frames += sample_cnt;
+	}
 }
 
 void audio_ringbuffer::play()
@@ -337,6 +631,13 @@ void audio_ringbuffer::flush()
 	resampler.flush();
 	backend_active = false;
 	playing = false;
+
+	// No write callback runs until the next Play() (see AudioBackend::Pause()): start over like a new ring buffer.
+	// The queue is gone, and the silence until it is filled again after the pause is no underrun.
+	cb_refilling = true;
+	cb_counting = false;
+	cb_fade_in_level = 0.0f;
+	cb_pad_level = 0.0f;
 
 	if (frequency_ratio != RESAMPLER_MAX_FREQ_VAL)
 	{
@@ -707,6 +1008,7 @@ void cell_audio_thread::advance(u64 timestamp)
 	m_counter++;
 	m_last_period_end = timestamp;
 	m_dynamic_period = 0;
+	m_period_late = false;
 
 	// send aftermix event (normal audio event)
 	std::array<shared_ptr<lv2_event_queue>, MAX_AUDIO_EVENT_QUEUES> queues;
@@ -812,6 +1114,18 @@ void cell_audio_thread::update_config(bool backend_changed)
 {
 	std::lock_guard lock(mutex);
 
+	// Keep the diagnostics of the old ring buffer
+	if (ringbuffer)
+	{
+		const audio_ringbuffer::xrun_stats xruns = ringbuffer->take_xrun_stats();
+		m_stats.output.underruns += xruns.underruns;
+		m_stats.output.padded_frames += xruns.padded_frames;
+		m_stats.output.dropped_frames += xruns.dropped_frames;
+	}
+
+	// Reopening the backend takes a while: not a late loop iteration
+	m_last_loop_time = 0;
+
 	// Clear ringbuffer
 	ringbuffer.reset();
 
@@ -834,6 +1148,45 @@ void cell_audio_thread::reset_counters()
 	m_audio_should_restart = true;
 }
 
+void cell_audio_thread::report_stats(u64 timestamp)
+{
+	if (!m_stats_time)
+	{
+		m_stats_time = timestamp;
+		return;
+	}
+
+	if (timestamp - m_stats_time < 30'000'000)
+	{
+		return;
+	}
+
+	const audio_ringbuffer::xrun_stats xruns = ringbuffer->take_xrun_stats();
+	m_stats.output.underruns += xruns.underruns;
+	m_stats.output.padded_frames += xruns.padded_frames;
+	m_stats.output.dropped_frames += xruns.dropped_frames;
+
+	const u64 elapsed = timestamp - m_stats_time;
+	m_stats_time = timestamp;
+
+	const period_stats& s = m_stats;
+
+	if (s.late_waited || s.skipped || s.silent || s.thread_late || s.output.underruns || s.output.padded_frames || s.output.dropped_frames)
+	{
+		// Late game: late periods covered by the queue, skipped (and silent) periods. Late cellAudio thread: its own
+		// gaps. Output: underruns of the device's queue, audio lost to a full queue.
+		const f64 frames_per_ms = cfg.audio_sampling_rate / 1000.0;
+		const std::string queue = cfg.buffering_enabled ? fmt::format(", average queue %.1f ms (desired %u ms)", m_average_playtime / 1000.0, cfg.desired_buffer_duration / 1000) : std::string{};
+
+		cellAudio.notice("Audio in the last %u s: game late for %u period(s) covered by the queue, %u skipped, %u silent; "
+			"cellAudio thread late %u time(s) (longest gap %.1f ms); output underrun %u time(s) (%.1f ms of silence), %.1f ms dropped (queue full)%s",
+			elapsed / 1'000'000, s.late_waited, s.skipped, s.silent, s.thread_late, s.max_thread_gap / 1000.0, s.output.underruns,
+			s.output.padded_frames / frames_per_ms, s.output.dropped_frames / frames_per_ms, queue);
+	}
+
+	m_stats = {};
+}
+
 cell_audio_thread::cell_audio_thread()
 {
 }
@@ -854,7 +1207,8 @@ void cell_audio_thread::operator()()
 	// Allocate ringbuffer
 	ringbuffer.reset(new audio_ringbuffer(cfg));
 
-	thread_ctrl::scoped_priority high_prio(+1);
+	// Real-time on macOS, scoped_priority(+1) elsewhere
+	audio_thread_scheduling scheduling(cfg.audio_block_period);
 
 	while (Emu.IsPausedOrReady())
 	{
@@ -885,11 +1239,24 @@ void cell_audio_thread::operator()()
 		const bool emu_paused = Emu.IsPaused();
 		const u64 timestamp = ringbuffer->update(emu_paused || m_backend_failed);
 
+		// Diagnostics: this loop never sleeps longer than about one period on its own (1.2 periods at most while
+		// buffering), so two periods between iterations mean that the thread did not get a core in time or was blocked,
+		// as opposed to the game being late (skipped and silent periods below).
+		if (m_last_loop_time && timestamp - m_last_loop_time > u64{cfg.audio_block_period} * 2)
+		{
+			m_stats.thread_late++;
+			m_stats.max_thread_gap = std::max(m_stats.max_thread_gap, timestamp - m_last_loop_time);
+		}
+
+		m_last_loop_time = timestamp;
+		report_stats(timestamp);
+
 		if (emu_paused)
 		{
 			m_audio_should_restart = true;
 			ringbuffer->flush();
 			thread_ctrl::wait_for(10000);
+			m_last_loop_time = 0;
 			continue;
 		}
 
@@ -1048,6 +1415,7 @@ void cell_audio_thread::operator()()
 			{
 				// no need to mix, just enqueue silence and advance time
 				cellAudio.trace("enqueuing silence: no active ports, enqueued_buffers=%llu", enqueued_buffers);
+				const period_work work(scheduling);
 				ringbuffer->enqueue_silence();
 				untouched_expected = 0;
 				advance(timestamp);
@@ -1060,17 +1428,30 @@ void cell_audio_thread::operator()()
 			{
 				// Games may sometimes "skip" audio periods entirely if they're falling behind (a sort of "frameskip" for audio)
 				// As such, if the game doesn't touch buffers for too long we advance time hoping the game recovers
-				if (
-					(untouched == active_ports && time_since_last_period > cfg.fully_untouched_timeout) ||
-					(time_since_last_period > cfg.partially_untouched_timeout) || g_cfg.audio.disable_sampling_skip
-				   )
+				const bool timed_out = (untouched == active_ports && time_since_last_period > cfg.fully_untouched_timeout) ||
+					time_since_last_period > cfg.partially_untouched_timeout;
+
+				// RPCS3 Metal fork: those timeouts (2 periods, 4 when some ports were written) are much shorter than the
+				// audio that is queued with buffering. A game that is merely slow (long frames, saturated SPUs) lost the
+				// period, and left a gap, while the queue could have covered the wait. Keep waiting while the queue holds
+				// more than the device's next pull plus one period, for at most the desired buffer duration. A game that
+				// stopped feeding its ports (menus, loading) still gets its period skipped, and silence enqueued for the
+				// periods after it, before the queue runs dry.
+				const bool queue_covers_wait = enqueued_playtime > cfg.backend_buffer_duration + cfg.audio_block_period &&
+					time_since_last_period < cfg.desired_buffer_duration;
+
+				if ((timed_out && !queue_covers_wait) || g_cfg.audio.disable_sampling_skip)
 				{
 					// There's no audio in the buffers, simply advance time and hope the game recovers
 					cellAudio.trace("advancing time: untouched=%u/%u (expected=%u), enqueued_buffers=%llu", untouched, active_ports, untouched_expected, enqueued_buffers);
+					const period_work work(scheduling);
+					m_stats.skipped++;
 					untouched_expected = untouched;
 					advance(timestamp);
 					continue;
 				}
+
+				m_period_late |= timed_out;
 
 				cellAudio.trace("waiting: untouched=%u/%u (expected=%u), enqueued_buffers=%llu", untouched, active_ports, untouched_expected, enqueued_buffers);
 				thread_ctrl::wait_for(1000);
@@ -1082,6 +1463,8 @@ void cell_audio_thread::operator()()
 			{
 				// There's no audio in the buffers, simply advance time
 				cellAudio.trace("enqueuing silence: untouched=%u/%u (expected=%u), enqueued_buffers=%llu", untouched, active_ports, untouched_expected, enqueued_buffers);
+				const period_work work(scheduling);
+				m_stats.silent++;
 				ringbuffer->enqueue_silence();
 				untouched_expected = untouched;
 				advance(timestamp);
@@ -1106,7 +1489,15 @@ void cell_audio_thread::operator()()
 			{
 				cellAudio.trace("enqueueing: untouched=%u/%u (expected=%u), incomplete=%u/%u enqueued_buffers=%llu", untouched, active_ports, untouched_expected, incomplete, active_ports, enqueued_buffers);
 			}
+
+			if (m_period_late)
+			{
+				// Upstream would have skipped this period
+				m_stats.late_waited++;
+			}
 		}
+
+		const period_work work(scheduling);
 
 		// Mix
 		float* buf = ringbuffer->get_current_buffer();

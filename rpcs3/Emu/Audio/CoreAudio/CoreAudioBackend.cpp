@@ -1072,20 +1072,41 @@ void CoreAudioBackend::read_frames(u8* dst, u32 bytes)
 		u32 written = std::min(m_write_callback(bytes, dst), bytes);
 		written -= written % frame_bytes;
 
+		const u32 sample_size = get_sample_size();
+		const f32 fade_step = 1.0f / UNDERRUN_FADE_FRAMES;
+
 		if (written >= frame_bytes)
 		{
+			// Data again after padding: fade in instead of jumping from silence to the signal level
+			if (m_fade_in_level < 1.0f)
+			{
+				m_fade_in_level = apply_gain_ramp(dst, std::min(written / frame_bytes, UNDERRUN_FADE_FRAMES), m_channels, sample_size, m_fade_in_level, fade_step);
+			}
+
 			std::memcpy(m_last_sample.data(), dst + written - frame_bytes, frame_bytes);
+			m_pad_level = 1.0f;
 		}
 
-		// Underrun: hold the last sample (no click)
-		for (u32 i = written; i + frame_bytes <= bytes; i += frame_bytes)
+		// Underrun (the provider returned less than asked for): continue from the last frame down to silence within
+		// UNDERRUN_FADE_FRAMES. Holding the last sample instead kept a DC level for as long as the provider stayed
+		// short, which buzzes with every device cycle when the game runs slow.
+		if (written < bytes)
 		{
-			std::memcpy(dst + i, m_last_sample.data(), frame_bytes);
+			m_pad_level = fill_decay(dst + written, (bytes - written) / frame_bytes, m_last_sample.data(), m_channels, sample_size, m_pad_level, fade_step);
+			m_fade_in_level = 0.0f;
+
+			// Bytes of an incomplete frame at the end (not expected)
+			const u32 tail = (bytes - written) % frame_bytes;
+			std::memset(dst + bytes - tail, 0, tail);
 		}
 	}
 	else
 	{
 		std::memset(dst, 0, bytes);
+
+		// Silence was output: whatever comes next fades in, and padding must not restart from an older frame
+		m_fade_in_level = 0.0f;
+		m_pad_level = 0.0f;
 	}
 }
 

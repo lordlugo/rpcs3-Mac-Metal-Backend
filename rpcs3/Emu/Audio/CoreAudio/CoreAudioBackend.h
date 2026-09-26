@@ -104,6 +104,12 @@ private:
 	std::vector<f32> m_scratch;                   // Interleaved staging for the mixer input (render thread only)
 	std::array<u8, sizeof(f32) * AUDIO_MAX_CHANNELS> m_last_sample{};
 
+	// Underrun padding (render thread only, see read_frames). cellAudio pads its own underruns and always returns full
+	// buffers; this is for providers that return less (RSXAudio).
+	static constexpr u32 UNDERRUN_FADE_FRAMES = 128; // 2.7 ms at 48 kHz
+	f32 m_pad_level = 0.0f;                       // Level of m_last_sample in the last padded frame
+	f32 m_fade_in_level = 1.0f;                   // Gain of the last frame output while fading in after padding
+
 	atomic_t<bool> m_reset_req = false;           // The device is gone or failed: recreate the backend
 	atomic_t<bool> m_reconfigure_req = false;     // Output route changed (headphones plugged in, speaker setup changed...)
 	std::vector<std::pair<AudioObjectID, AudioObjectPropertyAddress>> m_listeners;

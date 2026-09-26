@@ -133,6 +133,69 @@ void AudioBackend::apply_volume_static(f32 vol, u32 sample_cnt, const f32* src, 
 	}
 }
 
+f32 AudioBackend::apply_gain_ramp(void* frames, u32 frame_cnt, u32 ch_cnt, u32 sample_size, f32 level, f32 step)
+{
+	for (u32 i = 0; i < frame_cnt; i++)
+	{
+		level = std::clamp(level + step, 0.0f, 1.0f);
+
+		if (sample_size == sizeof(s16))
+		{
+			s16* const frame = static_cast<s16*>(frames) + usz{i} * ch_cnt;
+
+			for (u32 ch = 0; ch < ch_cnt; ch++)
+			{
+				frame[ch] = static_cast<s16>(frame[ch] * level);
+			}
+		}
+		else
+		{
+			f32* const frame = static_cast<f32*>(frames) + usz{i} * ch_cnt;
+
+			for (u32 ch = 0; ch < ch_cnt; ch++)
+			{
+				frame[ch] *= level;
+			}
+		}
+	}
+
+	return level;
+}
+
+f32 AudioBackend::fill_decay(void* frames, u32 frame_cnt, const void* last_frame, u32 ch_cnt, u32 sample_size, f32 level, f32 step)
+{
+	u32 i = 0;
+
+	for (; i < frame_cnt && level > 0.0f; i++)
+	{
+		level = std::max(level - step, 0.0f);
+
+		if (sample_size == sizeof(s16))
+		{
+			const s16* const src = static_cast<const s16*>(last_frame);
+			s16* const frame = static_cast<s16*>(frames) + usz{i} * ch_cnt;
+
+			for (u32 ch = 0; ch < ch_cnt; ch++)
+			{
+				frame[ch] = static_cast<s16>(src[ch] * level);
+			}
+		}
+		else
+		{
+			const f32* const src = static_cast<const f32*>(last_frame);
+			f32* const frame = static_cast<f32*>(frames) + usz{i} * ch_cnt;
+
+			for (u32 ch = 0; ch < ch_cnt; ch++)
+			{
+				frame[ch] = src[ch] * level;
+			}
+		}
+	}
+
+	std::memset(static_cast<u8*>(frames) + usz{i} * ch_cnt * sample_size, 0, usz{frame_cnt - i} * ch_cnt * sample_size);
+	return std::max(level, 0.0f);
+}
+
 void AudioBackend::normalize(u32 sample_cnt, const f32* src, f32* dst)
 {
 	// Hard limit to the valid range, like the real hardware's output stage. Samples inside the range are passed

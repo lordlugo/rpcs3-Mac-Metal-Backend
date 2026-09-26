@@ -164,6 +164,20 @@ public:
 	static void normalize(u32 sample_cnt, const f32* src, f32* dst);
 
 	/*
+	 * Underrun helpers for write callbacks, real-time safe. They work on interleaved frames of ch_cnt samples of
+	 * sample_size bytes (f32, or s16 with "Convert to 16 bit"). A level is the gain of the last frame written.
+	 */
+
+	// Multiplies frame_cnt frames by a linear ramp: frame i gets level + (i + 1) * step, clamped to [0, 1].
+	// Returns the level of the last frame (the start level for the next call).
+	static f32 apply_gain_ramp(void* frames, u32 frame_cnt, u32 ch_cnt, u32 sample_size, f32 level, f32 step);
+
+	// Fills frame_cnt frames with last_frame, scaled by a level that falls by step per frame from `level` down to silence.
+	// Padding that continues from the last frame output without a step and without holding a DC level.
+	// Returns the level of the last frame (the start level for the next call).
+	static f32 fill_decay(void* frames, u32 frame_cnt, const void* last_frame, u32 ch_cnt, u32 sample_size, f32 level, f32 step);
+
+	/*
 	 * Returns the output channel count and downmix mode.
 	 */
 	static std::pair<AudioChannelCnt, AudioChannelCnt> get_channel_count_and_downmixer(u32 device_index);
