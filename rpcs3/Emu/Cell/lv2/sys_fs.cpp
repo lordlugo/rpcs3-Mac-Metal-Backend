@@ -1505,7 +1505,11 @@ error_code sys_fs_close(ppu_thread& ppu, u32 fd)
 			return {CELL_EBADF, fd};
 		}
 
-		if (!(file->mp.read_only && file->mp->flags & lv2_mp_flag::cache) && file->flags & CELL_FS_O_ACCMODE)
+		// Only files written into a gamedata temporary directory (created by cellGameCreateGameData) have to be on disk
+		// here, before cellGameContentPermit renames that directory into place. Syncing every written file stalled the
+		// PPU thread, with the mount mutex held, on each close; other files reach the disk through the host OS as usual,
+		// and sys_fs_rename flushes a file before it replaces another.
+		if (file->mp == &g_mp_sys_dev_hdd0 && file->flags & CELL_FS_O_ACCMODE && std::string_view{file->name.data()}.starts_with("/dev_hdd0/game/_GDATA_"))
 		{
 			// Special: Ensure temporary directory for gamedata writes will remain on disk before final gamedata commitment
 			file->file.sync(); // For cellGameContentPermit atomicity
@@ -2096,6 +2100,14 @@ error_code sys_fs_rename(ppu_thread& ppu, vm::cptr<char> from, vm::cptr<char> to
 	if (mp.read_only || mp.mp->flags & lv2_mp_flag::read_only)
 	{
 		return CELL_EROFS;
+	}
+
+	// Games save by writing a new file and renaming it over the old one: its data must reach the disk before the rename
+	// does, or a power loss or system crash could leave a partial file in place of both versions. sys_fs_close no longer
+	// flushes every written file, so do it here (renames are rare); the cache partition (/dev_hdd1) doesn't need this.
+	if (!(mp->flags & lv2_mp_flag::cache) && fs::is_file(local_from) && !fs::sync_path(local_from))
+	{
+		sys_fs.warning("sys_fs_rename(): failed to flush %s (%s)", from, fs::g_tls_error);
 	}
 
 	// Done in vfs::host::rename
