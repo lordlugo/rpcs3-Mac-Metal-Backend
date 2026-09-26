@@ -382,6 +382,7 @@ void MTLGSRender::begin_render_pass(const mtl::attachment_clear_info* clear)
 	}
 
 	auto encoder = m_render_pass.begin(*m_current_command_buffer, m_draw_pass_desc.get());
+	mtl::count_draw_render_pass();
 
 	if (has_clear)
 	{

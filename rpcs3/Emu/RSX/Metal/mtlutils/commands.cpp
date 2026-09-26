@@ -13,6 +13,7 @@ namespace mtl
 			f64 busy_until = 0.;
 			u64 busy_ns = 0;
 			atomic_t<u64> render_passes = 0;
+			atomic_t<u64> draw_render_passes = 0;
 			atomic_t<u64> feedback_splits = 0;
 			std::array<atomic_t<u64>, static_cast<u32>(pass_split_reason::count)> splits_by_reason{};
 			atomic_t<u64> feedback_reads_in_pass = 0;
@@ -71,6 +72,7 @@ namespace mtl
 			stats.busy_ns = std::exchange(state.busy_ns, 0);
 		}
 		stats.render_passes = state.render_passes.exchange(0);
+		stats.draw_render_passes = state.draw_render_passes.exchange(0);
 		stats.feedback_splits = state.feedback_splits.exchange(0);
 		for (u32 i = 0; i < stats.splits_by_reason.size(); i++)
 		{
@@ -90,6 +92,11 @@ namespace mtl
 	void count_feedback_read_in_pass()
 	{
 		gpu_stats().feedback_reads_in_pass++;
+	}
+
+	void count_draw_render_pass()
+	{
+		gpu_stats().draw_render_passes++;
 	}
 
 	command_list::~command_list()

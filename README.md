@@ -142,7 +142,7 @@ only when the game has no custom configuration, and only for the listed settings
 
 | Game | Built-in settings | Fixes |
 |---|---|---|
-| Grand Theft Auto IV (BLES00229, BLUS30127, NPEB00882, Complete Edition) | SPU XFloat Accuracy: Accurate, MSAA: Disabled, Write Color Buffers: On, Relaxed ZCULL Sync: On, Accurate ZCULL stats: Off, Sleep Timers Accuracy: As Host | Falling through the world in the prologue (missing collision), doubled or flickering image, missing reflections |
+| Grand Theft Auto IV (BLES00229, BLUS30127, NPEB00882, Complete Edition) | SPU XFloat Accuracy: Accurate, MSAA: Disabled, Write Color Buffers: On, Sleep Timers Accuracy: As Host (the official entry's relaxed ZCULL options are left out: they let the game read occlusion results before they are written, a suspected cause of black cutscenes) | Falling through the world in the prologue (missing collision), doubled or flickering image, missing reflections |
 
 ## Audio
 

@@ -938,16 +938,44 @@ namespace mtl
 			// The memory load covers the whole image, no need to clear it first
 			initialize_subresource_from_memory(cmd, image, desc, rsx::texture_dimension_extended::texture_dimension_2d);
 		}
-		else if (!(dst_aspect & aspect_depth))
-		{
-			mtl::clear_image(cmd, image, {});
-		}
 		else
 		{
+			// Only clear the levels the copies below do not write completely. A clear is a render pass per level on
+			// Metal; games that sample a mipmapped render target while drawing into one of its levels (bloom, luminance
+			// and reflection chains) rebuild this image on every draw.
+			u32 levels_to_clear = (1u << mipmaps) - 1;
+
+			for (const auto& section : sections_to_copy)
+			{
+				if (!section.src || section.level >= mipmaps)
+				{
+					continue;
+				}
+
+				const u32 level_w = std::max(image->width() >> section.level, 1u);
+				const u32 level_h = std::max(image->height() >> section.level, 1u);
+
+				if (section.dst_x == 0 && section.dst_y == 0 && section.dst_z == 0 &&
+					section.dst_w >= level_w && section.dst_h >= level_h)
+				{
+					levels_to_clear &= ~(1u << section.level);
+				}
+			}
+
 			image_clear_value clear{};
-			clear.depth = 1.f;
-			clear.stencil = 0;
-			mtl::clear_image(cmd, image, clear);
+			if (dst_aspect & aspect_depth)
+			{
+				clear.depth = 1.f;
+				clear.stencil = 0;
+			}
+
+			for (u32 level = 0; level < mipmaps; ++level)
+			{
+				if (levels_to_clear & (1u << level))
+				{
+					mtl::clear_image(cmd, image, clear, level, 1);
+				}
+			}
 		}
 
 		copy_transfer_regions_impl(cmd, image, sections_to_copy);

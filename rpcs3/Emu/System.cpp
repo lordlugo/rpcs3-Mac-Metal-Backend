@@ -288,7 +288,9 @@ void init_fxo_for_exec(utils::serial* ar, bool full = false)
 
 // RPCS3 Metal fork: recommended settings for titles that are unplayable without them, used like the config database
 // (applied when the title has no custom config, overriding the global config only for these keys). Taken from the
-// official config database entries, without Vulkan-only settings and without Shader Precision: Low.
+// official config database entries, without Vulkan-only settings, Shader Precision: Low and the relaxed ZCULL
+// options: with Relaxed ZCULL Sync the game can read occlusion reports before the GPU wrote them and treat visible
+// geometry as hidden (suspected cause of black GTA IV cutscenes).
 static std::string get_builtin_title_config(std::string_view title_id, std::string_view title)
 {
 	// Grand Theft Auto IV (disc, PSN, Complete Edition). Approximate SPU floats break collision: the car falls through
@@ -304,9 +306,7 @@ static std::string get_builtin_title_config(std::string_view title_id, std::stri
 			"Video:\n"
 			"  MSAA: Disabled\n"
 			"  Multithreaded RSX: true\n"
-			"  Write Color Buffers: true\n"
-			"  Accurate ZCULL stats: false\n"
-			"  Relaxed ZCULL Sync: true\n";
+			"  Write Color Buffers: true\n";
 	}
 
 	return {};

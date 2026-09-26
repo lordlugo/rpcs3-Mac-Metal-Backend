@@ -34,6 +34,7 @@ namespace mtl
 	{
 		u64 busy_ns = 0;
 		u64 render_passes = 0;
+		u64 draw_render_passes = 0;     // passes of the renderer's framebuffer (the rest: copies, clears, overlays)
 		u64 feedback_splits = 0;
 		std::array<u64, static_cast<u32>(pass_split_reason::count)> splits_by_reason{};
 		u64 feedback_reads_in_pass = 0; // feedback reads served without a split (see render_target feedback streaks)
@@ -42,6 +43,7 @@ namespace mtl
 	gpu_stats_t get_gpu_stats_and_reset();
 	void count_feedback_split(pass_split_reason reason = pass_split_reason::read_after_write);
 	void count_feedback_read_in_pass();
+	void count_draw_render_pass();
 
 	struct submit_info_t
 	{
