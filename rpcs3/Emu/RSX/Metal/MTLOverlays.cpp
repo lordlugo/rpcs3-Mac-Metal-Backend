@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "MTLOverlays.h"
 #include "MTLFormats.h"
+#include "MTLPipelineCompiler.h"
 #include "MTLResourceManager.h"
 
 #include "mtlutils/device.h"
@@ -396,7 +397,12 @@ namespace mtl
 
 	u64 overlay_pass::get_pipeline_key(const glsl::graphics_pipeline_state& state) const
 	{
-		return rpcs3::hash_struct(state);
+		// MTL4 render pipeline descriptors have no depth/stencil attachment format, and only point topologies are
+		// declared (see build_graphics_program): targets that differ only there share one pipeline
+		auto key_state = state;
+		key_state.depth_stencil_format = 0;
+		key_state.topology_class = get_pipeline_topology_class(state.topology_class);
+		return rpcs3::hash_struct(key_state);
 	}
 
 	std::vector<glsl::program_input> overlay_pass::get_vertex_inputs()
@@ -460,7 +466,17 @@ namespace mtl
 
 	glsl::program* overlay_pass::build_pipeline(u64 storage_key, const glsl::graphics_pipeline_state& state)
 	{
-		auto program = glsl::create_graphics_program(vs_src, get_vertex_inputs(), fs_src, get_fragment_inputs(), state);
+		if (!m_vertex_shader)
+		{
+			m_vertex_shader = std::make_unique<glsl::shader>();
+			m_vertex_shader->create(::glsl::program_domain::glsl_vertex_program, vs_src);
+
+			m_fragment_shader = std::make_unique<glsl::shader>();
+			m_fragment_shader->create(::glsl::program_domain::glsl_fragment_program, fs_src);
+		}
+
+		// Translates the shaders on the first build only (a failed translation is not retried either)
+		auto program = build_graphics_program(*m_vertex_shader, *m_fragment_shader, state, get_vertex_inputs(), get_fragment_inputs());
 		if (!program)
 		{
 			// Cache the failure (nullptr) so it is reported once; callers skip the draw instead of aborting
@@ -583,6 +599,8 @@ namespace mtl
 		if (initialized)
 		{
 			m_program_cache.clear();
+			m_vertex_shader.reset();
+			m_fragment_shader.reset();
 			m_samplers[0].reset();
 			m_samplers[1].reset();
 

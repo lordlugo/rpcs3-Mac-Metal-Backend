@@ -290,8 +290,8 @@ namespace mtl
 		mtl::pipeline_props properties{};
 		auto& state = properties.state;
 
-		// Input assembly
-		state.topology_class = topology_class;
+		// Input assembly. Only point vs. other is baked (see get_pipeline_topology_class)
+		state.topology_class = get_pipeline_topology_class(topology_class);
 		state.rasterization_enabled = 1;
 
 		// Attachments
@@ -1383,7 +1383,9 @@ bool MTLGSRender::load_program()
 	const auto shadermode = g_cfg.video.shadermode.get();
 
 	const auto [primitive, emulated_primitive] = mtl::get_appropriate_topology(rsx::method_registers.current_draw_clause.primitive);
-	const u8 topology_class = mtl::get_topology_class(primitive);
+
+	// Pipeline key class (point or not): line and triangle draws share their pipelines
+	const u8 topology_class = mtl::get_pipeline_topology_class(mtl::get_topology_class(primitive));
 
 	if (m_graphics_state & rsx::pipeline_state::invalidate_pipeline_bits)
 	{
@@ -1455,6 +1457,9 @@ bool MTLGSRender::load_program()
 		}
 	}
 
+	// Sampled before the lookup: a compile finishing after the lookup changes it (see the wait below)
+	u32 completed_compiles = mtl::pipe_compiler::get_completed_job_count();
+
 	// Load current program from cache. The shader interpreter is not ported: every non-recompiler mode compiles
 	// asynchronously and skips draws until the pipeline is ready.
 	std::tie(m_program, m_vertex_prog, m_fragment_prog) = m_prog_buffer->get_graphics_pipeline(
@@ -1466,16 +1471,28 @@ bool MTLGSRender::load_program()
 
 	// The pipeline is being compiled on a worker. Without an interpreter the draw would be skipped: wait a little for
 	// it (compiles typically take a few ms on Apple silicon), within a per-frame budget so a burst of new shaders costs
-	// at most a short hitch.
-	if (!m_program && shadermode != shader_mode::recompiler && m_async_compile_wait_spent_us < async_compile_wait_budget_us)
+	// at most a short hitch. A pipeline that failed to build is never waited for.
+	if (!m_program && shadermode != shader_mode::recompiler && !m_prog_buffer->check_pipeline_failed() &&
+		m_async_compile_wait_spent_us < async_compile_wait_budget_us)
 	{
 		const u64 wait_start = get_system_time();
 
+		// Its job runs next (and at emulation priority) if it has not started yet
+		mtl::pipe_compiler::prioritize_jobs(m_vertex_prog->handle, m_fragment_prog->handle);
+
 		mtl::leave_uninterruptible();
 
-		while (!m_program && get_system_time() - wait_start + m_async_compile_wait_spent_us < async_compile_wait_budget_us)
+		while (true)
 		{
-			std::this_thread::sleep_for(std::chrono::microseconds(250));
+			const u64 spent_us = get_system_time() - wait_start + m_async_compile_wait_spent_us;
+			if (spent_us >= async_compile_wait_budget_us)
+			{
+				break;
+			}
+
+			// Woken by every finished compile (any pipeline), not by a timer
+			mtl::pipe_compiler::wait_for_completed_job(completed_compiles, async_compile_wait_budget_us - spent_us);
+			completed_compiles = mtl::pipe_compiler::get_completed_job_count();
 
 			mtl::enter_uninterruptible();
 			std::tie(m_program, m_vertex_prog, m_fragment_prog) = m_prog_buffer->get_graphics_pipeline(
@@ -1485,9 +1502,16 @@ bool MTLGSRender::load_program()
 				m_pipeline_properties,
 				true, true);
 			mtl::leave_uninterruptible();
+
+			if (m_program || m_prog_buffer->check_pipeline_failed())
+			{
+				break;
+			}
 		}
 
-		m_async_compile_wait_spent_us += get_system_time() - wait_start;
+		const u64 waited_us = get_system_time() - wait_start;
+		m_async_compile_wait_spent_us += waited_us;
+		m_pipeline_wait_us += waited_us;
 		mtl::enter_uninterruptible();
 	}
 
@@ -1521,6 +1545,9 @@ bool MTLGSRender::load_program()
 	{
 		m_vs_binding_table = nullptr;
 		m_fs_binding_table = nullptr;
+
+		// The draw is skipped (telemetry, MTLPresent.cpp)
+		m_skipped_draws++;
 	}
 
 	return m_program != nullptr;

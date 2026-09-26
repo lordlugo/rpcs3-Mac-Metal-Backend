@@ -387,17 +387,22 @@ void MTLGSRender::present_drawable(mtl::frame_context_t* ctx)
 			const f64 busy_ms = gpu.busy_ns / 1'000'000.;
 			const auto per_frame = [frames](u64 count) { return static_cast<f64>(count) / frames; };
 			const auto& reasons = gpu.splits_by_reason;
+			// Skipped draws / pipeline waits: shader compilation stutter (no shader interpreter on Metal)
 			rsx_log.notice("Metal: GPU busy %.2f ms per frame (%.0f%% of the time), %.1f render passes (%.1f for draws) and %.1f feedback splits per frame "
-				"(read after write %.1f, through a copy %.1f, write after read %.1f, depth compare %.1f, vertex read %.1f; %.1f feedback reads kept in the pass)",
+				"(read after write %.1f, through a copy %.1f, write after read %.1f, depth compare %.1f, vertex read %.1f; %.1f feedback reads kept in the pass). "
+				"Pipelines: %.1f draws skipped and %.2f ms waited per frame",
 				busy_ms / frames, 100. * busy_ms / window_ms, per_frame(gpu.render_passes), per_frame(gpu.draw_render_passes), per_frame(gpu.feedback_splits),
 				per_frame(reasons[static_cast<u32>(mtl::pass_split_reason::read_after_write)]),
 				per_frame(reasons[static_cast<u32>(mtl::pass_split_reason::read_through_copy)]),
 				per_frame(reasons[static_cast<u32>(mtl::pass_split_reason::write_after_read)]),
 				per_frame(reasons[static_cast<u32>(mtl::pass_split_reason::depth_compare)]),
 				per_frame(reasons[static_cast<u32>(mtl::pass_split_reason::vertex_read)]),
-				per_frame(gpu.feedback_reads_in_pass));
+				per_frame(gpu.feedback_reads_in_pass),
+				per_frame(m_skipped_draws), per_frame(m_pipeline_wait_us) / 1000.);
 		}
 
+		m_skipped_draws = 0;
+		m_pipeline_wait_us = 0;
 		pacing.stats_time = now_us;
 	}
 }

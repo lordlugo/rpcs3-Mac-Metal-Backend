@@ -238,7 +238,17 @@ namespace mtl
 
 		static_assert(sizeof(push_constants_t) == 32);
 
-		static std::map<std::pair<u64, u32>, std::unique_ptr<glsl::program>> g_programs;
+		// Pipelines by the state they bake (depth/stencil format excluded: MTL4 render pipelines do not bake it), so
+		// render passes that differ only in their depth format share one. nullptr: the build failed (not retried).
+		static std::unordered_map<u64, std::unique_ptr<glsl::program>> g_programs;
+
+		// (render pass key, write mask | colour count << 8) -> pipeline in g_programs: the common lookup
+		static std::map<std::pair<u64, u32>, glsl::program*> g_program_lookup;
+
+		// Translated once (GLSL -> SPIR-V -> MSL -> MTLLibrary) and shared by the pipelines: the vertex shader and one
+		// fragment shader per colour attachment count
+		static std::unique_ptr<glsl::shader> g_vertex_shader;
+		static std::array<std::unique_ptr<glsl::shader>, 5> g_fragment_shaders;
 
 		static std::vector<glsl::program_input> get_inputs(::glsl::program_domain domain)
 		{
@@ -256,79 +266,111 @@ namespace mtl
 
 		static glsl::program* get_program(const mtl::framebuffer_info& fbo, u64 renderpass_key, u8 color_write_mask)
 		{
-			const auto key = std::make_pair(renderpass_key, u32{ color_write_mask } | (fbo.color_count << 8));
-			if (auto found = g_programs.find(key); found != g_programs.end())
+			const auto lookup_key = std::make_pair(renderpass_key, u32{ color_write_mask } | (fbo.color_count << 8));
+			if (auto found = g_program_lookup.find(lookup_key); found != g_program_lookup.end())
 			{
-				return found->second.get();
+				return found->second;
 			}
 
-			const std::string vs_src =
-				"#version 450\n"
-				"layout(push_constant) uniform push_constants_block\n"
-				"{\n"
-				"	vec4 clear_color;\n"
-				"	float clear_depth;\n"
-				"};\n\n"
-				"void main()\n"
-				"{\n"
-				"	const vec2 positions[4] = vec2[4](vec2(-1., -1.), vec2(1., -1.), vec2(-1., 1.), vec2(1., 1.));\n"
-				"	gl_Position = vec4(positions[gl_VertexIndex & 3], clear_depth, 1.);\n"
-				"}\n";
-
-			std::string fs_src =
-				"#version 450\n"
-				"layout(push_constant) uniform push_constants_block\n"
-				"{\n"
-				"	vec4 clear_color;\n"
-				"	float clear_depth;\n"
-				"};\n\n";
-
-			for (u32 i = 0; i < fbo.color_count; ++i)
-			{
-				fs_src += fmt::format("layout(location=%u) out vec4 ocol%u;\n", i, i);
-			}
-
-			fs_src += "\nvoid main()\n{\n";
-			for (u32 i = 0; i < fbo.color_count; ++i)
-			{
-				fs_src += fmt::format("	ocol%u = clear_color;\n", i);
-			}
-			fs_src += "}\n";
+			const u32 color_count = std::min<u32>(fbo.color_count, ::size32(g_fragment_shaders) - 1);
 
 			glsl::graphics_pipeline_state state{};
-			state.color_count = fbo.color_count;
-			for (u32 i = 0; i < fbo.color_count; ++i)
+			state.color_count = color_count;
+			for (u32 i = 0; i < color_count; ++i)
 			{
 				state.color[i].pixel_format = static_cast<u32>(fbo.color[i]->format());
 				state.color[i].write_mask = color_write_mask;
 				state.color[i].blend_enable = 0;
 			}
 
-			state.depth_stencil_format = fbo.depth_stencil ? static_cast<u32>(fbo.depth_stencil->format()) : 0u;
+			// depth_stencil_format stays 0: not part of an MTL4 render pipeline (informational only)
 			state.sample_count = std::max<u8>(1, fbo.samples);
 			state.topology_class = static_cast<u8>(MTL::PrimitiveTopologyClassTriangle);
 			state.rasterization_enabled = 1;
 
-			auto program = glsl::create_graphics_program(
-				vs_src, get_inputs(::glsl::glsl_vertex_program),
-				fs_src, get_inputs(::glsl::glsl_fragment_program),
-				state);
+			const u64 state_key = rpcs3::hash_struct(state);
+			if (auto found = g_programs.find(state_key); found != g_programs.end())
+			{
+				// Same pipeline, other render pass (e.g. another depth format)
+				g_program_lookup.emplace(lookup_key, found->second.get());
+				return found->second.get();
+			}
+
+			if (!g_vertex_shader)
+			{
+				const std::string vs_src =
+					"#version 450\n"
+					"layout(push_constant) uniform push_constants_block\n"
+					"{\n"
+					"	vec4 clear_color;\n"
+					"	float clear_depth;\n"
+					"};\n\n"
+					"void main()\n"
+					"{\n"
+					"	const vec2 positions[4] = vec2[4](vec2(-1., -1.), vec2(1., -1.), vec2(-1., 1.), vec2(1., 1.));\n"
+					"	gl_Position = vec4(positions[gl_VertexIndex & 3], clear_depth, 1.);\n"
+					"}\n";
+
+				g_vertex_shader = std::make_unique<glsl::shader>();
+				g_vertex_shader->create(::glsl::glsl_vertex_program, vs_src);
+			}
+
+			auto& fragment_shader = g_fragment_shaders[color_count];
+			if (!fragment_shader)
+			{
+				std::string fs_src =
+					"#version 450\n"
+					"layout(push_constant) uniform push_constants_block\n"
+					"{\n"
+					"	vec4 clear_color;\n"
+					"	float clear_depth;\n"
+					"};\n\n";
+
+				for (u32 i = 0; i < color_count; ++i)
+				{
+					fs_src += fmt::format("layout(location=%u) out vec4 ocol%u;\n", i, i);
+				}
+
+				fs_src += "\nvoid main()\n{\n";
+				for (u32 i = 0; i < color_count; ++i)
+				{
+					fs_src += fmt::format("	ocol%u = clear_color;\n", i);
+				}
+				fs_src += "}\n";
+
+				fragment_shader = std::make_unique<glsl::shader>();
+				fragment_shader->create(::glsl::glsl_fragment_program, fs_src);
+			}
+
+			// Translates the shaders on their first use only
+			auto program = build_graphics_program(
+				*g_vertex_shader, *fragment_shader, state,
+				get_inputs(::glsl::glsl_vertex_program),
+				get_inputs(::glsl::glsl_fragment_program));
 
 			if (!program)
 			{
-				rsx_log.error("Metal: failed to build the attachment clear pipeline");
-				return nullptr;
+				// Cached as well: reported once per state instead of on every clear
+				rsx_log.error("Metal: failed to build the attachment clear pipeline (%u color attachments, %u samples)", color_count, state.sample_count);
 			}
 
 			auto result = program.get();
-			g_programs.emplace(key, std::move(program));
+			g_programs.emplace(state_key, std::move(program));
+			g_program_lookup.emplace(lookup_key, result);
 			return result;
 		}
 	}
 
 	void destroy_inpass_clear_programs()
 	{
+		inpass_clear::g_program_lookup.clear();
 		inpass_clear::g_programs.clear();
+
+		inpass_clear::g_vertex_shader.reset();
+		for (auto& shader : inpass_clear::g_fragment_shaders)
+		{
+			shader.reset();
+		}
 	}
 }
 

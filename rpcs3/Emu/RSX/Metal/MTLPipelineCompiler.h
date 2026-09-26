@@ -2,6 +2,7 @@
 
 // Port of VK/VKPipelineCompiler: a pool of "RSX.W" worker threads that translate shaders (GLSL -> MSL -> MTLLibrary)
 // and build Metal 4 pipeline state objects, either inline (COMPILE_INLINE) or deferred with a completion callback.
+// Deferred jobs go to one queue shared by all workers.
 
 #include "MTLProgramPipeline.h"
 #include "MTLPipelineArchive.h" // Pipeline persistence hooks used by MTLGSRender (initialize/preloaded/flush)
@@ -15,6 +16,18 @@
 namespace mtl
 {
 	class render_device;
+
+	void destroy_pipe_compiler();
+
+	// The only primitive topology class a render pipeline declares is Point (see build_graphics_program): line and
+	// triangle pipelines are identical. Pipeline keys (graphics_pipeline_state::topology_class) therefore use
+	// MTL::PrimitiveTopologyClassTriangle for every non-point topology, so the same pipeline is not built twice.
+	inline u8 get_pipeline_topology_class(u8 topology_class)
+	{
+		return topology_class == static_cast<u8>(MTL::PrimitiveTopologyClassPoint)
+			? topology_class
+			: static_cast<u8>(MTL::PrimitiveTopologyClassTriangle);
+	}
 
 	// Vertex shaders that declare input attributes (GLSL `layout(location = N) in ...`, e.g. overlay passes) get an
 	// automatic MTLVertexDescriptor: all attributes interleaved in ONE buffer, ascending location order, tightly packed
@@ -65,10 +78,24 @@ namespace mtl
 		// Worker thread entry
 		void operator()();
 
+		// Number of deferred jobs finished so far (built or failed). It is bumped after the job's callback returned,
+		// so a pipeline that was not in the cache when this was sampled is there once the count has changed.
+		static u32 get_completed_job_count();
+
+		// Waits until the completed job count differs from `count`, at most `timeout_us`. May return early.
+		static void wait_for_completed_job(u32 count, u64 timeout_us);
+
+		// A thread is about to wait for a pipeline of this shader pair: its queued jobs move to the front of the queue
+		// and run at emulation thread priority. No effect on jobs that are already running.
+		static void prioritize_jobs(const glsl::shader* vs, const glsl::shader* fs);
+
 	private:
+		friend void destroy_pipe_compiler();
+
 		struct pipe_compiler_job
 		{
 			bool is_graphics_job;
+			bool urgent = false;          // Waited for (prioritize_jobs): runs at emulation thread priority
 			callback_t callback_func;
 
 			mtl::pipeline_props graphics_data{};
@@ -108,8 +135,12 @@ namespace mtl
 			}
 		};
 
+		// Deferred jobs of all workers (MTLPipelineCompiler.cpp). One queue, so that an idle worker never waits
+		// behind a slow compile that happened to be queued on another worker.
+		struct job_queue;
+		static job_queue s_queue;
+
 		const mtl::render_device* m_device = nullptr;
-		lf_queue<pipe_compiler_job> m_work_queue;
 
 		std::unique_ptr<glsl::program> int_compile_compute_pipe(
 			glsl::shader* cs,
@@ -125,9 +156,10 @@ namespace mtl
 			op_flags flags);
 	};
 
-	// 0 (or negative) = automatic count (same heuristic as VK). Always capped by device caps().max_compile_tasks.
+	// 0 (or negative) = automatic count (one worker per concurrent Metal compilation task, see the .cpp). Always capped
+	// by device caps().max_compile_tasks.
 	void initialize_pipe_compiler(int num_worker_threads = -1);
-	void destroy_pipe_compiler();
+	void destroy_pipe_compiler(); // Joins the workers and drops the jobs that were still queued (callbacks never run)
 	pipe_compiler* get_pipe_compiler();
 
 	// ---- Synchronous building blocks (no worker threads needed; used by the workers and glsl::create_*_program) ----
