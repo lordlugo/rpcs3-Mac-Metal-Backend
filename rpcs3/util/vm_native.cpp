@@ -347,12 +347,22 @@ namespace utils
 #else
 		const u64 ptr64 = reinterpret_cast<u64>(pointer);
 #if defined(__APPLE__) && defined(ARCH_ARM64)
-		// Hack: on macOS, Apple explicitly fails mmap if you combine MAP_FIXED and MAP_JIT.
-		// So we unmap the space and just hope it maps to the same address we got before instead.
-		// The Xcode manpage says the pointer is a hint and the OS will try to map at the hint location
-		// so this isn't completely undefined behavior.
-		ensure(::munmap(pointer, size) != -1);
-		ensure(::mmap(pointer, size, PROT_NONE,  MAP_ANON | MAP_PRIVATE | (can_be_jit ? MAP_JIT : 0), -1, 0) == pointer);
+		if (can_be_jit)
+		{
+			// macOS rejects MAP_FIXED together with MAP_JIT, so a JIT range cannot be replaced in place. Unmapping it and
+			// mapping again at the same address (the old approach) races with every other thread that maps memory: with
+			// several PPU/SPU compile threads each dropping a JIT memory manager, another thread's mmap regularly took the
+			// freed range first and this failed ("Verification failed" in memory_decommit). Keep the mapping instead:
+			// make it inaccessible and hand its pages back to the system. The contents are not zeroed; JIT users always
+			// write memory before using it.
+			ensure(::mprotect(pointer, size, PROT_NONE) != -1);
+			::madvise(pointer, size, MADV_FREE_REUSABLE);
+		}
+		else
+		{
+			// Not a JIT range: MAP_FIXED is allowed and replaces the range atomically (zeroed, no window for other threads)
+			ensure(::mmap(pointer, size, PROT_NONE, MAP_FIXED | MAP_ANON | MAP_PRIVATE | c_map_noreserve, -1, 0) != reinterpret_cast<void*>(uptr{umax}));
+		}
 #else
 		ensure(::mmap(pointer, size, PROT_NONE, MAP_FIXED | MAP_ANON | MAP_PRIVATE | c_map_noreserve, -1, 0) != reinterpret_cast<void*>(uptr{umax}));
 #endif
@@ -381,8 +391,20 @@ namespace utils
 #else
 		const u64 ptr64 = reinterpret_cast<u64>(pointer);
 #if defined(__APPLE__) && defined(ARCH_ARM64)
-		ensure(::munmap(pointer, size) != -1);
-		ensure(::mmap(pointer, size, +prot,  MAP_ANON | MAP_PRIVATE | (can_be_jit ? MAP_JIT : 0), -1, 0) == pointer);
+		if (can_be_jit)
+		{
+			// See memory_decommit: MAP_FIXED cannot be combined with MAP_JIT and unmap + map again races with other
+			// threads. Keep the mapping, zero and drop its pages, and set the new protection.
+#ifdef MADV_ZERO
+			::madvise(pointer, size, MADV_ZERO); // Zeroes resident pages without touching the others (macOS 14+)
+#endif
+			::madvise(pointer, size, MADV_FREE_REUSABLE);
+			ensure(::mprotect(pointer, size, +prot) != -1);
+		}
+		else
+		{
+			ensure(::mmap(pointer, size, +prot, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0) != reinterpret_cast<void*>(uptr{umax}));
+		}
 #else
 		ensure(::mmap(pointer, size, +prot, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0) != reinterpret_cast<void*>(uptr{umax}));
 #endif
