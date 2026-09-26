@@ -1093,10 +1093,26 @@ namespace mtl
 
 	static mtl::command_list& prepare_for_transfer(mtl::command_list& primary_cb, mtl::image* /*dst_image*/, rsx::flags32_t& flags)
 	{
-		// Metal v1 has no async transfer queue: always upload inline on the primary command list.
+		// Metal has no async transfer queue. "Async" uploads are recorded into the primary list's prologue instead, which
+		// executes before everything recorded in the primary list (see mtl::command_list), so an open render pass stays
+		// open. The caller guarantees that no work already recorded in primary_cb references dst_image. The sources must
+		// be written by the CPU: data produced by GPU work of this submission (source_is_gpu_resident, e.g. detiled
+		// memory in the scratch buffer) would be read before it is written.
+		if ((flags & image_upload_options::upload_contents_async) && !(flags & image_upload_options::source_is_gpu_resident))
+		{
+			if (auto prologue = primary_cb.prologue())
+			{
+				count_image_upload(true, false);
+				return *prologue;
+			}
+		}
+
 		flags &= ~image_upload_options::upload_contents_async;
 
-		if (primary_cb.is_render_pass_open())
+		const bool ends_pass = primary_cb.is_render_pass_open();
+		count_image_upload(false, ends_pass);
+
+		if (ends_pass)
 		{
 			primary_cb.end_render_pass();
 		}
@@ -1250,6 +1266,11 @@ namespace mtl
 			if (opt.require_upload)
 			{
 				ensure(!opt.deferred_cmds.empty());
+
+				// Zero-copy reads a DMA block, which GPU work of this list may write back to (surface flushes): never from
+				// the prologue (upload_contents_async is still set only when recording there). Unreachable while
+				// supports_zero_copy stays off, see above.
+				ensure(!(image_setup_flags & upload_contents_async));
 
 				auto base_addr = static_cast<const char*>(opt.deferred_cmds.front().src);
 				auto end_addr = static_cast<const char*>(opt.deferred_cmds.back().src) + opt.deferred_cmds.back().length;
@@ -1740,7 +1761,12 @@ namespace mtl
 	static std::unordered_map<u64, std::unique_ptr<image>> g_typeless_textures;
 	static std::unique_ptr<mtl::sampler> g_null_sampler;
 
-	// Scratch memory handling. Use double-buffered resource to significantly cut down on GPU stalls
+	// Scratch memory handling. Use double-buffered resource to significantly cut down on GPU stalls.
+	// Prologue uploads (command_list::prologue()) share these buffers with the main lists. That is safe: scratch data is
+	// only read by work recorded right after its producer on the same list (upload: copy from the upload heap ->
+	// swap/deswizzle -> copy to the image; detile -> upload), never across submissions, and prologue work never overlaps
+	// other work (its encoders wait for all earlier queue work, all work of its main list waits for it). Running it
+	// before main-list work that was recorded earlier cannot clobber scratch data that work still needs.
 	struct scratch_buffer_pool_t
 	{
 		std::array<std::unique_ptr<buffer>, 2> scratch_buffers;

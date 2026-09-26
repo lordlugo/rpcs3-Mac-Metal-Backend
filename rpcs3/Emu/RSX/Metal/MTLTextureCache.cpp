@@ -1208,8 +1208,27 @@ namespace mtl
 			}
 		}
 
-		// No async transfer queue on Metal (supports_asynchronous_compute is false): uploads are always inline.
+		// No async transfer queue on Metal (supports_asynchronous_compute is false). Instead, "Asynchronous Texture
+		// Streaming" records an upload that would end the open render pass into the command list's prologue, which
+		// executes before everything recorded in the list (mtl::command_list::prologue()). On a TBDR GPU every early pass
+		// end stores and reloads all attachments. Reordering the upload ahead of the list is only valid if:
+		//  - its sources are written by the CPU: shader_read uploads read the upload heap (and scratch data derived from
+		//    it); blit engine sources may be detiled from GPU-resident memory, and they end the pass above anyway;
+		//  - no work recorded so far in the list references the destination image: the section's image is never reused
+		//    in place (earlier draws may sample its old contents), like VK async uploads. A new image, or one from the
+		//    reusable pool, which only takes images back after the GPU finished with them (through the GC).
+		// With no pass open the inline upload splits nothing and may reuse the image, so it stays inline.
+		const bool upload_ahead = context == rsx::texture_upload_context::shader_read &&
+			g_cfg.video.vk.asynchronous_texture_streaming &&
+			cmd.is_render_pass_open() &&
+			cmd.can_record_prologue();
+
 		rsx::flags32_t create_flags = 0;
+
+		if (upload_ahead)
+		{
+			create_flags |= texture_create_flags::do_not_reuse;
+		}
 
 		if (context == rsx::texture_upload_context::shader_read &&
 			!g_cfg.video.disable_hardware_texel_remapping)
@@ -1235,7 +1254,7 @@ namespace mtl
 			input_swizzled = false;
 		}
 
-		rsx::flags32_t upload_command_flags = initialize_image_layout | upload_contents_inline;
+		rsx::flags32_t upload_command_flags = initialize_image_layout | (upload_ahead ? upload_contents_async : upload_contents_inline);
 
 		std::vector<rsx::subresource_layout> tmp;
 		auto p_subresource_layout = &subresource_layout;
@@ -1273,7 +1292,7 @@ namespace mtl
 		mtl::leave_uninterruptible();
 
 		// VK transitioned the image to its preferred layout here. Metal has no layouts; the next consumer is ordered
-		// after the upload by the command list's barriers.
+		// after the upload by the command list's barriers (after the whole prologue for an upload recorded there).
 
 		section->last_write_tag = rsx::get_shared_tag();
 		return section;
